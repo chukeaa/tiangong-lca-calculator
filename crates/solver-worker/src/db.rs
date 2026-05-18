@@ -1344,7 +1344,7 @@ async fn run_snapshot_builder_job(
         ),
         "--provider-rule".to_owned(),
         provider_rule
-            .unwrap_or("split_by_evidence_hybrid")
+            .unwrap_or("split_by_process_volume")
             .to_owned(),
         "--reference-normalization-mode".to_owned(),
         reference_normalization_mode.unwrap_or("lenient").to_owned(),

@@ -41,7 +41,7 @@ Options:
   --process-states <csv|all>   process state_code filter, use "all" to disable filter (default: "100,101,...,199")
   --include-user-id <uuid>     include processes from this user_id in addition to --process-states
   --process-limit <n>          limit processes for debug snapshot, 0 = no limit (default: 0)
-  --provider-rule <rule>       provider matching rule (default: split_by_evidence_hybrid)
+  --provider-rule <rule>       provider matching rule (default: split_by_process_volume)
   --self-loop-cutoff <float>   drop technosphere diagonal edges with |value| >= cutoff (default: 0.999999)
   --singular-eps <float>       epsilon for near-singular diagonal checks (default: 1e-12)
   --report-dir <path>          write coverage report json/md files (default: reports/snapshot-coverage)

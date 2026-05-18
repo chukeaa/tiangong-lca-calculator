@@ -80,8 +80,19 @@ pub enum CompiledProviderResolutionStrategy {
     UniqueProvider,
     BestProviderStrict,
     SplitByEvidence,
+    SplitByProcessVolume,
     SplitEqual,
     SplitEqualFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompiledProviderGeographyTier {
+    LocalSubnational,
+    SameCountry,
+    SameRegion,
+    Global,
+    Other,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +119,10 @@ pub struct CompiledProviderDecision {
     #[serde(default)]
     pub failure_reason: Option<CompiledProviderFailureReason>,
     pub used_equal_fallback: bool,
+    #[serde(default)]
+    pub volume_fallback_to_one_count: i32,
+    #[serde(default)]
+    pub geography_tier: Option<CompiledProviderGeographyTier>,
     pub allocations: Vec<CompiledProviderAllocation>,
 }
 

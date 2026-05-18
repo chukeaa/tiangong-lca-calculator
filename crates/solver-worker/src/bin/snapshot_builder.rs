@@ -27,8 +27,8 @@ use solver_worker::compiled_graph::{
     CompiledAllocationStats, CompiledBiosphereEdge, CompiledEdgePartition, CompiledFlow,
     CompiledFlowKind, CompiledGraph, CompiledMatchingStats, CompiledProcess,
     CompiledProviderAllocation, CompiledProviderDecision, CompiledProviderDecisionKind,
-    CompiledProviderFailureReason, CompiledProviderResolutionStrategy, CompiledReferenceStats,
-    CompiledTechnosphereEdge,
+    CompiledProviderFailureReason, CompiledProviderGeographyTier,
+    CompiledProviderResolutionStrategy, CompiledReferenceStats, CompiledTechnosphereEdge,
 };
 use solver_worker::graph_types::{
     RequestRootProcess, ResolvedScopeProcess, ScopeProcessPartition, SnapshotSelectionMode,
@@ -77,7 +77,7 @@ struct Cli {
     root_processes: Vec<RequestRootProcess>,
     #[arg(long, default_value_t = 0)]
     process_limit: usize,
-    #[arg(long, default_value = "split_by_evidence_hybrid")]
+    #[arg(long, default_value = "split_by_process_volume")]
     provider_rule: String,
     #[arg(long, default_value_t = false)]
     provider_rule_replay: bool,
@@ -85,7 +85,7 @@ struct Cli {
     provider_rule_replay_only: bool,
     #[arg(
         long,
-        default_value = "strict_unique_provider,best_provider_strict,split_by_evidence,split_by_evidence_hybrid,split_equal"
+        default_value = "split_by_process_volume,strict_unique_provider,best_provider_strict,split_by_evidence,split_by_evidence_hybrid,split_equal"
     )]
     provider_rule_replay_rules: String,
     #[arg(long, default_value = "strict")]
@@ -134,6 +134,7 @@ struct ParsedExchange {
 enum ProviderRule {
     StrictUniqueProvider,
     BestProviderStrict,
+    SplitByProcessVolume,
     SplitByEvidenceStrict,
     SplitByEvidenceHybrid,
     SplitEqual,
@@ -160,6 +161,7 @@ struct ProcessMeta {
     model_id: Option<Uuid>,
     location: Option<String>,
     reference_year: Option<i32>,
+    annual_supply_or_production_volume: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -226,6 +228,8 @@ struct ProviderRuleReplayRow {
     provider_present_resolved_pct: f64,
     resolved_strategy_counts: BTreeMap<String, i64>,
     unresolved_reason_counts: BTreeMap<String, i64>,
+    volume_fallback_to_one_count: i64,
+    geography_tier_counts: BTreeMap<String, i64>,
 }
 
 type ParsedProcessChunk = (
@@ -295,6 +299,7 @@ impl ProviderRule {
         match self {
             Self::StrictUniqueProvider => "strict_unique_provider",
             Self::BestProviderStrict => "best_provider_strict",
+            Self::SplitByProcessVolume => "split_by_process_volume",
             Self::SplitByEvidenceStrict => "split_by_evidence",
             Self::SplitByEvidenceHybrid => "split_by_evidence_hybrid",
             Self::SplitEqual => "split_equal",
@@ -305,11 +310,12 @@ impl ProviderRule {
         match value {
             "strict_unique_provider" => Ok(Self::StrictUniqueProvider),
             "best_provider_strict" => Ok(Self::BestProviderStrict),
+            "split_by_process_volume" => Ok(Self::SplitByProcessVolume),
             "split_by_evidence" => Ok(Self::SplitByEvidenceStrict),
             "split_by_evidence_hybrid" => Ok(Self::SplitByEvidenceHybrid),
             "split_equal" => Ok(Self::SplitEqual),
             _ => Err(anyhow::anyhow!(
-                "unsupported provider_rule={value}; expected one of: strict_unique_provider, best_provider_strict, split_by_evidence, split_by_evidence_hybrid, split_equal"
+                "unsupported provider_rule={value}; expected one of: split_by_process_volume, strict_unique_provider, best_provider_strict, split_by_evidence, split_by_evidence_hybrid, split_equal"
             )),
         }
     }
@@ -1093,6 +1099,8 @@ async fn compile_scope_graph(
                 model_id: proc_row.model_id,
                 location: parse_process_location(&proc_row.json),
                 reference_year: parse_process_reference_year(&proc_row.json),
+                annual_supply_or_production_volume:
+                    parse_process_annual_supply_or_production_volume(&proc_row.json),
             };
             let mut local_exchanges = Vec::new();
             let mut local_flow_ids = BTreeSet::new();
@@ -1313,6 +1321,8 @@ async fn compile_scope_graph(
                 resolution_strategy: Some(CompiledProviderResolutionStrategy::UniqueProvider),
                 failure_reason: None,
                 used_equal_fallback: false,
+                volume_fallback_to_one_count: 0,
+                geography_tier: None,
                 allocations: vec![CompiledProviderAllocation {
                     provider_idx,
                     weight: 1.0,
@@ -1369,6 +1379,8 @@ async fn compile_scope_graph(
                         resolution_strategy: Some(resolution.resolution_strategy),
                         failure_reason: None,
                         used_equal_fallback: resolution.used_equal_fallback,
+                        volume_fallback_to_one_count: resolution.volume_fallback_to_one_count,
+                        geography_tier: resolution.geography_tier,
                         allocations: allocations.clone(),
                     });
                     let consumer = compiled_process_for_idx(&compiled_processes, ex.process_idx)
@@ -1413,6 +1425,8 @@ async fn compile_scope_graph(
                         resolution_strategy: None,
                         failure_reason: Some(failure_reason),
                         used_equal_fallback: false,
+                        volume_fallback_to_one_count: 0,
+                        geography_tier: None,
                         allocations: Vec::new(),
                     });
                 }
@@ -1428,6 +1442,8 @@ async fn compile_scope_graph(
                 resolution_strategy: None,
                 failure_reason: Some(CompiledProviderFailureReason::NoProviderCandidates),
                 used_equal_fallback: false,
+                volume_fallback_to_one_count: 0,
+                geography_tier: None,
                 allocations: Vec::new(),
             });
         }
@@ -1759,6 +1775,8 @@ struct MultiProviderResolution {
     allocations: Vec<(i32, f64)>,
     resolution_strategy: CompiledProviderResolutionStrategy,
     used_equal_fallback: bool,
+    volume_fallback_to_one_count: i32,
+    geography_tier: Option<CompiledProviderGeographyTier>,
 }
 
 #[derive(Debug, Clone)]
@@ -1919,6 +1937,8 @@ fn resolve_multi_provider(
             allocations: providers.iter().map(|idx| (*idx, share)).collect(),
             resolution_strategy: CompiledProviderResolutionStrategy::SplitEqual,
             used_equal_fallback: false,
+            volume_fallback_to_one_count: 0,
+            geography_tier: None,
         }
     };
 
@@ -1940,6 +1960,10 @@ fn resolve_multi_provider(
             CompiledProviderFailureReason::RuleRequiresUniqueProvider,
         )),
         ProviderRule::SplitEqual => Ok(MultiProviderDecision::Resolved(split_equal())),
+        ProviderRule::SplitByProcessVolume => {
+            split_by_process_volume(exchange, providers, process_meta)
+                .map(MultiProviderDecision::Resolved)
+        }
         ProviderRule::BestProviderStrict => {
             let scored = scored_candidates(AUTO_LINK_MIN_SCORE)?;
             let Some(top1) = scored.first() else {
@@ -1965,6 +1989,8 @@ fn resolve_multi_provider(
                 allocations: vec![(top1.provider_idx, 1.0)],
                 resolution_strategy: CompiledProviderResolutionStrategy::BestProviderStrict,
                 used_equal_fallback: false,
+                volume_fallback_to_one_count: 0,
+                geography_tier: None,
             }))
         }
         ProviderRule::SplitByEvidenceStrict => {
@@ -1990,6 +2016,8 @@ fn resolve_multi_provider(
                     .collect(),
                 resolution_strategy: CompiledProviderResolutionStrategy::SplitByEvidence,
                 used_equal_fallback: false,
+                volume_fallback_to_one_count: 0,
+                geography_tier: None,
             }))
         }
         ProviderRule::SplitByEvidenceHybrid => {
@@ -2011,8 +2039,80 @@ fn resolve_multi_provider(
                     .collect(),
                 resolution_strategy: CompiledProviderResolutionStrategy::SplitByEvidence,
                 used_equal_fallback: false,
+                volume_fallback_to_one_count: 0,
+                geography_tier: None,
             }))
         }
+    }
+}
+
+fn split_by_process_volume(
+    exchange: &ParsedExchange,
+    providers: &[i32],
+    process_meta: &[ProcessMeta],
+) -> anyhow::Result<MultiProviderResolution> {
+    let consumer = process_meta_for_idx(process_meta, exchange.process_idx).ok_or_else(|| {
+        anyhow::anyhow!("missing consumer process meta idx={}", exchange.process_idx)
+    })?;
+    let mut tiered_providers = Vec::<(i32, CompiledProviderGeographyTier)>::new();
+    for provider_idx in providers {
+        let provider = process_meta_for_idx(process_meta, *provider_idx)
+            .ok_or_else(|| anyhow::anyhow!("missing provider process meta idx={provider_idx}"))?;
+        tiered_providers.push((
+            *provider_idx,
+            provider_geography_tier(consumer.location.as_deref(), provider.location.as_deref()),
+        ));
+    }
+
+    let selected_tier = tiered_providers
+        .iter()
+        .map(|(_, tier)| *tier)
+        .min_by_key(|tier| provider_geography_tier_rank(*tier))
+        .ok_or_else(|| anyhow::anyhow!("provider candidates cannot be empty"))?;
+    let selected_providers = tiered_providers
+        .into_iter()
+        .filter_map(|(provider_idx, tier)| (tier == selected_tier).then_some(provider_idx))
+        .collect::<Vec<_>>();
+    let mut raw_weights = Vec::<(i32, f64, bool)>::with_capacity(selected_providers.len());
+    for provider_idx in selected_providers {
+        let provider = process_meta_for_idx(process_meta, provider_idx)
+            .ok_or_else(|| anyhow::anyhow!("missing provider process meta idx={provider_idx}"))?;
+        let (raw_weight, used_fallback_to_one) = provider_volume_raw_weight(provider);
+        raw_weights.push((provider_idx, raw_weight, used_fallback_to_one));
+    }
+    let weight_sum = raw_weights
+        .iter()
+        .map(|(_, raw_weight, _)| *raw_weight)
+        .sum::<f64>();
+    if weight_sum <= f64::EPSILON || !weight_sum.is_finite() {
+        return Err(anyhow::anyhow!(
+            "process volume provider weight sum must be positive"
+        ));
+    }
+    let volume_fallback_to_one_count = i32::try_from(
+        raw_weights
+            .iter()
+            .filter(|(_, _, used_fallback_to_one)| *used_fallback_to_one)
+            .count(),
+    )
+    .map_err(|_| anyhow::anyhow!("volume fallback count overflow"))?;
+
+    Ok(MultiProviderResolution {
+        allocations: raw_weights
+            .into_iter()
+            .map(|(provider_idx, raw_weight, _)| (provider_idx, raw_weight / weight_sum))
+            .collect(),
+        resolution_strategy: CompiledProviderResolutionStrategy::SplitByProcessVolume,
+        used_equal_fallback: false,
+        volume_fallback_to_one_count,
+        geography_tier: Some(selected_tier),
+    })
+}
+
+fn provider_volume_raw_weight(provider: &ProcessMeta) -> (f64, bool) {
+    match provider.annual_supply_or_production_volume {
+        Some(value) if value.is_finite() && value > 0.0 => (value, false),
+        _ => (1.0, true),
     }
 }
 
@@ -2108,6 +2208,44 @@ fn geo_score(consumer_location: Option<&str>, provider_location: Option<&str>) -
         return 0.4;
     }
     0.1
+}
+
+fn provider_geography_tier(
+    consumer_location: Option<&str>,
+    provider_location: Option<&str>,
+) -> CompiledProviderGeographyTier {
+    let consumer = parse_location_descriptor(consumer_location);
+    let provider = parse_location_descriptor(provider_location);
+    if consumer.is_subnational
+        && provider.is_subnational
+        && consumer.canonical.is_some()
+        && consumer.canonical == provider.canonical
+    {
+        return CompiledProviderGeographyTier::LocalSubnational;
+    }
+    if consumer.country_code.is_some() && consumer.country_code == provider.country_code {
+        return CompiledProviderGeographyTier::SameCountry;
+    }
+    if !provider.is_global
+        && consumer.region_group.is_some()
+        && consumer.region_group == provider.region_group
+    {
+        return CompiledProviderGeographyTier::SameRegion;
+    }
+    if provider.is_global {
+        return CompiledProviderGeographyTier::Global;
+    }
+    CompiledProviderGeographyTier::Other
+}
+
+fn provider_geography_tier_rank(tier: CompiledProviderGeographyTier) -> u8 {
+    match tier {
+        CompiledProviderGeographyTier::LocalSubnational => 0,
+        CompiledProviderGeographyTier::SameCountry => 1,
+        CompiledProviderGeographyTier::SameRegion => 2,
+        CompiledProviderGeographyTier::Global => 3,
+        CompiledProviderGeographyTier::Other => 4,
+    }
 }
 
 fn time_score(consumer_year: Option<i32>, provider_year: Option<i32>) -> f64 {
@@ -2208,6 +2346,8 @@ fn summarize_provider_decision_diagnostics(
 ) -> SnapshotProviderDecisionDiagnostics {
     let mut resolved_strategy_counts = BTreeMap::<String, i64>::new();
     let mut unresolved_reason_counts = BTreeMap::<String, i64>::new();
+    let mut geography_tier_counts = BTreeMap::<String, i64>::new();
+    let mut volume_fallback_to_one_count = 0_i64;
 
     for decision in decisions {
         if let Some(strategy) = decision.resolution_strategy {
@@ -2220,11 +2360,19 @@ fn summarize_provider_decision_diagnostics(
                 .entry(provider_failure_reason_label(reason).to_owned())
                 .or_insert(0) += 1;
         }
+        if let Some(tier) = decision.geography_tier {
+            *geography_tier_counts
+                .entry(provider_geography_tier_label(tier).to_owned())
+                .or_insert(0) += 1;
+        }
+        volume_fallback_to_one_count += i64::from(decision.volume_fallback_to_one_count);
     }
 
     SnapshotProviderDecisionDiagnostics {
         resolved_strategy_counts,
         unresolved_reason_counts,
+        volume_fallback_to_one_count,
+        geography_tier_counts,
     }
 }
 
@@ -2235,8 +2383,19 @@ fn provider_resolution_strategy_label(
         CompiledProviderResolutionStrategy::UniqueProvider => "unique_provider",
         CompiledProviderResolutionStrategy::BestProviderStrict => "best_provider_strict",
         CompiledProviderResolutionStrategy::SplitByEvidence => "split_by_evidence",
+        CompiledProviderResolutionStrategy::SplitByProcessVolume => "split_by_process_volume",
         CompiledProviderResolutionStrategy::SplitEqual => "split_equal",
         CompiledProviderResolutionStrategy::SplitEqualFallback => "split_equal_fallback",
+    }
+}
+
+fn provider_geography_tier_label(tier: CompiledProviderGeographyTier) -> &'static str {
+    match tier {
+        CompiledProviderGeographyTier::LocalSubnational => "local_subnational",
+        CompiledProviderGeographyTier::SameCountry => "same_country",
+        CompiledProviderGeographyTier::SameRegion => "same_region",
+        CompiledProviderGeographyTier::Global => "global",
+        CompiledProviderGeographyTier::Other => "other",
     }
 }
 
@@ -2380,6 +2539,9 @@ fn resolve_process_selection(
             model_id: proc_row.model_id,
             location: parse_process_location(&proc_row.json),
             reference_year: parse_process_reference_year(&proc_row.json),
+            annual_supply_or_production_volume: parse_process_annual_supply_or_production_volume(
+                &proc_row.json,
+            ),
         });
 
         let mut input_exchanges = Vec::new();
@@ -2871,6 +3033,33 @@ fn parse_process_reference_year(process_json: &Value) -> Option<i32> {
     }
 }
 
+fn parse_process_annual_supply_or_production_volume(process_json: &Value) -> Option<f64> {
+    let value = process_json
+        .get("processDataSet")
+        .and_then(|v| v.get("modellingAndValidation"))
+        .and_then(|v| v.get("dataSourcesTreatmentAndRepresentativeness"))
+        .and_then(|v| v.get("annualSupplyOrProductionVolume"))?;
+    parse_string_multi_lang_number_prefix(value)
+}
+
+fn parse_string_multi_lang_number_prefix(value: &Value) -> Option<f64> {
+    match value {
+        Value::Array(items) => items.iter().find_map(parse_string_multi_lang_number_prefix),
+        Value::Object(_) => value
+            .get("#text")
+            .and_then(Value::as_str)
+            .and_then(parse_positive_number_prefix),
+        Value::String(text) => parse_positive_number_prefix(text),
+        _ => None,
+    }
+}
+
+fn parse_positive_number_prefix(text: &str) -> Option<f64> {
+    let token = text.split_whitespace().next()?;
+    let value = token.replace(',', "").parse::<f64>().ok()?;
+    (value.is_finite() && value > 0.0).then_some(value)
+}
+
 fn classify_flow_kind(flow_json: &Value) -> &'static str {
     let Some(category) = flow_json
         .get("flowDataSet")
@@ -3272,6 +3461,28 @@ fn write_report_files(
         "- any_provider_match_pct: `{}`\n",
         coverage.matching.any_provider_match_pct
     ));
+    md.push_str(&format!(
+        "- volume_fallback_to_one_count: `{}`\n",
+        coverage
+            .matching
+            .provider_decision_diagnostics
+            .volume_fallback_to_one_count
+    ));
+    if !coverage
+        .matching
+        .provider_decision_diagnostics
+        .geography_tier_counts
+        .is_empty()
+    {
+        md.push_str("- geography_tier_counts:\n");
+        for (tier, count) in &coverage
+            .matching
+            .provider_decision_diagnostics
+            .geography_tier_counts
+        {
+            md.push_str(&format!("  - `{tier}`: `{count}`\n"));
+        }
+    }
     if !coverage
         .matching
         .provider_decision_diagnostics
@@ -3458,6 +3669,8 @@ fn build_provider_rule_replay_row(
         provider_present_resolved_pct: pct(stats.a_input_edges_written, provider_present_total),
         resolved_strategy_counts: diagnostics.resolved_strategy_counts,
         unresolved_reason_counts: diagnostics.unresolved_reason_counts,
+        volume_fallback_to_one_count: diagnostics.volume_fallback_to_one_count,
+        geography_tier_counts: diagnostics.geography_tier_counts,
     }
 }
 
@@ -3537,6 +3750,16 @@ fn write_provider_rule_replay_report_files(
             "- provider_present_resolved_pct: `{}`\n",
             row.provider_present_resolved_pct
         ));
+        md.push_str(&format!(
+            "- volume_fallback_to_one_count: `{}`\n",
+            row.volume_fallback_to_one_count
+        ));
+        if !row.geography_tier_counts.is_empty() {
+            md.push_str("- geography_tier_counts:\n");
+            for (tier, count) in &row.geography_tier_counts {
+                md.push_str(&format!("  - `{tier}`: `{count}`\n"));
+            }
+        }
         if !row.resolved_strategy_counts.is_empty() {
             md.push_str("- resolved_strategy_counts:\n");
             for (strategy, count) in &row.resolved_strategy_counts {
@@ -3562,9 +3785,9 @@ mod tests {
         AllocationMode, Cli, ExchangeDirection, MultiProviderDecision, NormalizationMode,
         ParsedExchange, ProcessMeta, ProcessRow, ProviderRule, add_technosphere_edge,
         biosphere_gross_value, compute_scope_hash, geo_score, normalize_request_roots,
-        parse_process_states, parse_provider_rule_list, resolve_allocation_fraction,
-        resolve_multi_provider, resolve_process_selection, resolve_reference_normalization,
-        time_score,
+        parse_process_annual_supply_or_production_volume, parse_process_states,
+        parse_provider_rule_list, resolve_allocation_fraction, resolve_multi_provider,
+        resolve_process_selection, resolve_reference_normalization, time_score,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -3573,7 +3796,8 @@ mod tests {
     use uuid::Uuid;
 
     use solver_worker::compiled_graph::{
-        CompiledProviderFailureReason, CompiledProviderResolutionStrategy,
+        CompiledProviderFailureReason, CompiledProviderGeographyTier,
+        CompiledProviderResolutionStrategy,
     };
     use solver_worker::graph_types::{RequestRootProcess, ScopeProcessPartition};
 
@@ -3605,6 +3829,10 @@ mod tests {
             ProviderRule::BestProviderStrict
         );
         assert_eq!(
+            ProviderRule::parse("split_by_process_volume").expect("parse"),
+            ProviderRule::SplitByProcessVolume
+        );
+        assert_eq!(
             ProviderRule::parse("split_by_evidence").expect("parse"),
             ProviderRule::SplitByEvidenceStrict
         );
@@ -3621,7 +3849,7 @@ mod tests {
     #[test]
     fn provider_rule_list_parses_and_deduplicates() {
         let parsed = parse_provider_rule_list(
-            "strict_unique_provider, split_by_evidence, split_by_evidence , split_equal",
+            "strict_unique_provider, split_by_process_volume, split_by_evidence, split_by_evidence , split_equal",
         )
         .expect("parse");
 
@@ -3629,6 +3857,7 @@ mod tests {
             parsed,
             vec![
                 ProviderRule::StrictUniqueProvider,
+                ProviderRule::SplitByProcessVolume,
                 ProviderRule::SplitByEvidenceStrict,
                 ProviderRule::SplitEqual,
             ]
@@ -3636,9 +3865,9 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_builder_defaults_to_explainable_multi_provider_rule() {
+    fn snapshot_builder_defaults_to_process_volume_provider_rule() {
         let cli = Cli::parse_from(["snapshot_builder"]);
-        assert_eq!(cli.provider_rule, "split_by_evidence_hybrid");
+        assert_eq!(cli.provider_rule, "split_by_process_volume");
     }
 
     #[test]
@@ -3785,11 +4014,37 @@ mod tests {
     }
 
     fn process_json(exchanges: &[(&str, Uuid)]) -> serde_json::Value {
+        process_json_with_metadata(exchanges, None, None)
+    }
+
+    fn process_json_with_metadata(
+        exchanges: &[(&str, Uuid)],
+        location: Option<&str>,
+        annual_volume_text: Option<&str>,
+    ) -> serde_json::Value {
+        let geography = location.map(|location| {
+            json!({
+                "locationOfOperationSupplyOrProduction": {
+                    "@location": location
+                }
+            })
+        });
+        let annual_volume = annual_volume_text.map(|text| {
+            json!({
+                "#text": text
+            })
+        });
         json!({
             "processDataSet": {
                 "processInformation": {
                     "quantitativeReference": {
                         "referenceToReferenceFlow": "1"
+                    },
+                    "geography": geography
+                },
+                "modellingAndValidation": {
+                    "dataSourcesTreatmentAndRepresentativeness": {
+                        "annualSupplyOrProductionVolume": annual_volume
                     }
                 },
                 "exchanges": {
@@ -3822,6 +4077,242 @@ mod tests {
         Uuid::from_bytes(raw)
     }
 
+    fn test_process_meta(
+        process_idx: i32,
+        location: Option<&str>,
+        annual_volume: Option<f64>,
+    ) -> ProcessMeta {
+        ProcessMeta {
+            process_idx,
+            process_id: Uuid::from_u128(
+                u128::try_from(process_idx).expect("nonnegative process idx") + 1,
+            ),
+            process_version: "01.00.000".to_owned(),
+            process_name: None,
+            model_id: None,
+            location: location.map(ToOwned::to_owned),
+            reference_year: Some(2026),
+            annual_supply_or_production_volume: annual_volume,
+        }
+    }
+
+    #[test]
+    fn annual_supply_or_production_volume_parses_string_multilang_shapes() {
+        let object_process = process_json_with_metadata(
+            &[("Output", Uuid::new_v4())],
+            Some("CN"),
+            Some("1,234.5 kg reference flow"),
+        );
+        assert_close(
+            parse_process_annual_supply_or_production_volume(&object_process).expect("parse"),
+            1234.5,
+        );
+
+        let array_process = json!({
+            "processDataSet": {
+                "modellingAndValidation": {
+                    "dataSourcesTreatmentAndRepresentativeness": {
+                        "annualSupplyOrProductionVolume": [
+                            { "#text": "" },
+                            { "#text": "12.5 t reference flow" }
+                        ]
+                    }
+                }
+            }
+        });
+        assert_close(
+            parse_process_annual_supply_or_production_volume(&array_process).expect("parse"),
+            12.5,
+        );
+    }
+
+    #[test]
+    fn annual_supply_or_production_volume_ignores_invalid_or_non_positive_values() {
+        for text in ["", "abc kg", "0 kg", "-5 kg", "NaN kg"] {
+            let process =
+                process_json_with_metadata(&[("Output", Uuid::new_v4())], Some("CN"), Some(text));
+            assert!(
+                parse_process_annual_supply_or_production_volume(&process).is_none(),
+                "expected no parsed annual volume for {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_by_process_volume_uses_volume_within_local_tier() {
+        let process_meta = vec![
+            test_process_meta(0, Some("CN-BJ"), None),
+            test_process_meta(1, Some("CN-BJ"), Some(10.0)),
+            test_process_meta(2, Some("CN-BJ"), Some(30.0)),
+            test_process_meta(3, Some("CN"), Some(1_000.0)),
+            test_process_meta(4, Some("GLO"), Some(10_000.0)),
+        ];
+        let exchange = ParsedExchange {
+            process_idx: 0,
+            flow_id: Uuid::new_v4(),
+            direction: ExchangeDirection::Input,
+            amount: Some(1.0),
+        };
+
+        let resolution = resolve_multi_provider(
+            ProviderRule::SplitByProcessVolume,
+            &exchange,
+            &[1, 2, 3, 4],
+            &process_meta,
+        )
+        .expect("resolve");
+        let MultiProviderDecision::Resolved(resolution) = resolution else {
+            panic!("expected resolved decision");
+        };
+
+        assert_eq!(
+            resolution.resolution_strategy,
+            CompiledProviderResolutionStrategy::SplitByProcessVolume
+        );
+        assert_eq!(
+            resolution.geography_tier,
+            Some(CompiledProviderGeographyTier::LocalSubnational)
+        );
+        assert_eq!(resolution.volume_fallback_to_one_count, 0);
+        assert_eq!(resolution.allocations.len(), 2);
+        assert_eq!(resolution.allocations[0].0, 1);
+        assert_close(resolution.allocations[0].1, 0.25);
+        assert_eq!(resolution.allocations[1].0, 2);
+        assert_close(resolution.allocations[1].1, 0.75);
+    }
+
+    #[test]
+    fn split_by_process_volume_falls_back_to_one_for_missing_volume() {
+        let process_meta = vec![
+            test_process_meta(0, Some("CN-BJ"), None),
+            test_process_meta(1, Some("CN-BJ"), Some(9.0)),
+            test_process_meta(2, Some("CN-BJ"), None),
+        ];
+        let exchange = ParsedExchange {
+            process_idx: 0,
+            flow_id: Uuid::new_v4(),
+            direction: ExchangeDirection::Input,
+            amount: Some(1.0),
+        };
+
+        let resolution = resolve_multi_provider(
+            ProviderRule::SplitByProcessVolume,
+            &exchange,
+            &[1, 2],
+            &process_meta,
+        )
+        .expect("resolve");
+        let MultiProviderDecision::Resolved(resolution) = resolution else {
+            panic!("expected resolved decision");
+        };
+
+        assert_eq!(resolution.volume_fallback_to_one_count, 1);
+        assert_eq!(resolution.allocations.len(), 2);
+        assert_eq!(resolution.allocations[0].0, 1);
+        assert_close(resolution.allocations[0].1, 0.9);
+        assert_eq!(resolution.allocations[1].0, 2);
+        assert_close(resolution.allocations[1].1, 0.1);
+    }
+
+    #[test]
+    fn split_by_process_volume_uses_same_country_when_local_absent() {
+        let process_meta = vec![
+            test_process_meta(0, Some("CN-BJ"), None),
+            test_process_meta(1, Some("CN"), Some(2.0)),
+            test_process_meta(2, Some("CN-SH"), Some(6.0)),
+            test_process_meta(3, Some("GLO"), Some(100.0)),
+        ];
+        let exchange = ParsedExchange {
+            process_idx: 0,
+            flow_id: Uuid::new_v4(),
+            direction: ExchangeDirection::Input,
+            amount: Some(1.0),
+        };
+
+        let resolution = resolve_multi_provider(
+            ProviderRule::SplitByProcessVolume,
+            &exchange,
+            &[1, 2, 3],
+            &process_meta,
+        )
+        .expect("resolve");
+        let MultiProviderDecision::Resolved(resolution) = resolution else {
+            panic!("expected resolved decision");
+        };
+
+        assert_eq!(
+            resolution.geography_tier,
+            Some(CompiledProviderGeographyTier::SameCountry)
+        );
+        assert_eq!(resolution.allocations.len(), 2);
+        assert_eq!(resolution.allocations[0].0, 1);
+        assert_close(resolution.allocations[0].1, 0.25);
+        assert_eq!(resolution.allocations[1].0, 2);
+        assert_close(resolution.allocations[1].1, 0.75);
+    }
+
+    #[test]
+    fn request_roots_closure_uses_process_volume_provider_resolution() {
+        let root_process_id = Uuid::new_v4();
+        let local_provider_id = Uuid::new_v4();
+        let global_provider_id = Uuid::new_v4();
+        let flow_id = fixed_flow_id("shared-flow");
+
+        let selected = resolve_process_selection(
+            vec![
+                ProcessRow {
+                    id: root_process_id,
+                    version: "01.00.000".to_owned(),
+                    model_id: None,
+                    user_id: None,
+                    modified_at: Some(Utc::now()),
+                    json: process_json_with_metadata(&[("Input", flow_id)], Some("CN-BJ"), None),
+                },
+                ProcessRow {
+                    id: local_provider_id,
+                    version: "01.00.000".to_owned(),
+                    model_id: None,
+                    user_id: None,
+                    modified_at: Some(Utc::now()),
+                    json: process_json_with_metadata(
+                        &[("Output", flow_id)],
+                        Some("CN-BJ"),
+                        Some("1 kg reference flow"),
+                    ),
+                },
+                ProcessRow {
+                    id: global_provider_id,
+                    version: "01.00.000".to_owned(),
+                    model_id: None,
+                    user_id: None,
+                    modified_at: Some(Utc::now()),
+                    json: process_json_with_metadata(
+                        &[("Output", flow_id)],
+                        Some("GLO"),
+                        Some("100000 kg reference flow"),
+                    ),
+                },
+            ],
+            false,
+            &[100],
+            None,
+            &[RequestRootProcess::new(
+                root_process_id,
+                "01.00.000".to_owned(),
+            )],
+            ProviderRule::SplitByProcessVolume,
+            0,
+        )
+        .expect("resolve scope");
+
+        let selected_ids = selected
+            .processes
+            .iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        assert_eq!(selected_ids, vec![root_process_id, local_provider_id]);
+    }
+
     #[test]
     fn best_provider_strict_selects_single_top_candidate() {
         let process_meta = vec![
@@ -3833,6 +4324,7 @@ mod tests {
                 model_id: None,
                 location: Some("CN-BJ".to_owned()),
                 reference_year: Some(2026),
+                annual_supply_or_production_volume: None,
             },
             ProcessMeta {
                 process_idx: 1,
@@ -3842,6 +4334,7 @@ mod tests {
                 model_id: None,
                 location: Some("CN-BJ".to_owned()),
                 reference_year: Some(2026),
+                annual_supply_or_production_volume: None,
             },
             ProcessMeta {
                 process_idx: 2,
@@ -3851,6 +4344,7 @@ mod tests {
                 model_id: None,
                 location: Some("GLO".to_owned()),
                 reference_year: Some(2010),
+                annual_supply_or_production_volume: None,
             },
         ];
         let exchange = ParsedExchange {
@@ -3892,6 +4386,7 @@ mod tests {
                 model_id: Some(model_consumer),
                 location: Some("CN-BJ".to_owned()),
                 reference_year: Some(2026),
+                annual_supply_or_production_volume: None,
             },
             ProcessMeta {
                 process_idx: 1,
@@ -3901,6 +4396,7 @@ mod tests {
                 model_id: Some(model_consumer),
                 location: Some("CN".to_owned()),
                 reference_year: Some(2024),
+                annual_supply_or_production_volume: None,
             },
             ProcessMeta {
                 process_idx: 2,
@@ -3910,6 +4406,7 @@ mod tests {
                 model_id: Some(model_other),
                 location: Some("CN-BJ".to_owned()),
                 reference_year: Some(2026),
+                annual_supply_or_production_volume: None,
             },
         ];
         let exchange = ParsedExchange {
@@ -3945,6 +4442,7 @@ mod tests {
                 model_id: None,
                 location: Some("CN-BJ".to_owned()),
                 reference_year: Some(2026),
+                annual_supply_or_production_volume: None,
             },
             ProcessMeta {
                 process_idx: 1,
@@ -3954,6 +4452,7 @@ mod tests {
                 model_id: None,
                 location: Some("CN-BJ".to_owned()),
                 reference_year: Some(2026),
+                annual_supply_or_production_volume: None,
             },
             ProcessMeta {
                 process_idx: 2,
@@ -3963,6 +4462,7 @@ mod tests {
                 model_id: None,
                 location: Some("CN".to_owned()),
                 reference_year: Some(2024),
+                annual_supply_or_production_volume: None,
             },
         ];
         let exchange = ParsedExchange {
@@ -4000,6 +4500,7 @@ mod tests {
                 model_id: None,
                 location: Some("CN-BJ".to_owned()),
                 reference_year: Some(2026),
+                annual_supply_or_production_volume: None,
             },
             ProcessMeta {
                 process_idx: 1,
@@ -4009,6 +4510,7 @@ mod tests {
                 model_id: None,
                 location: Some("CN-BJ".to_owned()),
                 reference_year: Some(2026),
+                annual_supply_or_production_volume: None,
             },
             ProcessMeta {
                 process_idx: 2,
@@ -4018,6 +4520,7 @@ mod tests {
                 model_id: None,
                 location: Some("CN-BJ".to_owned()),
                 reference_year: Some(2026),
+                annual_supply_or_production_volume: None,
             },
         ];
         let exchange = ParsedExchange {
@@ -4052,6 +4555,7 @@ mod tests {
                 model_id: None,
                 location: Some("CN-BJ".to_owned()),
                 reference_year: Some(2026),
+                annual_supply_or_production_volume: None,
             },
             ProcessMeta {
                 process_idx: 1,
@@ -4061,6 +4565,7 @@ mod tests {
                 model_id: None,
                 location: Some("GLO".to_owned()),
                 reference_year: None,
+                annual_supply_or_production_volume: None,
             },
             ProcessMeta {
                 process_idx: 2,
@@ -4070,6 +4575,7 @@ mod tests {
                 model_id: None,
                 location: Some("US".to_owned()),
                 reference_year: Some(2010),
+                annual_supply_or_production_volume: None,
             },
         ];
         let exchange = ParsedExchange {

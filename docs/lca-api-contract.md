@@ -19,8 +19,8 @@ checkPaths:
   - supabase/migrations/**
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
-lastReviewedAt: 2026-04-23
-lastReviewedCommit: 4e04ac3c840390998ce4280a03c8a75829ba198a
+lastReviewedAt: 2026-05-18
+lastReviewedCommit: 14d9a905b8a5b745b1693ba4f81af8d383db0d54
 related:
   - AGENTS.md
   - .docpact/config.yaml

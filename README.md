@@ -245,10 +245,11 @@ psql "$CONN" -v ON_ERROR_STOP=1 -f supabase/migrations/20260309042000_lca_latest
 
 当前默认 provider rule：
 
-- `split_by_evidence_hybrid`
+- `split_by_process_volume`
 - 单 provider case 仍然直接按唯一 provider 写入 `A`
-- multi-provider case 先按证据加权分配；只有没有候选达到最低分时才回退到 equal split
-- 如需复现旧行为，可显式传 `--provider-rule strict_unique_provider`
+- multi-provider case 先按 local-first geography tier 选择最优非空 provider 层级，再在该层级内按 process annual volume 归一化分配
+- annual volume 缺失、非法或非正时，该 provider 的 raw weight 使用 `1.0`
+- 如需强制唯一 provider 模式，可显式传 `--provider-rule strict_unique_provider`
 
 ### 4.1.1 导出 provider link 问题 process 诊断 Excel
 
