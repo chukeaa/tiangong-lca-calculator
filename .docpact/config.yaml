@@ -29,6 +29,7 @@ ownership:
           - docs/lca-api-contract.md
           - docs/edge-function-integration.md
           - docs/frontend-integration.md
+          - docs/implicit-regional-supply-mix-modeling.md
           - docs/tidas-package-contract.md
           - .github/workflows/ai-doc-lint.yml
       ownerRepo: calculator
@@ -73,6 +74,7 @@ coverage:
     - docs/lca-api-contract.md
     - docs/edge-function-integration.md
     - docs/frontend-integration.md
+    - docs/implicit-regional-supply-mix-modeling.md
     - docs/tidas-package-contract.md
     - Cargo.toml
     - Makefile
@@ -117,6 +119,7 @@ routing:
         - scripts/export_provider_link_diagnostics.sh
         - scripts/export_unmatched_no_provider_diagnostics.sh
         - docs/agents/repo-architecture.md
+        - docs/implicit-regional-supply-mix-modeling.md
     package-worker:
       paths:
         - crates/solver-worker/src/bin/package_worker.rs
@@ -158,6 +161,7 @@ routing:
         - docs/lca-api-contract.md
         - docs/edge-function-integration.md
         - docs/frontend-integration.md
+        - docs/implicit-regional-supply-mix-modeling.md
         - docs/tidas-package-contract.md
     root-integration:
       paths:
@@ -173,6 +177,7 @@ docInventory:
     - docs/lca-api-contract.md
     - docs/edge-function-integration.md
     - docs/frontend-integration.md
+    - docs/implicit-regional-supply-mix-modeling.md
     - docs/tidas-package-contract.md
 
 repo:
@@ -240,6 +245,28 @@ rules:
       - path: docs/lca-api-contract.md
         mode: review_or_update
     reason: Solver runtime, worker behavior, and CI gates shape ownership, proof, and the shared runtime contract together.
+  - id: calculator-provider-allocation-theory-contract
+    scope: repo
+    repo: calculator
+    triggers:
+      - path: docs/implicit-regional-supply-mix-modeling.md
+        kind: theory-doc
+      - path: crates/solver-worker/src/bin/snapshot_builder.rs
+        kind: runtime-code
+      - path: crates/solver-worker/src/compiled_graph.rs
+        kind: runtime-code
+      - path: crates/solver-worker/src/snapshot_artifacts.rs
+        kind: runtime-code
+    requiredDocs:
+      - path: .docpact/config.yaml
+        mode: review_or_update
+      - path: docs/agents/repo-architecture.md
+        mode: review_or_update
+      - path: docs/agents/repo-validation.md
+        mode: review_or_update
+      - path: docs/implicit-regional-supply-mix-modeling.md
+        mode: review_or_update
+    reason: Provider allocation code and implicit regional supply mix theory must stay aligned when annual-volume weighting semantics change.
   - id: calculator-debug-and-tooling-contract
     scope: repo
     repo: calculator

@@ -22,6 +22,7 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
+  - docs/implicit-regional-supply-mix-modeling.md
   - docs/tidas-package-contract.md
   - Cargo.toml
   - Makefile
@@ -33,8 +34,8 @@ checkPaths:
   - .githooks/**
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-05-08
-lastReviewedCommit: 37a158e4817ee71553c7fcec746728cd6d5b7be0
+lastReviewedAt: 2026-05-18
+lastReviewedCommit: 875cf25f34e56bf7d9bdfff9a140a40c8a311731
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md
@@ -63,6 +64,7 @@ Start here when the task may change what the compute stack does.
 | `docs/lca-api-contract.md` | shared jobs/results/payload/status contract for consumers | branch policy, proof matrix, or edge/frontend implementation details |
 | `docs/edge-function-integration.md` | edge-facing enqueue, polling, and service-role integration contract | solver internals or frontend UX rules |
 | `docs/frontend-integration.md` | frontend-facing solve/result interaction contract | edge auth implementation or solver internals |
+| `docs/implicit-regional-supply-mix-modeling.md` | modeling basis for implicit regional supply mix and annual-volume provider share semantics | implementation checklist or consumer API contract |
 | `docs/tidas-package-contract.md` | package-worker async import/export contract | generic solver runtime or branch policy truth |
 
 ## Load Order
@@ -76,6 +78,7 @@ Read in this order:
    - `docs/lca-api-contract.md`
    - `docs/edge-function-integration.md`
    - `docs/frontend-integration.md`
+   - `docs/implicit-regional-supply-mix-modeling.md`
    - `docs/tidas-package-contract.md`
 5. `README.md` only when you need longer setup or operator-facing context
 
@@ -116,7 +119,7 @@ At a human-readable level, this repo owns:
 - `Cargo.toml`, `Makefile`, and `crates/**` for solver topology, sparse-runtime behavior, queue workers, snapshot builder flows, and package workers
 - `scripts/**` and `tools/bw25-validator/**` for manual validation, parity, debug, snapshot, and diagnostics helpers
 - `supabase/migrations/**` for runtime SQL expectations still referenced by the calculator runtime
-- `README.md`, `docs/agents/**`, `docs/lca-api-contract.md`, `docs/edge-function-integration.md`, `docs/frontend-integration.md`, `docs/tidas-package-contract.md`, and repo-local governed docs
+- `README.md`, `docs/agents/**`, `docs/lca-api-contract.md`, `docs/edge-function-integration.md`, `docs/frontend-integration.md`, `docs/implicit-regional-supply-mix-modeling.md`, `docs/tidas-package-contract.md`, and repo-local governed docs
 
 This repo does not own:
 
@@ -156,6 +159,7 @@ Route those tasks to:
 - if shared jobs/results/payload/status semantics change, update `docs/lca-api-contract.md`
 - if edge-facing enqueue, polling, or service-role integration guidance changes, update `docs/edge-function-integration.md`
 - if frontend-facing solve/result interaction guidance changes, update `docs/frontend-integration.md`
+- if implicit regional supply mix theory or annual-volume provider share semantics change, update `docs/implicit-regional-supply-mix-modeling.md`
 - if package-worker import/export contract changes, update `docs/tidas-package-contract.md`
 - if landing context or operator setup changes, update `README.md`
 - do not copy the same rule into multiple docs just to make it easier to find

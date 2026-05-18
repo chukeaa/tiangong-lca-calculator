@@ -23,12 +23,13 @@ checkPaths:
   - tools/bw25-validator/**
   - supabase/migrations/**
   - docs/lca-api-contract.md
+  - docs/implicit-regional-supply-mix-modeling.md
   - docs/tidas-package-contract.md
   - .githooks/pre-push
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-05-08
-lastReviewedCommit: 37a158e4817ee71553c7fcec746728cd6d5b7be0
+lastReviewedAt: 2026-05-18
+lastReviewedCommit: 875cf25f34e56bf7d9bdfff9a140a40c8a311731
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -68,6 +69,7 @@ Keep these constraints in mind before editing `crates/solver-core/**` or worker 
 | `docs/lca-api-contract.md` | shared jobs/results/payload/status contract for edge and frontend consumers |
 | `docs/edge-function-integration.md` | edge-facing enqueue, polling, and service-role integration contract |
 | `docs/frontend-integration.md` | frontend-side solve/result interaction contract |
+| `docs/implicit-regional-supply-mix-modeling.md` | modeling note for implicit regional supply mix and annual-volume provider share semantics |
 | `docs/tidas-package-contract.md` | package-worker async import/export contract |
 
 ## Current Runtime Families
@@ -90,6 +92,7 @@ These flows belong to the calculator runtime, not to the API repo.
 ### Snapshot builder and provider matching
 
 The snapshot builder path owns sparse payload generation, provider matching, and snapshot artifact metadata.
+The modeling basis for implicit regional supply mix and annual-volume provider shares lives in `docs/implicit-regional-supply-mix-modeling.md`.
 
 ### Package worker
 
