@@ -2494,8 +2494,13 @@ fn summarize_matching_diagnostics(compiled_graph: &CompiledGraph) -> MatchingDia
         summarize_provider_decision_diagnostics(&compiled_graph.provider_decisions);
     let mut candidate_count_histogram = BTreeMap::<String, i64>::new();
     let mut tier_counts_by_strategy = BTreeMap::<String, BTreeMap<String, i64>>::new();
+    let mut supply_region_source_counts_by_strategy =
+        BTreeMap::<String, BTreeMap<String, i64>>::new();
     let mut requested_location_granularity_counts = BTreeMap::<String, i64>::new();
+    let mut requested_location_granularity_counts_by_strategy =
+        BTreeMap::<String, BTreeMap<String, i64>>::new();
     let mut exchange_location_present_count = 0_i64;
+    let mut exchange_location_present_count_by_strategy = BTreeMap::<String, i64>::new();
     let mut unmatched_flow_counts = BTreeMap::<Uuid, i64>::new();
     let mut process_gap_counts = BTreeMap::<i32, ProcessGapAccumulator>::new();
     let mut volume_weight_summary = SnapshotVolumeWeightSummary::default();
@@ -2514,15 +2519,35 @@ fn summarize_matching_diagnostics(compiled_graph: &CompiledGraph) -> MatchingDia
             )
             .or_insert(0) += 1;
 
-        if let (Some(strategy), Some(tier)) =
-            (decision.resolution_strategy, decision.geography_tier)
-        {
-            let strategy = provider_resolution_strategy_label(strategy).to_owned();
-            let tier = provider_geography_tier_label(tier).to_owned();
-            *tier_counts_by_strategy
-                .entry(strategy)
+        if let Some(strategy) = decision.resolution_strategy {
+            let strategy_label = provider_resolution_strategy_label(strategy).to_owned();
+            if let Some(tier) = decision.geography_tier {
+                let tier = provider_geography_tier_label(tier).to_owned();
+                *tier_counts_by_strategy
+                    .entry(strategy_label.clone())
+                    .or_default()
+                    .entry(tier)
+                    .or_insert(0) += 1;
+            }
+            if let Some(source) = decision.supply_region_source {
+                let source = provider_supply_region_source_label(source).to_owned();
+                *supply_region_source_counts_by_strategy
+                    .entry(strategy_label.clone())
+                    .or_default()
+                    .entry(source)
+                    .or_insert(0) += 1;
+            }
+            if decision.exchange_location_present {
+                *exchange_location_present_count_by_strategy
+                    .entry(strategy_label.clone())
+                    .or_insert(0) += 1;
+            }
+            let granularity =
+                location_granularity_label(decision.supply_region_location.as_deref()).to_owned();
+            *requested_location_granularity_counts_by_strategy
+                .entry(strategy_label)
                 .or_default()
-                .entry(tier)
+                .entry(granularity)
                 .or_insert(0) += 1;
         }
 
@@ -2576,8 +2601,11 @@ fn summarize_matching_diagnostics(compiled_graph: &CompiledGraph) -> MatchingDia
             supply_region_source_counts: provider_decision_diagnostics
                 .supply_region_source_counts
                 .clone(),
+            supply_region_source_counts_by_strategy,
             exchange_location_present_count,
+            exchange_location_present_count_by_strategy,
             requested_location_granularity_counts,
+            requested_location_granularity_counts_by_strategy,
         },
         volume_weight_summary,
         gap_summary: SnapshotGapSummary {
@@ -4734,8 +4762,70 @@ mod tests {
             diagnostics
                 .geography_summary
                 .tier_counts_by_strategy
+                .get("unique_provider")
+                .and_then(|counts| counts.get("same_country")),
+            Some(&1)
+        );
+        assert_eq!(
+            diagnostics
+                .geography_summary
+                .tier_counts_by_strategy
                 .get("split_by_process_volume")
                 .and_then(|counts| counts.get("local_subnational")),
+            Some(&1)
+        );
+        assert_eq!(
+            diagnostics
+                .geography_summary
+                .supply_region_source_counts_by_strategy
+                .get("unique_provider")
+                .and_then(|counts| counts.get("consumer_process_location")),
+            Some(&1)
+        );
+        assert_eq!(
+            diagnostics
+                .geography_summary
+                .supply_region_source_counts_by_strategy
+                .get("split_by_process_volume")
+                .and_then(|counts| counts.get("exchange_location")),
+            Some(&1)
+        );
+        assert_eq!(
+            diagnostics
+                .geography_summary
+                .supply_region_source_counts_by_strategy
+                .get("unique_provider")
+                .and_then(|counts| counts.get("unspecified")),
+            None
+        );
+        assert_eq!(
+            diagnostics
+                .geography_summary
+                .exchange_location_present_count_by_strategy
+                .get("split_by_process_volume"),
+            Some(&1)
+        );
+        assert_eq!(
+            diagnostics
+                .geography_summary
+                .exchange_location_present_count_by_strategy
+                .get("unique_provider"),
+            None
+        );
+        assert_eq!(
+            diagnostics
+                .geography_summary
+                .requested_location_granularity_counts_by_strategy
+                .get("unique_provider")
+                .and_then(|counts| counts.get("country")),
+            Some(&1)
+        );
+        assert_eq!(
+            diagnostics
+                .geography_summary
+                .requested_location_granularity_counts_by_strategy
+                .get("split_by_process_volume")
+                .and_then(|counts| counts.get("subnational")),
             Some(&1)
         );
         assert_eq!(diagnostics.volume_weight_summary.candidate_total, 2);

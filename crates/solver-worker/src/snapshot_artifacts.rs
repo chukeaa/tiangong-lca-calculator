@@ -106,9 +106,15 @@ pub struct SnapshotGeographySummary {
     #[serde(default)]
     pub supply_region_source_counts: BTreeMap<String, i64>,
     #[serde(default)]
+    pub supply_region_source_counts_by_strategy: BTreeMap<String, BTreeMap<String, i64>>,
+    #[serde(default)]
     pub exchange_location_present_count: i64,
     #[serde(default)]
+    pub exchange_location_present_count_by_strategy: BTreeMap<String, i64>,
+    #[serde(default)]
     pub requested_location_granularity_counts: BTreeMap<String, i64>,
+    #[serde(default)]
+    pub requested_location_granularity_counts_by_strategy: BTreeMap<String, BTreeMap<String, i64>>,
 }
 
 /// Annual supply / production volume weight quality diagnostics.

@@ -19,8 +19,8 @@ checkPaths:
   - supabase/migrations/**
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
-lastReviewedAt: 2026-05-18
-lastReviewedCommit: 20919db320e399b9c53f3dd3c03426e79c5b0d40
+lastReviewedAt: 2026-05-19
+lastReviewedCommit: fa3e30458b7e20e6d7968b1185834acdb176ce93
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -175,6 +175,17 @@ snapshot coverage diagnostics 会暴露 snapshot 构建阶段的 provider linkin
 - `geography_summary`：地理层级、strategy × geography tier、supply-region anchor 来源、exchange location 覆盖情况和 location 粒度分布。
 - `volume_weight_summary`：基于 `annualSupplyOrProductionVolume` 的权重数据可用性与 fallback-to-one 情况。
 - `gap_summary`：no-provider gap 的 top flows 与 top processes。
+
+`geography_summary` 中的 canonical 字段包括：
+
+- `tier_counts`：所有 resolved provider decision 的地理匹配层级总计。
+- `tier_counts_by_strategy`：按 resolved strategy 拆分的地理匹配层级，用于判断 `unique_provider` 或 `split_by_process_volume` 各自的本地匹配与地理 fallback 分布。
+- `supply_region_source_counts`：供应区域 anchor 来源总计，典型 key 为 `exchange_location`、`consumer_process_location`、`unspecified`。
+- `supply_region_source_counts_by_strategy`：按 resolved strategy 拆分的供应区域 anchor 来源，用于判断某个 link 策略实际使用 exchange-level location 还是 consumer process location。
+- `exchange_location_present_count`：input exchange 中存在 exchange-level `location` 的总数。
+- `exchange_location_present_count_by_strategy`：按 resolved strategy 拆分的 exchange-level `location` 覆盖数。
+- `requested_location_granularity_counts`：目标供应区域粒度总计，例如 `subnational`、`country`、`region`、`global`、`unspecified`。
+- `requested_location_granularity_counts_by_strategy`：按 resolved strategy 拆分的目标供应区域粒度。
 
 `build_snapshot` job 完成时，`lca_jobs.diagnostics.build_timing_sec` 会记录 snapshot builder 主要阶段耗时。这些字段属于诊断信息，不改变 job payload、状态机或 result artifact 主契约。
 
