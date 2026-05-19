@@ -36,8 +36,10 @@ use solver_worker::graph_types::{
 };
 use solver_worker::snapshot_artifacts::{
     SNAPSHOT_ARTIFACT_FORMAT, SnapshotAllocationCoverage, SnapshotBuildConfig,
-    SnapshotCoverageReport, SnapshotMatchingCoverage, SnapshotMatrixScale,
-    SnapshotProviderDecisionDiagnostics, SnapshotReferenceCoverage, SnapshotSingularRisk,
+    SnapshotCandidateSummary, SnapshotCoverageReport, SnapshotGapSummary, SnapshotGeographySummary,
+    SnapshotMatchingCoverage, SnapshotMatrixScale, SnapshotProcessGapEntry,
+    SnapshotProviderDecisionDiagnostics, SnapshotReferenceCoverage, SnapshotResolutionSummary,
+    SnapshotSingularRisk, SnapshotUnmatchedFlowEntry, SnapshotVolumeWeightSummary,
     encode_snapshot_artifact,
 };
 use solver_worker::snapshot_index::{
@@ -302,6 +304,25 @@ struct BuildTimingSec {
     persist_metadata_sec: f64,
 }
 
+#[derive(Debug, Clone)]
+struct MatchingDiagnosticsSummary {
+    provider_decision_diagnostics: SnapshotProviderDecisionDiagnostics,
+    candidate_summary: SnapshotCandidateSummary,
+    resolution_summary: SnapshotResolutionSummary,
+    geography_summary: SnapshotGeographySummary,
+    volume_weight_summary: SnapshotVolumeWeightSummary,
+    gap_summary: SnapshotGapSummary,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ProcessGapAccumulator {
+    input_edges_total: i64,
+    unmatched_no_provider: i64,
+    a_input_edges_written: i64,
+}
+
+const GAP_TOP_K_LIMIT: usize = 20;
+
 impl ProviderRule {
     fn as_str(self) -> &'static str {
         match self {
@@ -559,6 +580,10 @@ async fn main() -> anyhow::Result<()> {
                     "[reuse] matched existing ready snapshot={}",
                     reused.snapshot_id
                 );
+                println!(
+                    "[build_timing_sec] {}",
+                    serde_json::to_string(&build_timing)?
+                );
                 println!("[resolved_snapshot_id] {resolved_snapshot_id}");
                 println!("[done] snapshot ready: {resolved_snapshot_id}");
                 println!("[artifact] {}", reused.artifact_url);
@@ -672,6 +697,10 @@ async fn main() -> anyhow::Result<()> {
         &build_timing,
     )?;
 
+    println!(
+        "[build_timing_sec] {}",
+        serde_json::to_string(&build_timing)?
+    );
     println!("[resolved_snapshot_id] {snapshot_id}");
     println!("[done] snapshot ready: {snapshot_id}");
     println!("[artifact] {artifact_url}");
@@ -1322,6 +1351,10 @@ async fn compile_scope_graph(
             let provider_idx = *providers
                 .and_then(|vec| vec.first())
                 .ok_or_else(|| anyhow::anyhow!("missing provider idx"))?;
+            let provider_meta =
+                process_meta_for_idx(&process_meta, provider_idx).ok_or_else(|| {
+                    anyhow::anyhow!("missing provider process meta idx={provider_idx}")
+                })?;
             provider_decisions.push(CompiledProviderDecision {
                 consumer_idx: ex.process_idx,
                 flow_id: ex.flow_id,
@@ -1332,9 +1365,13 @@ async fn compile_scope_graph(
                 failure_reason: None,
                 used_equal_fallback: false,
                 volume_fallback_to_one_count: 0,
-                geography_tier: None,
+                geography_tier: Some(provider_geography_tier(
+                    supply_region_anchor.location.as_deref(),
+                    provider_meta.location.as_deref(),
+                )),
                 supply_region_source: Some(supply_region_anchor.source),
                 supply_region_location: supply_region_anchor.location.clone(),
+                exchange_location_present: ex.location.is_some(),
                 allocations: vec![CompiledProviderAllocation {
                     provider_idx,
                     weight: 1.0,
@@ -1367,12 +1404,19 @@ async fn compile_scope_graph(
                 &process_meta,
             )?;
             match resolution {
-                MultiProviderDecision::Resolved(resolution) => {
+                MultiProviderDecision::Resolved(mut resolution) => {
                     matching_stats.matched_multi_resolved += 1;
                     if resolution.used_equal_fallback {
                         matching_stats.matched_multi_fallback_equal += 1;
                     }
                     matching_stats.a_input_edges_written += 1;
+                    if resolution.geography_tier.is_none() {
+                        resolution.geography_tier = best_geography_tier_for_allocations(
+                            supply_region_anchor.location.as_deref(),
+                            &resolution.allocations,
+                            &process_meta,
+                        )?;
+                    }
                     let allocations = resolution
                         .allocations
                         .into_iter()
@@ -1395,6 +1439,7 @@ async fn compile_scope_graph(
                         geography_tier: resolution.geography_tier,
                         supply_region_source: Some(supply_region_anchor.source),
                         supply_region_location: supply_region_anchor.location.clone(),
+                        exchange_location_present: ex.location.is_some(),
                         allocations: allocations.clone(),
                     });
                     let consumer = compiled_process_for_idx(&compiled_processes, ex.process_idx)
@@ -1443,6 +1488,7 @@ async fn compile_scope_graph(
                         geography_tier: None,
                         supply_region_source: Some(supply_region_anchor.source),
                         supply_region_location: supply_region_anchor.location.clone(),
+                        exchange_location_present: ex.location.is_some(),
                         allocations: Vec::new(),
                     });
                 }
@@ -1462,6 +1508,7 @@ async fn compile_scope_graph(
                 geography_tier: None,
                 supply_region_source: Some(supply_region_anchor.source),
                 supply_region_location: supply_region_anchor.location,
+                exchange_location_present: ex.location.is_some(),
                 allocations: Vec::new(),
             });
         }
@@ -1660,10 +1707,11 @@ fn assemble_sparse_payload(
         compiled_graph.allocation_stats.fraction_present_count,
         compiled_graph.allocation_stats.exchange_total,
     );
-    let provider_decision_diagnostics =
-        summarize_provider_decision_diagnostics(&compiled_graph.provider_decisions);
+    let matching_diagnostics = summarize_matching_diagnostics(compiled_graph);
 
     let coverage = SnapshotCoverageReport {
+        schema_version: solver_worker::snapshot_artifacts::SNAPSHOT_COVERAGE_SCHEMA_VERSION
+            .to_owned(),
         matching: SnapshotMatchingCoverage {
             input_edges_total: compiled_graph.matching_stats.input_edges_total,
             matched_unique_provider: compiled_graph.matching_stats.matched_unique_provider,
@@ -1679,7 +1727,12 @@ fn assemble_sparse_payload(
             provider_present_resolved_pct,
             unique_provider_match_pct,
             any_provider_match_pct,
-            provider_decision_diagnostics,
+            provider_decision_diagnostics: matching_diagnostics.provider_decision_diagnostics,
+            candidate_summary: matching_diagnostics.candidate_summary,
+            resolution_summary: matching_diagnostics.resolution_summary,
+            geography_summary: matching_diagnostics.geography_summary,
+            volume_weight_summary: matching_diagnostics.volume_weight_summary,
+            gap_summary: matching_diagnostics.gap_summary,
         },
         reference: SnapshotReferenceCoverage {
             process_total: process_count_i64,
@@ -2278,6 +2331,29 @@ fn provider_geography_tier_rank(tier: CompiledProviderGeographyTier) -> u8 {
     }
 }
 
+fn best_geography_tier_for_allocations(
+    supply_region_location: Option<&str>,
+    allocations: &[(i32, f64)],
+    process_meta: &[ProcessMeta],
+) -> anyhow::Result<Option<CompiledProviderGeographyTier>> {
+    let mut best_tier = None;
+    for (provider_idx, _) in allocations {
+        let provider = process_meta_for_idx(process_meta, *provider_idx)
+            .ok_or_else(|| anyhow::anyhow!("missing provider process meta idx={provider_idx}"))?;
+        let tier = provider_geography_tier(supply_region_location, provider.location.as_deref());
+        let should_replace = match best_tier {
+            Some(current) => {
+                provider_geography_tier_rank(tier) < provider_geography_tier_rank(current)
+            }
+            None => true,
+        };
+        if should_replace {
+            best_tier = Some(tier);
+        }
+    }
+    Ok(best_tier)
+}
+
 fn time_score(consumer_year: Option<i32>, provider_year: Option<i32>) -> f64 {
     match (consumer_year, provider_year) {
         (Some(left), Some(right)) => {
@@ -2411,6 +2487,185 @@ fn summarize_provider_decision_diagnostics(
         geography_tier_counts,
         supply_region_source_counts,
     }
+}
+
+fn summarize_matching_diagnostics(compiled_graph: &CompiledGraph) -> MatchingDiagnosticsSummary {
+    let provider_decision_diagnostics =
+        summarize_provider_decision_diagnostics(&compiled_graph.provider_decisions);
+    let mut candidate_count_histogram = BTreeMap::<String, i64>::new();
+    let mut tier_counts_by_strategy = BTreeMap::<String, BTreeMap<String, i64>>::new();
+    let mut requested_location_granularity_counts = BTreeMap::<String, i64>::new();
+    let mut exchange_location_present_count = 0_i64;
+    let mut unmatched_flow_counts = BTreeMap::<Uuid, i64>::new();
+    let mut process_gap_counts = BTreeMap::<i32, ProcessGapAccumulator>::new();
+    let mut volume_weight_summary = SnapshotVolumeWeightSummary::default();
+
+    for decision in &compiled_graph.provider_decisions {
+        *candidate_count_histogram
+            .entry(candidate_count_bucket_label(decision.candidate_provider_count).to_owned())
+            .or_insert(0) += 1;
+
+        if decision.exchange_location_present {
+            exchange_location_present_count += 1;
+        }
+        *requested_location_granularity_counts
+            .entry(
+                location_granularity_label(decision.supply_region_location.as_deref()).to_owned(),
+            )
+            .or_insert(0) += 1;
+
+        if let (Some(strategy), Some(tier)) =
+            (decision.resolution_strategy, decision.geography_tier)
+        {
+            let strategy = provider_resolution_strategy_label(strategy).to_owned();
+            let tier = provider_geography_tier_label(tier).to_owned();
+            *tier_counts_by_strategy
+                .entry(strategy)
+                .or_default()
+                .entry(tier)
+                .or_insert(0) += 1;
+        }
+
+        if decision.resolution_strategy
+            == Some(CompiledProviderResolutionStrategy::SplitByProcessVolume)
+        {
+            volume_weight_summary.decisions_total += 1;
+            let candidate_count = i64::try_from(decision.allocations.len()).unwrap_or(i64::MAX);
+            let fallback_count = i64::from(decision.volume_fallback_to_one_count);
+            volume_weight_summary.candidate_total += candidate_count;
+            volume_weight_summary.fallback_to_one_count += fallback_count;
+            if fallback_count == 0 {
+                volume_weight_summary.decisions_all_valid_count += 1;
+            } else if fallback_count >= candidate_count {
+                volume_weight_summary.decisions_all_missing_count += 1;
+            } else {
+                volume_weight_summary.decisions_partial_missing_count += 1;
+            }
+        }
+
+        let process_gap = process_gap_counts.entry(decision.consumer_idx).or_default();
+        process_gap.input_edges_total += 1;
+        if decision.matched_provider_count > 0 {
+            process_gap.a_input_edges_written += 1;
+        }
+        if decision.decision_kind == Some(CompiledProviderDecisionKind::NoProvider) {
+            process_gap.unmatched_no_provider += 1;
+            *unmatched_flow_counts.entry(decision.flow_id).or_insert(0) += 1;
+        }
+    }
+
+    volume_weight_summary.valid_volume_count = (volume_weight_summary.candidate_total
+        - volume_weight_summary.fallback_to_one_count)
+        .max(0);
+
+    MatchingDiagnosticsSummary {
+        candidate_summary: SnapshotCandidateSummary {
+            candidate_count_histogram,
+        },
+        resolution_summary: SnapshotResolutionSummary {
+            resolved_strategy_counts: provider_decision_diagnostics
+                .resolved_strategy_counts
+                .clone(),
+            unresolved_reason_counts: provider_decision_diagnostics
+                .unresolved_reason_counts
+                .clone(),
+        },
+        geography_summary: SnapshotGeographySummary {
+            tier_counts: provider_decision_diagnostics.geography_tier_counts.clone(),
+            tier_counts_by_strategy,
+            supply_region_source_counts: provider_decision_diagnostics
+                .supply_region_source_counts
+                .clone(),
+            exchange_location_present_count,
+            requested_location_granularity_counts,
+        },
+        volume_weight_summary,
+        gap_summary: SnapshotGapSummary {
+            unmatched_top_flows: top_unmatched_flows(unmatched_flow_counts),
+            process_gap_top: top_process_gaps(process_gap_counts, &compiled_graph.processes),
+        },
+        provider_decision_diagnostics,
+    }
+}
+
+fn candidate_count_bucket_label(candidate_count: i32) -> &'static str {
+    match candidate_count {
+        i32::MIN..=0 => "zero",
+        1 => "one",
+        2..=5 => "two_to_five",
+        6..=20 => "six_to_twenty",
+        _ => "gt_twenty",
+    }
+}
+
+fn location_granularity_label(location: Option<&str>) -> &'static str {
+    let Some(location) = location.map(str::trim).filter(|value| !value.is_empty()) else {
+        return "unspecified";
+    };
+    let descriptor = parse_location_descriptor(Some(location));
+    if descriptor.is_global {
+        "global"
+    } else if descriptor.is_subnational {
+        "subnational"
+    } else if descriptor.country_code.is_some() {
+        "country"
+    } else if descriptor.region_group.is_some() {
+        "region"
+    } else {
+        "unknown"
+    }
+}
+
+fn top_unmatched_flows(
+    unmatched_flow_counts: BTreeMap<Uuid, i64>,
+) -> Vec<SnapshotUnmatchedFlowEntry> {
+    let mut entries = unmatched_flow_counts
+        .into_iter()
+        .map(|(flow_id, count)| SnapshotUnmatchedFlowEntry {
+            flow_id,
+            flow_name: None,
+            count,
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.flow_id.cmp(&right.flow_id))
+    });
+    entries.truncate(GAP_TOP_K_LIMIT);
+    entries
+}
+
+fn top_process_gaps(
+    process_gap_counts: BTreeMap<i32, ProcessGapAccumulator>,
+    processes: &[CompiledProcess],
+) -> Vec<SnapshotProcessGapEntry> {
+    let mut entries = process_gap_counts
+        .into_iter()
+        .filter_map(|(process_idx, counts)| {
+            if counts.unmatched_no_provider == 0 {
+                return None;
+            }
+            let process = compiled_process_for_idx(processes, process_idx)?;
+            Some(SnapshotProcessGapEntry {
+                process_id: process.process_id,
+                process_name: process.process_name.clone(),
+                input_edges_total: counts.input_edges_total,
+                unmatched_no_provider: counts.unmatched_no_provider,
+                a_write_pct: pct(counts.a_input_edges_written, counts.input_edges_total),
+            })
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        right
+            .unmatched_no_provider
+            .cmp(&left.unmatched_no_provider)
+            .then_with(|| right.input_edges_total.cmp(&left.input_edges_total))
+            .then_with(|| left.process_id.cmp(&right.process_id))
+    });
+    entries.truncate(GAP_TOP_K_LIMIT);
+    entries
 }
 
 fn provider_resolution_strategy_label(
@@ -3358,6 +3613,67 @@ async fn persist_snapshot_metadata(
     Ok(())
 }
 
+fn append_count_map(md: &mut String, label: &str, counts: &BTreeMap<String, i64>) {
+    if counts.is_empty() {
+        return;
+    }
+    md.push_str(&format!("- {label}:\n"));
+    for (key, count) in counts {
+        md.push_str(&format!("  - `{key}`: `{count}`\n"));
+    }
+}
+
+fn append_nested_count_map(
+    md: &mut String,
+    label: &str,
+    counts: &BTreeMap<String, BTreeMap<String, i64>>,
+) {
+    if counts.is_empty() {
+        return;
+    }
+    md.push_str(&format!("- {label}:\n"));
+    for (outer_key, inner_counts) in counts {
+        md.push_str(&format!("  - `{outer_key}`:\n"));
+        for (inner_key, count) in inner_counts {
+            md.push_str(&format!("    - `{inner_key}`: `{count}`\n"));
+        }
+    }
+}
+
+fn append_unmatched_flow_top(md: &mut String, entries: &[SnapshotUnmatchedFlowEntry]) {
+    if entries.is_empty() {
+        return;
+    }
+    md.push_str("- unmatched_top_flows:\n");
+    for entry in entries {
+        if let Some(flow_name) = &entry.flow_name {
+            md.push_str(&format!(
+                "  - `{}` (`{}`): `{}`\n",
+                flow_name, entry.flow_id, entry.count
+            ));
+        } else {
+            md.push_str(&format!("  - `{}`: `{}`\n", entry.flow_id, entry.count));
+        }
+    }
+}
+
+fn append_process_gap_top(md: &mut String, entries: &[SnapshotProcessGapEntry]) {
+    if entries.is_empty() {
+        return;
+    }
+    md.push_str("- process_gap_top:\n");
+    for entry in entries {
+        let process_label = entry.process_name.as_deref().map_or_else(
+            || entry.process_id.to_string(),
+            |name| format!("{name} ({})", entry.process_id),
+        );
+        md.push_str(&format!(
+            "  - `{}`: unmatched_no_provider=`{}`, input_edges_total=`{}`, a_write_pct=`{}`\n",
+            process_label, entry.unmatched_no_provider, entry.input_edges_total, entry.a_write_pct
+        ));
+    }
+}
+
 fn write_report_files(
     report_dir: &PathBuf,
     snapshot_id: Uuid,
@@ -3390,6 +3706,75 @@ fn write_report_files(
         }
     });
     fs::write(&json_path, serde_json::to_vec_pretty(&doc)?)?;
+
+    let resolved_strategy_counts = if coverage
+        .matching
+        .resolution_summary
+        .resolved_strategy_counts
+        .is_empty()
+    {
+        &coverage
+            .matching
+            .provider_decision_diagnostics
+            .resolved_strategy_counts
+    } else {
+        &coverage
+            .matching
+            .resolution_summary
+            .resolved_strategy_counts
+    };
+    let unresolved_reason_counts = if coverage
+        .matching
+        .resolution_summary
+        .unresolved_reason_counts
+        .is_empty()
+    {
+        &coverage
+            .matching
+            .provider_decision_diagnostics
+            .unresolved_reason_counts
+    } else {
+        &coverage
+            .matching
+            .resolution_summary
+            .unresolved_reason_counts
+    };
+    let geography_tier_counts = if coverage.matching.geography_summary.tier_counts.is_empty() {
+        &coverage
+            .matching
+            .provider_decision_diagnostics
+            .geography_tier_counts
+    } else {
+        &coverage.matching.geography_summary.tier_counts
+    };
+    let supply_region_source_counts = if coverage
+        .matching
+        .geography_summary
+        .supply_region_source_counts
+        .is_empty()
+    {
+        &coverage
+            .matching
+            .provider_decision_diagnostics
+            .supply_region_source_counts
+    } else {
+        &coverage
+            .matching
+            .geography_summary
+            .supply_region_source_counts
+    };
+    let volume_fallback_to_one_count =
+        if coverage.matching.volume_weight_summary.decisions_total > 0 {
+            coverage
+                .matching
+                .volume_weight_summary
+                .fallback_to_one_count
+        } else {
+            coverage
+                .matching
+                .provider_decision_diagnostics
+                .volume_fallback_to_one_count
+        };
 
     let mut md = String::new();
     md.push_str("# Snapshot Coverage Report\n\n");
@@ -3501,6 +3886,10 @@ fn write_report_files(
         build_timing.upload_artifact_sec
     ));
     md.push_str(&format!(
+        "- upload_snapshot_index_sec: `{}`\n",
+        build_timing.upload_snapshot_index_sec
+    ));
+    md.push_str(&format!(
         "- persist_metadata_sec: `{}`\n\n",
         build_timing.persist_metadata_sec
     ));
@@ -3578,72 +3967,92 @@ fn write_report_files(
         coverage.matching.any_provider_match_pct
     ));
     md.push_str(&format!(
+        "- coverage_schema_version: `{}`\n",
+        coverage.schema_version
+    ));
+    md.push_str(&format!(
         "- volume_fallback_to_one_count: `{}`\n",
+        volume_fallback_to_one_count
+    ));
+    append_count_map(
+        &mut md,
+        "candidate_count_histogram",
+        &coverage
+            .matching
+            .candidate_summary
+            .candidate_count_histogram,
+    );
+    append_count_map(
+        &mut md,
+        "resolved_strategy_counts",
+        resolved_strategy_counts,
+    );
+    append_count_map(
+        &mut md,
+        "unresolved_reason_counts",
+        unresolved_reason_counts,
+    );
+    append_count_map(&mut md, "geography_tier_counts", geography_tier_counts);
+    append_nested_count_map(
+        &mut md,
+        "tier_counts_by_strategy",
+        &coverage.matching.geography_summary.tier_counts_by_strategy,
+    );
+    append_count_map(
+        &mut md,
+        "supply_region_source_counts",
+        supply_region_source_counts,
+    );
+    md.push_str(&format!(
+        "- exchange_location_present_count: `{}`\n",
         coverage
             .matching
-            .provider_decision_diagnostics
-            .volume_fallback_to_one_count
+            .geography_summary
+            .exchange_location_present_count
     ));
-    if !coverage
-        .matching
-        .provider_decision_diagnostics
-        .geography_tier_counts
-        .is_empty()
-    {
-        md.push_str("- geography_tier_counts:\n");
-        for (tier, count) in &coverage
+    append_count_map(
+        &mut md,
+        "requested_location_granularity_counts",
+        &coverage
             .matching
-            .provider_decision_diagnostics
-            .geography_tier_counts
-        {
-            md.push_str(&format!("  - `{tier}`: `{count}`\n"));
-        }
-    }
-    if !coverage
-        .matching
-        .provider_decision_diagnostics
-        .supply_region_source_counts
-        .is_empty()
-    {
-        md.push_str("- supply_region_source_counts:\n");
-        for (source, count) in &coverage
+            .geography_summary
+            .requested_location_granularity_counts,
+    );
+    md.push_str(&format!(
+        "- volume_weight_candidate_total: `{}`\n",
+        coverage.matching.volume_weight_summary.candidate_total
+    ));
+    md.push_str(&format!(
+        "- volume_weight_valid_volume_count: `{}`\n",
+        coverage.matching.volume_weight_summary.valid_volume_count
+    ));
+    md.push_str(&format!(
+        "- volume_weight_decisions_total: `{}`\n",
+        coverage.matching.volume_weight_summary.decisions_total
+    ));
+    md.push_str(&format!(
+        "- volume_weight_decisions_all_valid_count: `{}`\n",
+        coverage
             .matching
-            .provider_decision_diagnostics
-            .supply_region_source_counts
-        {
-            md.push_str(&format!("  - `{source}`: `{count}`\n"));
-        }
-    }
-    if !coverage
-        .matching
-        .provider_decision_diagnostics
-        .resolved_strategy_counts
-        .is_empty()
-    {
-        md.push_str("- resolved_strategy_counts:\n");
-        for (strategy, count) in &coverage
+            .volume_weight_summary
+            .decisions_all_valid_count
+    ));
+    md.push_str(&format!(
+        "- volume_weight_decisions_partial_missing_count: `{}`\n",
+        coverage
             .matching
-            .provider_decision_diagnostics
-            .resolved_strategy_counts
-        {
-            md.push_str(&format!("  - `{strategy}`: `{count}`\n"));
-        }
-    }
-    if !coverage
-        .matching
-        .provider_decision_diagnostics
-        .unresolved_reason_counts
-        .is_empty()
-    {
-        md.push_str("- unresolved_reason_counts:\n");
-        for (reason, count) in &coverage
+            .volume_weight_summary
+            .decisions_partial_missing_count
+    ));
+    md.push_str(&format!(
+        "- volume_weight_decisions_all_missing_count: `{}`\n",
+        coverage
             .matching
-            .provider_decision_diagnostics
-            .unresolved_reason_counts
-        {
-            md.push_str(&format!("  - `{reason}`: `{count}`\n"));
-        }
-    }
+            .volume_weight_summary
+            .decisions_all_missing_count
+    ));
+    append_unmatched_flow_top(&mut md, &coverage.matching.gap_summary.unmatched_top_flows);
+    append_process_gap_top(&mut md, &coverage.matching.gap_summary.process_gap_top);
     md.push('\n');
 
     md.push_str("## Reference Coverage\n\n");
@@ -3915,10 +4324,12 @@ mod tests {
     use super::{
         AllocationMode, Cli, ExchangeDirection, MultiProviderDecision, NormalizationMode,
         ParsedExchange, ProcessMeta, ProcessRow, ProviderRule, add_technosphere_edge,
-        biosphere_gross_value, compute_scope_hash, geo_score, normalize_request_roots,
+        biosphere_gross_value, candidate_count_bucket_label, compute_scope_hash, geo_score,
+        location_granularity_label, normalize_request_roots,
         parse_process_annual_supply_or_production_volume, parse_process_states,
         parse_provider_rule_list, resolve_allocation_fraction, resolve_multi_provider,
-        resolve_process_selection, resolve_reference_normalization, time_score,
+        resolve_process_selection, resolve_reference_normalization, summarize_matching_diagnostics,
+        time_score,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -3927,8 +4338,11 @@ mod tests {
     use uuid::Uuid;
 
     use solver_worker::compiled_graph::{
-        CompiledProviderFailureReason, CompiledProviderGeographyTier,
-        CompiledProviderResolutionStrategy,
+        CompiledAllocationStats, CompiledFlow, CompiledGraph, CompiledMatchingStats,
+        CompiledProcess, CompiledProviderAllocation, CompiledProviderDecision,
+        CompiledProviderDecisionKind, CompiledProviderFailureReason, CompiledProviderGeographyTier,
+        CompiledProviderResolutionStrategy, CompiledProviderSupplyRegionSource,
+        CompiledReferenceStats,
     };
     use solver_worker::graph_types::{RequestRootProcess, ScopeProcessPartition};
 
@@ -4142,6 +4556,205 @@ mod tests {
         assert_close(time_score(Some(2026), Some(2024)), 0.85);
         assert_close(time_score(Some(2026), Some(2016)), 0.4);
         assert_close(time_score(Some(2026), Some(2010)), 0.2);
+    }
+
+    #[test]
+    fn diagnostic_bucket_labels_are_stable() {
+        assert_eq!(candidate_count_bucket_label(0), "zero");
+        assert_eq!(candidate_count_bucket_label(1), "one");
+        assert_eq!(candidate_count_bucket_label(3), "two_to_five");
+        assert_eq!(candidate_count_bucket_label(12), "six_to_twenty");
+        assert_eq!(candidate_count_bucket_label(21), "gt_twenty");
+
+        assert_eq!(location_granularity_label(None), "unspecified");
+        assert_eq!(location_granularity_label(Some("CN-BJ")), "subnational");
+        assert_eq!(location_granularity_label(Some("CN")), "country");
+        assert_eq!(location_granularity_label(Some("RER")), "region");
+        assert_eq!(location_granularity_label(Some("GLO")), "global");
+        assert_eq!(
+            location_granularity_label(Some("not-a-location")),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn matching_diagnostics_aggregate_v2_summary_groups() {
+        let flow_without_provider = Uuid::from_u128(101);
+        let process_with_gap = Uuid::from_u128(202);
+        let compiled_graph = CompiledGraph {
+            processes: vec![
+                CompiledProcess {
+                    process_idx: 0,
+                    process_id: Uuid::from_u128(201),
+                    process_version: "01.00.000".to_owned(),
+                    process_name: Some("consumer with providers".to_owned()),
+                    model_id: None,
+                    location: Some("CN-BJ".to_owned()),
+                    reference_year: Some(2026),
+                    partition: ScopeProcessPartition::Public,
+                },
+                CompiledProcess {
+                    process_idx: 1,
+                    process_id: process_with_gap,
+                    process_version: "01.00.000".to_owned(),
+                    process_name: Some("consumer with gap".to_owned()),
+                    model_id: None,
+                    location: Some("CN".to_owned()),
+                    reference_year: Some(2026),
+                    partition: ScopeProcessPartition::Public,
+                },
+            ],
+            flows: Vec::<CompiledFlow>::new(),
+            provider_decisions: vec![
+                CompiledProviderDecision {
+                    consumer_idx: 0,
+                    flow_id: Uuid::from_u128(301),
+                    candidate_provider_count: 1,
+                    matched_provider_count: 1,
+                    decision_kind: Some(CompiledProviderDecisionKind::UniqueProvider),
+                    resolution_strategy: Some(CompiledProviderResolutionStrategy::UniqueProvider),
+                    failure_reason: None,
+                    used_equal_fallback: false,
+                    volume_fallback_to_one_count: 0,
+                    geography_tier: Some(CompiledProviderGeographyTier::SameCountry),
+                    supply_region_source: Some(
+                        CompiledProviderSupplyRegionSource::ConsumerProcessLocation,
+                    ),
+                    supply_region_location: Some("CN".to_owned()),
+                    exchange_location_present: false,
+                    allocations: vec![CompiledProviderAllocation {
+                        provider_idx: 2,
+                        weight: 1.0,
+                    }],
+                },
+                CompiledProviderDecision {
+                    consumer_idx: 0,
+                    flow_id: Uuid::from_u128(302),
+                    candidate_provider_count: 3,
+                    matched_provider_count: 2,
+                    decision_kind: Some(CompiledProviderDecisionKind::MultiResolved),
+                    resolution_strategy: Some(
+                        CompiledProviderResolutionStrategy::SplitByProcessVolume,
+                    ),
+                    failure_reason: None,
+                    used_equal_fallback: false,
+                    volume_fallback_to_one_count: 1,
+                    geography_tier: Some(CompiledProviderGeographyTier::LocalSubnational),
+                    supply_region_source: Some(
+                        CompiledProviderSupplyRegionSource::ExchangeLocation,
+                    ),
+                    supply_region_location: Some("CN-BJ".to_owned()),
+                    exchange_location_present: true,
+                    allocations: vec![
+                        CompiledProviderAllocation {
+                            provider_idx: 3,
+                            weight: 0.75,
+                        },
+                        CompiledProviderAllocation {
+                            provider_idx: 4,
+                            weight: 0.25,
+                        },
+                    ],
+                },
+                CompiledProviderDecision {
+                    consumer_idx: 1,
+                    flow_id: flow_without_provider,
+                    candidate_provider_count: 0,
+                    matched_provider_count: 0,
+                    decision_kind: Some(CompiledProviderDecisionKind::NoProvider),
+                    resolution_strategy: None,
+                    failure_reason: Some(CompiledProviderFailureReason::NoProviderCandidates),
+                    used_equal_fallback: false,
+                    volume_fallback_to_one_count: 0,
+                    geography_tier: None,
+                    supply_region_source: Some(CompiledProviderSupplyRegionSource::Unspecified),
+                    supply_region_location: None,
+                    exchange_location_present: false,
+                    allocations: Vec::new(),
+                },
+            ],
+            technosphere_edges: Vec::new(),
+            biosphere_edges: Vec::new(),
+            reference_stats: CompiledReferenceStats::default(),
+            allocation_stats: CompiledAllocationStats::default(),
+            matching_stats: CompiledMatchingStats::default(),
+        };
+
+        let diagnostics = summarize_matching_diagnostics(&compiled_graph);
+
+        assert_eq!(
+            diagnostics
+                .candidate_summary
+                .candidate_count_histogram
+                .get("zero"),
+            Some(&1)
+        );
+        assert_eq!(
+            diagnostics
+                .candidate_summary
+                .candidate_count_histogram
+                .get("one"),
+            Some(&1)
+        );
+        assert_eq!(
+            diagnostics
+                .candidate_summary
+                .candidate_count_histogram
+                .get("two_to_five"),
+            Some(&1)
+        );
+        assert_eq!(
+            diagnostics
+                .geography_summary
+                .requested_location_granularity_counts
+                .get("subnational"),
+            Some(&1)
+        );
+        assert_eq!(
+            diagnostics
+                .geography_summary
+                .requested_location_granularity_counts
+                .get("country"),
+            Some(&1)
+        );
+        assert_eq!(
+            diagnostics
+                .geography_summary
+                .requested_location_granularity_counts
+                .get("unspecified"),
+            Some(&1)
+        );
+        assert_eq!(
+            diagnostics
+                .geography_summary
+                .exchange_location_present_count,
+            1
+        );
+        assert_eq!(
+            diagnostics
+                .geography_summary
+                .tier_counts_by_strategy
+                .get("split_by_process_volume")
+                .and_then(|counts| counts.get("local_subnational")),
+            Some(&1)
+        );
+        assert_eq!(diagnostics.volume_weight_summary.candidate_total, 2);
+        assert_eq!(diagnostics.volume_weight_summary.valid_volume_count, 1);
+        assert_eq!(diagnostics.volume_weight_summary.fallback_to_one_count, 1);
+        assert_eq!(
+            diagnostics
+                .volume_weight_summary
+                .decisions_partial_missing_count,
+            1
+        );
+        assert_eq!(
+            diagnostics.gap_summary.unmatched_top_flows[0].flow_id,
+            flow_without_provider
+        );
+        assert_eq!(
+            diagnostics.gap_summary.process_gap_top[0].process_id,
+            process_with_gap
+        );
     }
 
     fn process_json(exchanges: &[(&str, Uuid)]) -> serde_json::Value {

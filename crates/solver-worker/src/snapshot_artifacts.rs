@@ -23,6 +23,8 @@ pub const SNAPSHOT_ARTIFACT_FORMAT: &str = "snapshot-hdf5:v1";
 pub const SNAPSHOT_ARTIFACT_EXTENSION: &str = "h5";
 /// Snapshot artifact content type.
 pub const SNAPSHOT_ARTIFACT_CONTENT_TYPE: &str = "application/x-hdf5";
+/// Snapshot coverage JSON schema identifier.
+pub const SNAPSHOT_COVERAGE_SCHEMA_VERSION: &str = "snapshot_coverage.v2";
 
 /// Snapshot build options persisted in artifact metadata.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -78,6 +80,85 @@ pub struct SnapshotProviderDecisionDiagnostics {
     pub supply_region_source_counts: BTreeMap<String, i64>,
 }
 
+/// Provider candidate distribution diagnostics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SnapshotCandidateSummary {
+    #[serde(default)]
+    pub candidate_count_histogram: BTreeMap<String, i64>,
+}
+
+/// Provider resolution diagnostics in the canonical v2 summary layout.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SnapshotResolutionSummary {
+    #[serde(default)]
+    pub resolved_strategy_counts: BTreeMap<String, i64>,
+    #[serde(default)]
+    pub unresolved_reason_counts: BTreeMap<String, i64>,
+}
+
+/// Geography and supply-region diagnostics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SnapshotGeographySummary {
+    #[serde(default)]
+    pub tier_counts: BTreeMap<String, i64>,
+    #[serde(default)]
+    pub tier_counts_by_strategy: BTreeMap<String, BTreeMap<String, i64>>,
+    #[serde(default)]
+    pub supply_region_source_counts: BTreeMap<String, i64>,
+    #[serde(default)]
+    pub exchange_location_present_count: i64,
+    #[serde(default)]
+    pub requested_location_granularity_counts: BTreeMap<String, i64>,
+}
+
+/// Annual supply / production volume weight quality diagnostics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SnapshotVolumeWeightSummary {
+    #[serde(default)]
+    pub candidate_total: i64,
+    #[serde(default)]
+    pub valid_volume_count: i64,
+    #[serde(default)]
+    pub fallback_to_one_count: i64,
+    #[serde(default)]
+    pub decisions_total: i64,
+    #[serde(default)]
+    pub decisions_all_valid_count: i64,
+    #[serde(default)]
+    pub decisions_partial_missing_count: i64,
+    #[serde(default)]
+    pub decisions_all_missing_count: i64,
+}
+
+/// Top unmatched flow entry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotUnmatchedFlowEntry {
+    pub flow_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_name: Option<String>,
+    pub count: i64,
+}
+
+/// Top process gap entry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotProcessGapEntry {
+    pub process_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_name: Option<String>,
+    pub input_edges_total: i64,
+    pub unmatched_no_provider: i64,
+    pub a_write_pct: f64,
+}
+
+/// No-provider gap diagnostics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SnapshotGapSummary {
+    #[serde(default)]
+    pub unmatched_top_flows: Vec<SnapshotUnmatchedFlowEntry>,
+    #[serde(default)]
+    pub process_gap_top: Vec<SnapshotProcessGapEntry>,
+}
+
 /// Matching coverage diagnostics.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotMatchingCoverage {
@@ -101,6 +182,16 @@ pub struct SnapshotMatchingCoverage {
     pub any_provider_match_pct: f64,
     #[serde(default)]
     pub provider_decision_diagnostics: SnapshotProviderDecisionDiagnostics,
+    #[serde(default)]
+    pub candidate_summary: SnapshotCandidateSummary,
+    #[serde(default)]
+    pub resolution_summary: SnapshotResolutionSummary,
+    #[serde(default)]
+    pub geography_summary: SnapshotGeographySummary,
+    #[serde(default)]
+    pub volume_weight_summary: SnapshotVolumeWeightSummary,
+    #[serde(default)]
+    pub gap_summary: SnapshotGapSummary,
 }
 
 /// Quantitative reference diagnostics.
@@ -147,6 +238,8 @@ pub struct SnapshotMatrixScale {
 /// Snapshot coverage report persisted beside payload.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotCoverageReport {
+    #[serde(default = "default_coverage_schema_version")]
+    pub schema_version: String,
     pub matching: SnapshotMatchingCoverage,
     #[serde(default)]
     pub reference: SnapshotReferenceCoverage,
@@ -154,6 +247,10 @@ pub struct SnapshotCoverageReport {
     pub allocation: SnapshotAllocationCoverage,
     pub singular_risk: SnapshotSingularRisk,
     pub matrix_scale: SnapshotMatrixScale,
+}
+
+fn default_coverage_schema_version() -> String {
+    SNAPSHOT_COVERAGE_SCHEMA_VERSION.to_owned()
 }
 
 fn default_strict_mode() -> String {
@@ -307,9 +404,11 @@ mod tests {
 
     use super::{
         DATASET_ENVELOPE_JSON, HDF5_DEFLATE_LEVEL, SNAPSHOT_ARTIFACT_FORMAT,
-        SnapshotAllocationCoverage, SnapshotBuildConfig, SnapshotCoverageReport,
-        SnapshotMatchingCoverage, SnapshotMatrixScale, SnapshotProviderDecisionDiagnostics,
-        SnapshotReferenceCoverage, SnapshotSelectionMode, SnapshotSingularRisk,
+        SNAPSHOT_COVERAGE_SCHEMA_VERSION, SnapshotAllocationCoverage, SnapshotBuildConfig,
+        SnapshotCandidateSummary, SnapshotCoverageReport, SnapshotGapSummary,
+        SnapshotGeographySummary, SnapshotMatchingCoverage, SnapshotMatrixScale,
+        SnapshotProviderDecisionDiagnostics, SnapshotReferenceCoverage, SnapshotResolutionSummary,
+        SnapshotSelectionMode, SnapshotSingularRisk, SnapshotVolumeWeightSummary,
         decode_snapshot_artifact, encode_snapshot_artifact,
     };
 
@@ -334,6 +433,7 @@ mod tests {
             method_version: Some("01.00.000".to_owned()),
         };
         let coverage = SnapshotCoverageReport {
+            schema_version: SNAPSHOT_COVERAGE_SCHEMA_VERSION.to_owned(),
             matching: SnapshotMatchingCoverage {
                 input_edges_total: 10,
                 matched_unique_provider: 7,
@@ -360,6 +460,11 @@ mod tests {
                     geography_tier_counts: BTreeMap::new(),
                     supply_region_source_counts: BTreeMap::new(),
                 },
+                candidate_summary: SnapshotCandidateSummary::default(),
+                resolution_summary: SnapshotResolutionSummary::default(),
+                geography_summary: SnapshotGeographySummary::default(),
+                volume_weight_summary: SnapshotVolumeWeightSummary::default(),
+                gap_summary: SnapshotGapSummary::default(),
             },
             reference: SnapshotReferenceCoverage {
                 process_total: 2,

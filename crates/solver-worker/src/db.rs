@@ -1021,6 +1021,7 @@ pub async fn handle_job_payload(state: &AppState, payload: JobPayload) -> anyhow
             .await?;
 
             let resolved_snapshot_id = executed.resolved_snapshot_id;
+            let build_timing_sec = executed.build_timing_sec.clone();
             if resolved_snapshot_id != snapshot_id {
                 set_job_snapshot_id(&state.pool, job_id, resolved_snapshot_id).await?;
             }
@@ -1038,17 +1039,20 @@ pub async fn handle_job_payload(state: &AppState, payload: JobPayload) -> anyhow
                 .await?;
             }
 
-            let completed_diag = merge_job_status_update_timing(
-                serde_json::json!({
-                    "phase": "build_snapshot",
-                    "requested_snapshot_id": snapshot_id,
-                    "snapshot_id": resolved_snapshot_id,
-                    "builder": executed,
-                    "source_hash": source_hash,
-                }),
-                "running",
-                running_db_write_sec,
-            );
+            let mut completed_payload = serde_json::json!({
+                "phase": "build_snapshot",
+                "requested_snapshot_id": snapshot_id,
+                "snapshot_id": resolved_snapshot_id,
+                "builder": executed,
+                "source_hash": source_hash,
+            });
+            if let (Some(build_timing_sec), Some(payload)) =
+                (build_timing_sec, completed_payload.as_object_mut())
+            {
+                payload.insert("build_timing_sec".to_owned(), build_timing_sec);
+            }
+            let completed_diag =
+                merge_job_status_update_timing(completed_payload, "running", running_db_write_sec);
             let _ = update_job_status(&state.pool, job_id, "completed", completed_diag).await?;
         }
     }
@@ -1249,6 +1253,8 @@ struct QueryArtifactMeta {
 struct SnapshotBuilderExecution {
     requested_snapshot_id: Uuid,
     resolved_snapshot_id: Uuid,
+    #[serde(skip_serializing)]
+    build_timing_sec: Option<Value>,
     command: Vec<String>,
     exit_code: i32,
     stdout_tail: String,
@@ -1437,6 +1443,7 @@ async fn run_snapshot_builder_job(
         return Ok(SnapshotBuilderExecution {
             requested_snapshot_id: snapshot_id,
             resolved_snapshot_id,
+            build_timing_sec: parse_snapshot_builder_build_timing(&stdout),
             command: cmd_vec,
             exit_code: output.status.code().unwrap_or(0),
             stdout_tail: tail_text(&stdout, 4000),
@@ -1520,6 +1527,14 @@ fn parse_snapshot_builder_resolved_snapshot_id(stdout: &str) -> Option<Uuid> {
         .rev()
         .find_map(|line| line.strip_prefix("[resolved_snapshot_id] "))
         .and_then(|value| Uuid::parse_str(value.trim()).ok())
+}
+
+fn parse_snapshot_builder_build_timing(stdout: &str) -> Option<Value> {
+    stdout
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("[build_timing_sec] "))
+        .and_then(|value| serde_json::from_str(value.trim()).ok())
 }
 
 async fn fetch_snapshot_source_hash(
@@ -1807,8 +1822,10 @@ fn _assert_result_types(_a: SolveResult, _b: SolveBatchResult) {}
 mod tests {
     use super::{
         SolveOptionsPayload, build_all_unit_rhs_batch, normalize_all_unit_batch_size,
-        parse_snapshot_builder_resolved_snapshot_id, resolve_solve_all_unit_options,
+        parse_snapshot_builder_build_timing, parse_snapshot_builder_resolved_snapshot_id,
+        resolve_solve_all_unit_options,
     };
+    use serde_json::json;
     use uuid::Uuid;
 
     #[test]
@@ -1864,6 +1881,18 @@ mod tests {
         assert_eq!(
             parse_snapshot_builder_resolved_snapshot_id("[done] snapshot ready: not-used\n"),
             None
+        );
+    }
+
+    #[test]
+    fn parses_build_timing_from_builder_stdout() {
+        let stdout = r#"[build_timing_sec] {"total_sec":1.25,"reused_snapshot":false}
+[resolved_snapshot_id] 9b19e81d-e81b-4c11-8585-7adcff2fcb95
+"#;
+
+        assert_eq!(
+            parse_snapshot_builder_build_timing(stdout),
+            Some(json!({"total_sec": 1.25, "reused_snapshot": false}))
         );
     }
 }

@@ -135,6 +135,8 @@ pub struct CompiledProviderDecision {
     pub supply_region_source: Option<CompiledProviderSupplyRegionSource>,
     #[serde(default)]
     pub supply_region_location: Option<String>,
+    #[serde(default)]
+    pub exchange_location_present: bool,
     pub allocations: Vec<CompiledProviderAllocation>,
 }
 
