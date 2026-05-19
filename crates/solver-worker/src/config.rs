@@ -35,6 +35,21 @@ pub struct AppConfig {
     /// Message visibility timeout for pgmq.read.
     #[arg(long, env = "WORKER_VT_SECONDS", default_value_t = 30_i32)]
     pub worker_vt_seconds: i32,
+    /// Maximum number of DB connections held by the worker process.
+    #[arg(long, env = "DB_MAX_CONNECTIONS", default_value_t = 8_u32)]
+    pub db_max_connections: u32,
+    /// Minimum number of DB connections kept by the worker process.
+    #[arg(long, env = "DB_MIN_CONNECTIONS", default_value_t = 1_u32)]
+    pub db_min_connections: u32,
+    /// DB connection acquire timeout for the worker process.
+    #[arg(long, env = "DB_ACQUIRE_TIMEOUT_SECONDS", default_value_t = 30_u64)]
+    pub db_acquire_timeout_seconds: u64,
+    /// Maximum number of concurrent `build_snapshot` jobs across worker instances.
+    #[arg(long, env = "BUILD_SNAPSHOT_MAX_CONCURRENCY", default_value_t = 1_u32)]
+    pub build_snapshot_max_concurrency: u32,
+    /// Poll interval while waiting for a `build_snapshot` concurrency slot.
+    #[arg(long, env = "BUILD_SNAPSHOT_LOCK_POLL_MS", default_value_t = 5_000_u64)]
+    pub build_snapshot_lock_poll_ms: u64,
     /// Internal HTTP bind address.
     #[arg(long, env = "HTTP_ADDR", default_value = "0.0.0.0:8080")]
     pub http_addr: String,
@@ -80,9 +95,92 @@ impl AppConfig {
         Duration::from_millis(self.worker_poll_ms)
     }
 
+    /// Sanitized maximum DB connections for the worker process.
+    #[must_use]
+    pub fn db_max_connections(&self) -> u32 {
+        self.db_max_connections.max(1)
+    }
+
+    /// Sanitized minimum DB connections for the worker process.
+    #[must_use]
+    pub fn db_min_connections(&self) -> u32 {
+        self.db_min_connections.min(self.db_max_connections())
+    }
+
+    /// DB connection acquire timeout.
+    #[must_use]
+    pub fn db_acquire_timeout(&self) -> Duration {
+        Duration::from_secs(self.db_acquire_timeout_seconds.max(1))
+    }
+
+    /// Sanitized maximum `build_snapshot` concurrency.
+    #[must_use]
+    pub fn build_snapshot_max_concurrency(&self) -> u32 {
+        self.build_snapshot_max_concurrency.max(1)
+    }
+
+    /// Poll interval used when all `build_snapshot` concurrency slots are busy.
+    #[must_use]
+    pub fn build_snapshot_lock_poll_interval(&self) -> Duration {
+        Duration::from_millis(self.build_snapshot_lock_poll_ms.max(100))
+    }
+
     /// Parsed http socket addr.
     pub fn http_socket_addr(&self) -> anyhow::Result<SocketAddr> {
         SocketAddr::from_str(&self.http_addr)
             .map_err(|err| anyhow::anyhow!("invalid HTTP_ADDR {}: {err}", self.http_addr))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppConfig;
+    use clap::Parser;
+    use std::time::Duration;
+
+    #[test]
+    fn db_and_build_snapshot_config_defaults_match_previous_limits() {
+        let config = AppConfig::parse_from([
+            "solver-worker",
+            "--database-url",
+            "postgres://example.local/app",
+        ]);
+
+        assert_eq!(config.db_max_connections(), 8);
+        assert_eq!(config.db_min_connections(), 1);
+        assert_eq!(config.db_acquire_timeout(), Duration::from_secs(30));
+        assert_eq!(config.build_snapshot_max_concurrency(), 1);
+        assert_eq!(
+            config.build_snapshot_lock_poll_interval(),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn db_and_build_snapshot_config_clamps_invalid_low_values() {
+        let config = AppConfig::parse_from([
+            "solver-worker",
+            "--database-url",
+            "postgres://example.local/app",
+            "--db-max-connections",
+            "0",
+            "--db-min-connections",
+            "4",
+            "--db-acquire-timeout-seconds",
+            "0",
+            "--build-snapshot-max-concurrency",
+            "0",
+            "--build-snapshot-lock-poll-ms",
+            "1",
+        ]);
+
+        assert_eq!(config.db_max_connections(), 1);
+        assert_eq!(config.db_min_connections(), 1);
+        assert_eq!(config.db_acquire_timeout(), Duration::from_secs(1));
+        assert_eq!(config.build_snapshot_max_concurrency(), 1);
+        assert_eq!(
+            config.build_snapshot_lock_poll_interval(),
+            Duration::from_millis(100)
+        );
     }
 }

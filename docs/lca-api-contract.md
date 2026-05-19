@@ -20,7 +20,7 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
 lastReviewedAt: 2026-05-19
-lastReviewedCommit: fa3e30458b7e20e6d7968b1185834acdb176ce93
+lastReviewedCommit: a5cf624ebe294e40cb3d11377678b6020a362631
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -38,7 +38,7 @@ related:
 - 数值核心固定为 `M = I - A`，只解 `M x = y`。
 - `snapshot_builder` 对 elementary flow 的 `B` 采用 `gross` 口径（`Input/Output` 均按原始 `amount` 入模，不做方向符号翻转）。
 - 计算入口是异步 `lca_jobs` + `pgmq`，不走前端直连队列。
-- worker 连接池当前默认采用 `idle_timeout = 5min` 与 `max_lifetime = 30min`，以保证长时求解与 artifact 落盘阶段有稳定连接窗口。
+- worker 连接池可通过 `DB_MAX_CONNECTIONS`、`DB_MIN_CONNECTIONS` 和 `DB_ACQUIRE_TIMEOUT_SECONDS` 调整；默认采用 `max_connections = 8`、`min_connections = 1`、`acquire_timeout = 30s`、`idle_timeout = 5min` 与 `max_lifetime = 30min`，以保证长时求解与 artifact 落盘阶段有稳定连接窗口。
 - 主路径读取 `lca_snapshot_artifacts`（artifact-first），旧 `lca_*_entries` 仅兼容回退。
 - 所有写操作由服务端（Edge Function / worker，`service_role`）执行。
 
@@ -187,7 +187,7 @@ snapshot coverage diagnostics 会暴露 snapshot 构建阶段的 provider linkin
 - `requested_location_granularity_counts`：目标供应区域粒度总计，例如 `subnational`、`country`、`region`、`global`、`unspecified`。
 - `requested_location_granularity_counts_by_strategy`：按 resolved strategy 拆分的目标供应区域粒度。
 
-`build_snapshot` job 完成时，`lca_jobs.diagnostics.build_timing_sec` 会记录 snapshot builder 主要阶段耗时。这些字段属于诊断信息，不改变 job payload、状态机或 result artifact 主契约。
+`build_snapshot` job 运行和完成时，`lca_jobs.diagnostics.build_snapshot_lock` 会记录全局构建并发锁信息，包括 `strategy`、`max_concurrency`、`slot`、`waiting` 与 `wait_sec`；完成时 `lca_jobs.diagnostics.build_timing_sec` 会记录 snapshot builder 主要阶段耗时。这些字段属于诊断信息，不改变 job payload、状态机或 result artifact 主契约。
 
 ## 6. 幂等与请求缓存（建议约束）
 

@@ -10,8 +10,9 @@ use solver_core::{
     ModelSparseData, NumericOptions, PrepareResult, SolveBatchResult, SolveComputationTiming,
     SolveOptions, SolveResult, SolverService, SparseTriplet,
 };
-use sqlx::{PgPool, Row, postgres::PgPoolOptions};
-use tracing::{instrument, warn};
+use sqlx::{PgPool, Postgres, Row, pool::PoolConnection, postgres::PgPoolOptions};
+use tokio::time::sleep;
+use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -45,18 +46,81 @@ pub struct AppState {
     pub solver: SolverService,
     /// Object storage for result/snapshot artifacts.
     pub object_store: ObjectStoreClient,
+    /// Maximum number of concurrent `build_snapshot` jobs across worker instances.
+    pub build_snapshot_max_concurrency: u32,
+    /// Poll interval while waiting for a `build_snapshot` concurrency slot.
+    pub build_snapshot_lock_poll_interval: Duration,
 }
 
 const DEFAULT_ALL_UNIT_BATCH_SIZE: usize = 128;
 const MAX_ALL_UNIT_BATCH_SIZE: usize = 2_048;
+const BUILD_SNAPSHOT_ADVISORY_LOCK_BASE: i64 = 0x5447_4c43_4253_4e50;
+
+struct BuildSnapshotLockGuard {
+    conn: Option<PoolConnection<Postgres>>,
+    key: i64,
+    slot: u32,
+    wait_sec: f64,
+    max_concurrency: u32,
+}
+
+impl BuildSnapshotLockGuard {
+    fn diagnostics(&self) -> Value {
+        serde_json::json!({
+            "enabled": true,
+            "strategy": "postgres_advisory_lock",
+            "max_concurrency": self.max_concurrency,
+            "slot": self.slot,
+            "wait_sec": self.wait_sec,
+        })
+    }
+
+    async fn release(mut self) -> anyhow::Result<()> {
+        let Some(mut conn) = self.conn.take() else {
+            return Ok(());
+        };
+
+        match sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
+            .bind(self.key)
+            .fetch_one(&mut *conn)
+            .await
+        {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                warn!(
+                    lock_key = self.key,
+                    slot = self.slot,
+                    "build_snapshot advisory lock was not held when releasing"
+                );
+                Ok(())
+            }
+            Err(err) => {
+                conn.close_on_drop();
+                Err(err.into())
+            }
+        }
+    }
+}
+
+impl Drop for BuildSnapshotLockGuard {
+    fn drop(&mut self) {
+        if self.conn.is_some() {
+            warn!(
+                lock_key = self.key,
+                slot = self.slot,
+                "build_snapshot advisory lock guard dropped before explicit release"
+            );
+        }
+    }
+}
 
 impl AppState {
     /// Creates app state with DB pool and required object storage.
     pub async fn new(config: &AppConfig) -> anyhow::Result<Self> {
         let pool = PgPoolOptions::new()
-            .max_connections(8)
-            .min_connections(1)
-            .acquire_timeout(Duration::from_secs(30))
+            .max_connections(config.db_max_connections())
+            .min_connections(config.db_min_connections())
+            .acquire_timeout(config.db_acquire_timeout())
             .idle_timeout(Duration::from_mins(5))
             .max_lifetime(Duration::from_mins(30))
             .test_before_acquire(true)
@@ -95,7 +159,46 @@ impl AppState {
             pool,
             solver: SolverService::new(),
             object_store,
+            build_snapshot_max_concurrency: config.build_snapshot_max_concurrency(),
+            build_snapshot_lock_poll_interval: config.build_snapshot_lock_poll_interval(),
         })
+    }
+}
+
+async fn acquire_build_snapshot_lock(
+    pool: &PgPool,
+    max_concurrency: u32,
+    poll_interval: Duration,
+) -> anyhow::Result<BuildSnapshotLockGuard> {
+    let started = Instant::now();
+    let max_concurrency = max_concurrency.max(1);
+    let poll_interval = poll_interval.max(Duration::from_millis(100));
+
+    loop {
+        for slot in 0..max_concurrency {
+            let key = BUILD_SNAPSHOT_ADVISORY_LOCK_BASE + i64::from(slot);
+            let mut conn = pool.acquire().await?;
+            let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
+                .bind(key)
+                .fetch_one(&mut *conn)
+                .await?;
+            if acquired {
+                let wait_sec = started.elapsed().as_secs_f64();
+                info!(
+                    lock_key = key,
+                    slot, max_concurrency, wait_sec, "acquired build_snapshot advisory lock"
+                );
+                return Ok(BuildSnapshotLockGuard {
+                    conn: Some(conn),
+                    key,
+                    slot,
+                    wait_sec,
+                    max_concurrency,
+                });
+            }
+        }
+
+        sleep(poll_interval).await;
     }
 }
 
@@ -999,11 +1102,39 @@ pub async fn handle_job_payload(state: &AppState, payload: JobPayload) -> anyhow
                 serde_json::json!({
                     "phase": "build_snapshot",
                     "snapshot_id": snapshot_id,
+                    "build_snapshot_lock": {
+                        "enabled": true,
+                        "strategy": "postgres_advisory_lock",
+                        "max_concurrency": state.build_snapshot_max_concurrency,
+                        "waiting": true,
+                    },
                 }),
             )
             .await?;
 
-            let executed = run_snapshot_builder_job(
+            let lock_guard = acquire_build_snapshot_lock(
+                &state.pool,
+                state.build_snapshot_max_concurrency,
+                state.build_snapshot_lock_poll_interval,
+            )
+            .await?;
+            let mut build_snapshot_lock = lock_guard.diagnostics();
+            if let Some(lock_payload) = build_snapshot_lock.as_object_mut() {
+                lock_payload.insert("waiting".to_owned(), Value::Bool(false));
+            }
+            let _lock_running_db_write_sec = update_job_status(
+                &state.pool,
+                job_id,
+                "running",
+                serde_json::json!({
+                    "phase": "build_snapshot",
+                    "snapshot_id": snapshot_id,
+                    "build_snapshot_lock": build_snapshot_lock,
+                }),
+            )
+            .await?;
+
+            let executed_result = run_snapshot_builder_job(
                 snapshot_id,
                 process_states.as_deref(),
                 include_user_id,
@@ -1018,7 +1149,27 @@ pub async fn handle_job_payload(state: &AppState, payload: JobPayload) -> anyhow
                 method_version.as_deref(),
                 no_lcia.unwrap_or(false),
             )
-            .await?;
+            .await;
+            let release_result = lock_guard.release().await;
+            let executed = match executed_result {
+                Ok(executed) => {
+                    if let Err(err) = release_result {
+                        return Err(anyhow::anyhow!(
+                            "failed to release build_snapshot advisory lock: {err}"
+                        ));
+                    }
+                    executed
+                }
+                Err(err) => {
+                    if let Err(release_err) = release_result {
+                        warn!(
+                            error = %release_err,
+                            "failed to release build_snapshot advisory lock after builder failure"
+                        );
+                    }
+                    return Err(err);
+                }
+            };
 
             let resolved_snapshot_id = executed.resolved_snapshot_id;
             let build_timing_sec = executed.build_timing_sec.clone();
@@ -1044,6 +1195,7 @@ pub async fn handle_job_payload(state: &AppState, payload: JobPayload) -> anyhow
                 "requested_snapshot_id": snapshot_id,
                 "snapshot_id": resolved_snapshot_id,
                 "builder": executed,
+                "build_snapshot_lock": build_snapshot_lock,
                 "source_hash": source_hash,
             });
             if let (Some(build_timing_sec), Some(payload)) =

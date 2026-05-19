@@ -20,8 +20,8 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/tidas-package-contract.md
-lastReviewedAt: 2026-04-23
-lastReviewedCommit: 4e04ac3c840390998ce4280a03c8a75829ba198a
+lastReviewedAt: 2026-05-19
+lastReviewedCommit: a5cf624ebe294e40cb3d11377678b6020a362631
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -281,6 +281,18 @@ psql "$CONN" -v ON_ERROR_STOP=1 -f supabase/migrations/20260309042000_lca_latest
 - `PGMQ_QUEUE`（默认 `lca_jobs`）
 - `SOLVER_MODE`（`worker` / `http` / `both`）
 - `HTTP_ADDR`（默认 `0.0.0.0:8080`）
+- `WORKER_POLL_MS`（默认 `1000`）
+- `WORKER_VT_SECONDS`（默认 `30`；生产 `build_snapshot` 队列建议按最长任务耗时设置，例如 `1800`）
+
+数据库连接池与 `build_snapshot` 并发：
+
+- `DB_MAX_CONNECTIONS`（worker 进程连接池上限，默认 `8`）
+- `DB_MIN_CONNECTIONS`（worker 进程连接池保留连接数，默认 `1`）
+- `DB_ACQUIRE_TIMEOUT_SECONDS`（worker 获取连接超时，默认 `30`）
+- `BUILD_SNAPSHOT_MAX_CONCURRENCY`（跨 worker 实例的 `build_snapshot` 并发上限，默认 `1`）
+- `BUILD_SNAPSHOT_LOCK_POLL_MS`（等待 `build_snapshot` 并发槽位时的轮询间隔，默认 `5000`）
+- `SNAPSHOT_BUILDER_DB_MAX_CONNECTIONS`（`snapshot_builder` 子进程连接池上限，默认 `4`）
+- `SNAPSHOT_BUILDER_DB_ACQUIRE_TIMEOUT_SECONDS`（`snapshot_builder` 获取连接超时，默认 `30`）
 
 对象存储（snapshot builder / solver-worker / result_gc 必需）：
 
@@ -546,7 +558,7 @@ Group=ubuntu
 WorkingDirectory=/home/ubuntu/projects/lca_workspace/tiangong-lca-calculator
 EnvironmentFile=/home/ubuntu/projects/lca_workspace/tiangong-lca-calculator/.env
 Environment=RUST_LOG=info
-ExecStart=/home/ubuntu/projects/lca_workspace/tiangong-lca-calculator/target/release/solver-worker --mode worker --worker-vt-seconds 600 --worker-poll-ms 300
+ExecStart=/home/ubuntu/projects/lca_workspace/tiangong-lca-calculator/target/release/solver-worker --mode worker --worker-vt-seconds 1800 --worker-poll-ms 300
 Restart=always
 RestartSec=2
 TimeoutStopSec=30
@@ -581,7 +593,9 @@ sudo systemctl restart solver-worker@1 solver-worker@2
 建议：
 
 - 先从 2 个 worker 实例开始，再根据队列积压和 CPU 使用率调整。
-- `WORKER_VT_SECONDS` 需要大于慢任务耗时，避免消息重复消费。
+- `WORKER_VT_SECONDS` 需要大于“等待 `build_snapshot` 并发槽位 + 实际构建”的最慢耗时，避免消息重复消费。
+- 多台机器共享同一个数据库队列时，生产环境建议保持 `BUILD_SNAPSHOT_MAX_CONCURRENCY=1`，用全局 advisory lock 串行化全量快照构建；普通 solve 类任务仍可由多个 worker 实例并行消费。
+- 如 Supabase 连接数紧张，优先调低每个 worker 的 `DB_MAX_CONNECTIONS`，再结合 `SNAPSHOT_BUILDER_DB_MAX_CONNECTIONS` 控制全量构建期间的连接峰值。
 
 ### 6.4 TIDAS Package Worker 常驻（systemd，推荐）
 

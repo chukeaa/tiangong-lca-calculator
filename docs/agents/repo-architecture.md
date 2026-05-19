@@ -30,7 +30,7 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-05-19
-lastReviewedCommit: fa3e30458b7e20e6d7968b1185834acdb176ce93
+lastReviewedCommit: a5cf624ebe294e40cb3d11377678b6020a362631
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -111,7 +111,8 @@ Result artifacts are persisted through the worker and supporting runtime storage
 ## Operational Baseline
 
 - Solve result persistence is S3-only; treat `lca_results` as artifact metadata plus diagnostics, not as an inline result store.
-- The worker DB pool currently uses a 5-minute idle timeout and a 30-minute max lifetime; keep equivalent long-running job headroom if you retune the pool.
+- The worker DB pool is configurable through `DB_MAX_CONNECTIONS`, `DB_MIN_CONNECTIONS`, and `DB_ACQUIRE_TIMEOUT_SECONDS`; it still keeps a 5-minute idle timeout and a 30-minute max lifetime by default, so preserve equivalent long-running job headroom if you retune the pool.
+- `build_snapshot` is globally throttled with a PostgreSQL advisory lock (`BUILD_SNAPSHOT_MAX_CONCURRENCY`, default `1`) across worker instances; keep `WORKER_VT_SECONDS` larger than the worst-case lock wait plus build time.
 - Queue enqueue and protected writes stay on service-side runtime paths guarded by existing RLS and `service_role` boundaries.
 - Worker and snapshot paths require DB connectivity plus the required S3 env set before runtime validation is meaningful.
 

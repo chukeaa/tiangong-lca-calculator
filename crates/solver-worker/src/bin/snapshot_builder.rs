@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use clap::Parser;
@@ -56,6 +56,18 @@ struct Cli {
     database_url: Option<String>,
     #[arg(long, env = "CONN")]
     conn: Option<String>,
+    #[arg(
+        long,
+        env = "SNAPSHOT_BUILDER_DB_MAX_CONNECTIONS",
+        default_value_t = 4_u32
+    )]
+    db_max_connections: u32,
+    #[arg(
+        long,
+        env = "SNAPSHOT_BUILDER_DB_ACQUIRE_TIMEOUT_SECONDS",
+        default_value_t = 30_u64
+    )]
+    db_acquire_timeout_seconds: u64,
     #[arg(long, env = "S3_ENDPOINT")]
     s3_endpoint: Option<String>,
     #[arg(long, env = "S3_REGION")]
@@ -388,7 +400,8 @@ async fn main() -> anyhow::Result<()> {
         .or(cli.conn.as_deref())
         .ok_or_else(|| anyhow::anyhow!("missing DB connection: set DATABASE_URL or CONN"))?;
     let pool = PgPoolOptions::new()
-        .max_connections(4)
+        .max_connections(cli.db_max_connections.max(1))
+        .acquire_timeout(Duration::from_secs(cli.db_acquire_timeout_seconds.max(1)))
         .after_connect(|conn, _meta| {
             Box::pin(async move {
                 sqlx::query("SET statement_timeout = 0")
