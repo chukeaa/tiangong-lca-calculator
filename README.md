@@ -20,8 +20,8 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/tidas-package-contract.md
-lastReviewedAt: 2026-05-19
-lastReviewedCommit: a5cf624ebe294e40cb3d11377678b6020a362631
+lastReviewedAt: 2026-05-20
+lastReviewedCommit: f23848d58634dbf6f77df741210476f8d7bf61a1
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -278,6 +278,7 @@ psql "$CONN" -v ON_ERROR_STOP=1 -f supabase/migrations/20260309042000_lca_latest
 最小必需：
 
 - `DATABASE_URL` 或 `CONN`
+- `QUEUE_DATABASE_URL` 或 `QUEUE_CONN`（可选；仅用于 pgmq read/archive，未设置时复用 `DATABASE_URL` / `CONN`）
 - `PGMQ_QUEUE`（默认 `lca_jobs`）
 - `SOLVER_MODE`（`worker` / `http` / `both`）
 - `HTTP_ADDR`（默认 `0.0.0.0:8080`）
@@ -289,10 +290,20 @@ psql "$CONN" -v ON_ERROR_STOP=1 -f supabase/migrations/20260309042000_lca_latest
 - `DB_MAX_CONNECTIONS`（worker 进程连接池上限，默认 `8`）
 - `DB_MIN_CONNECTIONS`（worker 进程连接池保留连接数，默认 `1`）
 - `DB_ACQUIRE_TIMEOUT_SECONDS`（worker 获取连接超时，默认 `30`）
+- `QUEUE_DB_MAX_CONNECTIONS`（队列轮询连接池上限，默认 `2`）
+- `QUEUE_DB_MIN_CONNECTIONS`（队列轮询连接池保留连接数，默认 `0`）
+- `QUEUE_DB_ACQUIRE_TIMEOUT_SECONDS`（队列轮询获取连接超时，默认 `30`）
 - `BUILD_SNAPSHOT_MAX_CONCURRENCY`（跨 worker 实例的 `build_snapshot` 并发上限，默认 `1`）
 - `BUILD_SNAPSHOT_LOCK_POLL_MS`（等待 `build_snapshot` 并发槽位时的轮询间隔，默认 `5000`）
 - `SNAPSHOT_BUILDER_DB_MAX_CONNECTIONS`（`snapshot_builder` 子进程连接池上限，默认 `4`）
 - `SNAPSHOT_BUILDER_DB_ACQUIRE_TIMEOUT_SECONDS`（`snapshot_builder` 获取连接超时，默认 `30`）
+
+Supabase 连接说明：
+
+- worker / package worker 支持双连接池：`DATABASE_URL` / `CONN` 用于 solver、package、snapshot builder 与结果写入等主业务查询；`QUEUE_DATABASE_URL` / `QUEUE_CONN` 仅用于 pgmq polling / archive。
+- 推荐生产配置：主业务连接保留在 session/direct 连接或 session pooler；`QUEUE_DATABASE_URL` 使用 Supabase transaction pooler（通常是 `:6543`）。
+- 运行时 SQLx 查询使用非持久 prepared statement，以避免后端复用导致 `sqlx_s_*` 语句名冲突；高频 pgmq polling / archive 操作使用 `raw_sql` 简单查询协议与受限队列名字面量，避免 6543 transaction pooler 不支持 prepared statement 协议导致空轮询失败。
+- `build_snapshot` 全局并发控制使用 transaction-level advisory lock，适配 transaction pooler；生产环境仍建议保持 `BUILD_SNAPSHOT_MAX_CONCURRENCY=1`。
 
 对象存储（snapshot builder / solver-worker / result_gc 必需）：
 

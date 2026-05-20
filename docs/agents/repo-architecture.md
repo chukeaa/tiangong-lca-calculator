@@ -29,8 +29,8 @@ checkPaths:
   - .githooks/pre-push
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-05-19
-lastReviewedCommit: a5cf624ebe294e40cb3d11377678b6020a362631
+lastReviewedAt: 2026-05-20
+lastReviewedCommit: f23848d58634dbf6f77df741210476f8d7bf61a1
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -111,8 +111,9 @@ Result artifacts are persisted through the worker and supporting runtime storage
 ## Operational Baseline
 
 - Solve result persistence is S3-only; treat `lca_results` as artifact metadata plus diagnostics, not as an inline result store.
-- The worker DB pool is configurable through `DB_MAX_CONNECTIONS`, `DB_MIN_CONNECTIONS`, and `DB_ACQUIRE_TIMEOUT_SECONDS`; it still keeps a 5-minute idle timeout and a 30-minute max lifetime by default, so preserve equivalent long-running job headroom if you retune the pool.
-- `build_snapshot` is globally throttled with a PostgreSQL advisory lock (`BUILD_SNAPSHOT_MAX_CONCURRENCY`, default `1`) across worker instances; keep `WORKER_VT_SECONDS` larger than the worst-case lock wait plus build time.
+- The worker uses a main DB pool plus an optional queue-only DB pool. The main pool is configured through `DATABASE_URL` / `CONN`, `DB_MAX_CONNECTIONS`, `DB_MIN_CONNECTIONS`, and `DB_ACQUIRE_TIMEOUT_SECONDS`; it should remain on a session/direct connection or session pooler when compute paths use SQLx bound queries. The queue-only pool is configured through `QUEUE_DATABASE_URL` / `QUEUE_CONN`, `QUEUE_DB_MAX_CONNECTIONS`, `QUEUE_DB_MIN_CONNECTIONS`, and `QUEUE_DB_ACQUIRE_TIMEOUT_SECONDS`; if no queue URL is set it reuses the main pool.
+- `build_snapshot` is globally throttled with a PostgreSQL transaction-level advisory lock (`BUILD_SNAPSHOT_MAX_CONCURRENCY`, default `1`) across worker instances; keep `WORKER_VT_SECONDS` larger than the worst-case lock wait plus build time.
+- Runtime SQLx queries use non-persistent prepared statements so the worker does not reuse named prepared statements across PostgreSQL session reuse boundaries. High-frequency pgmq polling and archive operations use the queue-only pool plus `raw_sql` with validated queue-name literals so they can run through the simple query protocol on Supabase's 6543 transaction pooler without moving compute/package/snapshot queries onto that pooler.
 - Queue enqueue and protected writes stay on service-side runtime paths guarded by existing RLS and `service_role` boundaries.
 - Worker and snapshot paths require DB connectivity plus the required S3 env set before runtime validation is meaningful.
 

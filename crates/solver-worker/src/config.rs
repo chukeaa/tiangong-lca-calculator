@@ -26,6 +26,13 @@ pub struct AppConfig {
     /// `PostgreSQL` URL fallback used by this project in local `.env`.
     #[arg(long, env = "CONN")]
     pub conn: Option<String>,
+    /// Optional queue-only `PostgreSQL` URL. Use this for transaction poolers
+    /// such as Supabase 6543 while keeping main compute queries on `DATABASE_URL`.
+    #[arg(long, env = "QUEUE_DATABASE_URL")]
+    pub queue_database_url: Option<String>,
+    /// Queue-only `PostgreSQL` URL fallback used by this project in local `.env`.
+    #[arg(long, env = "QUEUE_CONN")]
+    pub queue_conn: Option<String>,
     /// Queue name in pgmq.
     #[arg(long, env = "PGMQ_QUEUE", default_value = "lca_jobs")]
     pub pgmq_queue: String,
@@ -44,6 +51,19 @@ pub struct AppConfig {
     /// DB connection acquire timeout for the worker process.
     #[arg(long, env = "DB_ACQUIRE_TIMEOUT_SECONDS", default_value_t = 30_u64)]
     pub db_acquire_timeout_seconds: u64,
+    /// Maximum number of DB connections held by the queue polling pool.
+    #[arg(long, env = "QUEUE_DB_MAX_CONNECTIONS", default_value_t = 2_u32)]
+    pub queue_db_max_connections: u32,
+    /// Minimum number of DB connections kept by the queue polling pool.
+    #[arg(long, env = "QUEUE_DB_MIN_CONNECTIONS", default_value_t = 0_u32)]
+    pub queue_db_min_connections: u32,
+    /// DB connection acquire timeout for the queue polling pool.
+    #[arg(
+        long,
+        env = "QUEUE_DB_ACQUIRE_TIMEOUT_SECONDS",
+        default_value_t = 30_u64
+    )]
+    pub queue_db_acquire_timeout_seconds: u64,
     /// Maximum number of concurrent `build_snapshot` jobs across worker instances.
     #[arg(long, env = "BUILD_SNAPSHOT_MAX_CONCURRENCY", default_value_t = 1_u32)]
     pub build_snapshot_max_concurrency: u32,
@@ -89,6 +109,21 @@ impl AppConfig {
             })
     }
 
+    /// Returns queue-only database URL from `QUEUE_DATABASE_URL` / `QUEUE_CONN`,
+    /// falling back to the main runtime database URL.
+    pub fn resolved_queue_database_url(&self) -> anyhow::Result<&str> {
+        self.queue_database_url
+            .as_deref()
+            .or(self.queue_conn.as_deref())
+            .map_or_else(|| self.resolved_database_url(), Ok)
+    }
+
+    /// Returns whether queue DB URL was explicitly configured.
+    #[must_use]
+    pub fn has_explicit_queue_database_url(&self) -> bool {
+        self.queue_database_url.is_some() || self.queue_conn.is_some()
+    }
+
     /// Poll interval as Duration.
     #[must_use]
     pub fn poll_interval(&self) -> Duration {
@@ -111,6 +146,25 @@ impl AppConfig {
     #[must_use]
     pub fn db_acquire_timeout(&self) -> Duration {
         Duration::from_secs(self.db_acquire_timeout_seconds.max(1))
+    }
+
+    /// Sanitized maximum DB connections for the queue polling pool.
+    #[must_use]
+    pub fn queue_db_max_connections(&self) -> u32 {
+        self.queue_db_max_connections.max(1)
+    }
+
+    /// Sanitized minimum DB connections for the queue polling pool.
+    #[must_use]
+    pub fn queue_db_min_connections(&self) -> u32 {
+        self.queue_db_min_connections
+            .min(self.queue_db_max_connections())
+    }
+
+    /// Queue DB connection acquire timeout.
+    #[must_use]
+    pub fn queue_db_acquire_timeout(&self) -> Duration {
+        Duration::from_secs(self.queue_db_acquire_timeout_seconds.max(1))
     }
 
     /// Sanitized maximum `build_snapshot` concurrency.
@@ -149,6 +203,14 @@ mod tests {
         assert_eq!(config.db_max_connections(), 8);
         assert_eq!(config.db_min_connections(), 1);
         assert_eq!(config.db_acquire_timeout(), Duration::from_secs(30));
+        assert_eq!(
+            config.resolved_queue_database_url().unwrap(),
+            "postgres://example.local/app"
+        );
+        assert!(!config.has_explicit_queue_database_url());
+        assert_eq!(config.queue_db_max_connections(), 2);
+        assert_eq!(config.queue_db_min_connections(), 0);
+        assert_eq!(config.queue_db_acquire_timeout(), Duration::from_secs(30));
         assert_eq!(config.build_snapshot_max_concurrency(), 1);
         assert_eq!(
             config.build_snapshot_lock_poll_interval(),
@@ -168,6 +230,12 @@ mod tests {
             "4",
             "--db-acquire-timeout-seconds",
             "0",
+            "--queue-db-max-connections",
+            "0",
+            "--queue-db-min-connections",
+            "4",
+            "--queue-db-acquire-timeout-seconds",
+            "0",
             "--build-snapshot-max-concurrency",
             "0",
             "--build-snapshot-lock-poll-ms",
@@ -177,10 +245,30 @@ mod tests {
         assert_eq!(config.db_max_connections(), 1);
         assert_eq!(config.db_min_connections(), 1);
         assert_eq!(config.db_acquire_timeout(), Duration::from_secs(1));
+        assert_eq!(config.queue_db_max_connections(), 1);
+        assert_eq!(config.queue_db_min_connections(), 1);
+        assert_eq!(config.queue_db_acquire_timeout(), Duration::from_secs(1));
         assert_eq!(config.build_snapshot_max_concurrency(), 1);
         assert_eq!(
             config.build_snapshot_lock_poll_interval(),
             Duration::from_millis(100)
         );
+    }
+
+    #[test]
+    fn queue_database_url_overrides_main_database_url() {
+        let config = AppConfig::parse_from([
+            "solver-worker",
+            "--database-url",
+            "postgres://example.local/app",
+            "--queue-database-url",
+            "postgres://pooler.example.local/app",
+        ]);
+
+        assert_eq!(
+            config.resolved_queue_database_url().unwrap(),
+            "postgres://pooler.example.local/app"
+        );
+        assert!(config.has_explicit_queue_database_url());
     }
 }

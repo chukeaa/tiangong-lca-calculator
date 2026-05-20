@@ -5,12 +5,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::pgbouncer_sqlx::{
+    self as sqlx, PgPool, Postgres, Row, Transaction, postgres::PgPoolOptions,
+};
 use serde_json::{Map, Value};
 use solver_core::{
     ModelSparseData, NumericOptions, PrepareResult, SolveBatchResult, SolveComputationTiming,
     SolveOptions, SolveResult, SolverService, SparseTriplet,
 };
-use sqlx::{PgPool, Postgres, Row, pool::PoolConnection, postgres::PgPoolOptions};
 use tokio::time::sleep;
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
@@ -40,8 +42,10 @@ pub struct QueueMessage {
 /// App state shared by worker and HTTP server.
 #[derive(Debug)]
 pub struct AppState {
-    /// DB pool.
+    /// Main DB pool for compute, package, snapshot, and result persistence queries.
     pub pool: PgPool,
+    /// Queue-only DB pool for pgmq read/archive operations.
+    pub queue_pool: PgPool,
     /// Core solver service.
     pub solver: SolverService,
     /// Object storage for result/snapshot artifacts.
@@ -56,8 +60,19 @@ const DEFAULT_ALL_UNIT_BATCH_SIZE: usize = 128;
 const MAX_ALL_UNIT_BATCH_SIZE: usize = 2_048;
 const BUILD_SNAPSHOT_ADVISORY_LOCK_BASE: i64 = 0x5447_4c43_4253_4e50;
 
+fn pgmq_queue_name_literal(queue_name: &str) -> anyhow::Result<String> {
+    if queue_name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        Ok(format!("'{queue_name}'"))
+    } else {
+        Err(anyhow::anyhow!("invalid pgmq queue name: {queue_name}"))
+    }
+}
+
 struct BuildSnapshotLockGuard {
-    conn: Option<PoolConnection<Postgres>>,
+    tx: Option<Transaction<'static, Postgres>>,
     key: i64,
     slot: u32,
     wait_sec: f64,
@@ -68,7 +83,7 @@ impl BuildSnapshotLockGuard {
     fn diagnostics(&self) -> Value {
         serde_json::json!({
             "enabled": true,
-            "strategy": "postgres_advisory_lock",
+            "strategy": "postgres_transaction_advisory_lock",
             "max_concurrency": self.max_concurrency,
             "slot": self.slot,
             "wait_sec": self.wait_sec,
@@ -76,39 +91,22 @@ impl BuildSnapshotLockGuard {
     }
 
     async fn release(mut self) -> anyhow::Result<()> {
-        let Some(mut conn) = self.conn.take() else {
+        let Some(tx) = self.tx.take() else {
             return Ok(());
         };
 
-        match sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
-            .bind(self.key)
-            .fetch_one(&mut *conn)
-            .await
-        {
-            Ok(true) => Ok(()),
-            Ok(false) => {
-                warn!(
-                    lock_key = self.key,
-                    slot = self.slot,
-                    "build_snapshot advisory lock was not held when releasing"
-                );
-                Ok(())
-            }
-            Err(err) => {
-                conn.close_on_drop();
-                Err(err.into())
-            }
-        }
+        tx.commit().await?;
+        Ok(())
     }
 }
 
 impl Drop for BuildSnapshotLockGuard {
     fn drop(&mut self) {
-        if self.conn.is_some() {
+        if self.tx.is_some() {
             warn!(
                 lock_key = self.key,
                 slot = self.slot,
-                "build_snapshot advisory lock guard dropped before explicit release"
+                "build_snapshot transaction advisory lock guard dropped before explicit release"
             );
         }
     }
@@ -117,15 +115,25 @@ impl Drop for BuildSnapshotLockGuard {
 impl AppState {
     /// Creates app state with DB pool and required object storage.
     pub async fn new(config: &AppConfig) -> anyhow::Result<Self> {
-        let pool = PgPoolOptions::new()
-            .max_connections(config.db_max_connections())
-            .min_connections(config.db_min_connections())
-            .acquire_timeout(config.db_acquire_timeout())
-            .idle_timeout(Duration::from_mins(5))
-            .max_lifetime(Duration::from_mins(30))
-            .test_before_acquire(true)
-            .connect(config.resolved_database_url()?)
-            .await?;
+        let pool = connect_pool(
+            config.resolved_database_url()?,
+            config.db_max_connections(),
+            config.db_min_connections(),
+            config.db_acquire_timeout(),
+        )
+        .await?;
+
+        let queue_pool = if config.has_explicit_queue_database_url() {
+            connect_pool(
+                config.resolved_queue_database_url()?,
+                config.queue_db_max_connections(),
+                config.queue_db_min_connections(),
+                config.queue_db_acquire_timeout(),
+            )
+            .await?
+        } else {
+            pool.clone()
+        };
 
         let endpoint = config
             .s3_endpoint
@@ -157,12 +165,30 @@ impl AppState {
 
         Ok(Self {
             pool,
+            queue_pool,
             solver: SolverService::new(),
             object_store,
             build_snapshot_max_concurrency: config.build_snapshot_max_concurrency(),
             build_snapshot_lock_poll_interval: config.build_snapshot_lock_poll_interval(),
         })
     }
+}
+
+async fn connect_pool(
+    database_url: &str,
+    max_connections: u32,
+    min_connections: u32,
+    acquire_timeout: Duration,
+) -> anyhow::Result<PgPool> {
+    Ok(PgPoolOptions::new()
+        .max_connections(max_connections)
+        .min_connections(min_connections)
+        .acquire_timeout(acquire_timeout)
+        .idle_timeout(Duration::from_mins(5))
+        .max_lifetime(Duration::from_mins(30))
+        .test_before_acquire(true)
+        .connect(database_url)
+        .await?)
 }
 
 async fn acquire_build_snapshot_lock(
@@ -177,25 +203,29 @@ async fn acquire_build_snapshot_lock(
     loop {
         for slot in 0..max_concurrency {
             let key = BUILD_SNAPSHOT_ADVISORY_LOCK_BASE + i64::from(slot);
-            let mut conn = pool.acquire().await?;
-            let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
+            let mut tx = pool.begin().await?;
+            let acquired = sqlx::query_scalar::<bool>("SELECT pg_try_advisory_xact_lock($1)")
                 .bind(key)
-                .fetch_one(&mut *conn)
+                .fetch_one(&mut *tx)
                 .await?;
             if acquired {
                 let wait_sec = started.elapsed().as_secs_f64();
                 info!(
                     lock_key = key,
-                    slot, max_concurrency, wait_sec, "acquired build_snapshot advisory lock"
+                    slot,
+                    max_concurrency,
+                    wait_sec,
+                    "acquired build_snapshot transaction advisory lock"
                 );
                 return Ok(BuildSnapshotLockGuard {
-                    conn: Some(conn),
+                    tx: Some(tx),
                     key,
                     slot,
                     wait_sec,
                     max_concurrency,
                 });
             }
+            tx.rollback().await?;
         }
 
         sleep(poll_interval).await;
@@ -209,26 +239,26 @@ pub async fn read_one_queue_message(
     queue_name: &str,
     vt_seconds: i32,
 ) -> anyhow::Result<Option<QueueMessage>> {
-    let row = sqlx::query(
+    let queue_name = pgmq_queue_name_literal(queue_name)?;
+    let rows = sqlx::raw_sql(&format!(
         r"
         SELECT msg_id, message
-        FROM pgmq.read($1, $2, $3)
+        FROM pgmq.read({queue_name}, {vt_seconds}, 1)
         LIMIT 1
-        ",
-    )
-    .bind(queue_name)
-    .bind(vt_seconds)
-    .bind(1_i32)
-    .fetch_optional(pool)
+        "
+    ))
+    .fetch_all(pool)
     .await?;
 
-    row.map(|r| {
-        Ok(QueueMessage {
-            msg_id: r.try_get::<i64, _>("msg_id")?,
-            payload: r.try_get::<Value, _>("message")?,
+    rows.into_iter()
+        .next()
+        .map(|r| {
+            Ok(QueueMessage {
+                msg_id: r.try_get::<i64, _>("msg_id")?,
+                payload: r.try_get::<Value, _>("message")?,
+            })
         })
-    })
-    .transpose()
+        .transpose()
 }
 
 /// Archives processed message.
@@ -238,9 +268,8 @@ pub async fn archive_queue_message(
     queue_name: &str,
     msg_id: i64,
 ) -> anyhow::Result<()> {
-    let _ = sqlx::query("SELECT pgmq.archive($1, $2)")
-        .bind(queue_name)
-        .bind(msg_id)
+    let queue_name = pgmq_queue_name_literal(queue_name)?;
+    let _ = sqlx::raw_sql(&format!("SELECT pgmq.archive({queue_name}, {msg_id})"))
         .execute(pool)
         .await?;
     Ok(())
@@ -1104,7 +1133,7 @@ pub async fn handle_job_payload(state: &AppState, payload: JobPayload) -> anyhow
                     "snapshot_id": snapshot_id,
                     "build_snapshot_lock": {
                         "enabled": true,
-                        "strategy": "postgres_advisory_lock",
+                        "strategy": "postgres_transaction_advisory_lock",
                         "max_concurrency": state.build_snapshot_max_concurrency,
                         "waiting": true,
                     },

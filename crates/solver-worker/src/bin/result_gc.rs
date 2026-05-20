@@ -1,6 +1,6 @@
 use clap::Parser;
+use solver_worker::pgbouncer_sqlx::{self as sqlx, Row, postgres::PgPoolOptions};
 use solver_worker::storage::ObjectStoreClient;
-use sqlx::{Row, postgres::PgPoolOptions};
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]

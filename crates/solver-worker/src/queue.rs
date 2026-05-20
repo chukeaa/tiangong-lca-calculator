@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::pgbouncer_sqlx as sqlx;
 use serde_json::Value;
 use tokio::time::sleep;
 use tracing::{error, info, instrument, warn};
@@ -28,7 +29,7 @@ fn extract_snapshot_id(payload: &JobPayload) -> Option<Uuid> {
 
 /// Fetches snapshot coverage from `lca_snapshot_artifacts` for richer error diagnostics.
 async fn fetch_snapshot_coverage(pool: &sqlx::PgPool, snapshot_id: Uuid) -> Option<Value> {
-    sqlx::query_scalar::<_, Value>(
+    sqlx::query_scalar::<Value>(
         "SELECT coverage FROM public.lca_snapshot_artifacts \
          WHERE snapshot_id = $1 AND status = 'ready' \
          ORDER BY created_at DESC LIMIT 1",
@@ -48,7 +49,7 @@ async fn detect_duplicate_exchange_processes(
     pool: &sqlx::PgPool,
     snapshot_id: Uuid,
 ) -> Option<Value> {
-    let result = sqlx::query_scalar::<_, Value>(
+    let result = sqlx::query_scalar::<Value>(
         r"
         WITH snapshot_scope AS (
             SELECT
@@ -125,7 +126,7 @@ async fn detect_duplicate_exchange_processes(
 /// in the same process with identical amounts — the process "provides to itself".
 /// This creates numerical instability (negative activities) in the solver.
 async fn detect_service_loop_processes(pool: &sqlx::PgPool, snapshot_id: Uuid) -> Option<Value> {
-    let result = sqlx::query_scalar::<_, Value>(
+    let result = sqlx::query_scalar::<Value>(
         r"
         WITH snapshot_scope AS (
             SELECT
@@ -232,7 +233,7 @@ pub async fn run_worker_loop(
     poll_interval: std::time::Duration,
 ) -> anyhow::Result<()> {
     loop {
-        match read_one_queue_message(&state.pool, &queue_name, vt_seconds).await {
+        match read_one_queue_message(&state.queue_pool, &queue_name, vt_seconds).await {
             Ok(Some(message)) => {
                 let parsed = serde_json::from_value::<JobPayload>(message.payload.clone());
                 match parsed {
@@ -280,7 +281,7 @@ pub async fn run_worker_loop(
                 }
 
                 if let Err(err) =
-                    archive_queue_message(&state.pool, &queue_name, message.msg_id).await
+                    archive_queue_message(&state.queue_pool, &queue_name, message.msg_id).await
                 {
                     error!(error = %err, msg_id = message.msg_id, "failed to archive queue message");
                 }

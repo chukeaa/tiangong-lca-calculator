@@ -34,6 +34,7 @@ use solver_worker::compiled_graph::{
 use solver_worker::graph_types::{
     RequestRootProcess, ResolvedScopeProcess, ScopeProcessPartition, SnapshotSelectionMode,
 };
+use solver_worker::pgbouncer_sqlx::{self as sqlx, PgPool, Row, postgres::PgPoolOptions};
 use solver_worker::snapshot_artifacts::{
     SNAPSHOT_ARTIFACT_FORMAT, SnapshotAllocationCoverage, SnapshotBuildConfig,
     SnapshotCandidateSummary, SnapshotCoverageReport, SnapshotGapSummary, SnapshotGeographySummary,
@@ -46,7 +47,6 @@ use solver_worker::snapshot_index::{
     SnapshotImpactMapEntry, SnapshotIndexDocument, SnapshotProcessMapEntry,
 };
 use solver_worker::storage::ObjectStoreClient;
-use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Parser)]
@@ -822,7 +822,7 @@ async fn resolve_method_identity(pool: &PgPool, cli: &Cli) -> anyhow::Result<Met
             .method_version
             .clone()
             .ok_or_else(|| anyhow::anyhow!("missing method version"))?;
-        let factor_count = sqlx::query_scalar::<_, i64>(
+        let factor_count = sqlx::query_scalar::<i64>(
             r#"
             SELECT
               CASE

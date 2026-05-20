@@ -17,8 +17,8 @@ checkPaths:
   - .docpact/config.yaml
   - crates/solver-worker/**
   - docs/agents/repo-validation.md
-lastReviewedAt: 2026-04-23
-lastReviewedCommit: 4e04ac3c840390998ce4280a03c8a75829ba198a
+lastReviewedAt: 2026-05-20
+lastReviewedCommit: f7c7d97e64dab987631281c3835eb7d2a343b94a
 related:
   - AGENTS.md
   - .docpact/config.yaml

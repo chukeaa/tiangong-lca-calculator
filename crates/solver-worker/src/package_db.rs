@@ -1,7 +1,7 @@
 use std::time::Instant;
 
+use crate::pgbouncer_sqlx::{self as sqlx, PgPool, Row};
 use serde_json::{Map, Value};
-use sqlx::{PgPool, Row};
 use tracing::{instrument, warn};
 use uuid::Uuid;
 

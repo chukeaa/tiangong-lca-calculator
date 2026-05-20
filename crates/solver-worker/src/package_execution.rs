@@ -9,10 +9,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::pgbouncer_sqlx::{self as sqlx, PgPool, Postgres, QueryBuilder, Row};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 use tempfile::{Builder, NamedTempFile, TempDir};
 use uuid::Uuid;
 use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
@@ -955,7 +955,7 @@ async fn fetch_scope_seed_scan_batch_after_cursor(
     builder
         .push(" ORDER BY id ASC, version ASC LIMIT ")
         .push_bind(limit);
-    let rows = builder.build().fetch_all(pool).await?;
+    let rows = builder.build().persistent(false).fetch_all(pool).await?;
 
     rows.iter()
         .map(|row| parse_seed_scan_entry_row(table, row))
@@ -1005,7 +1005,7 @@ async fn insert_export_items(
                   refs_done = lca_package_export_items.refs_done OR EXCLUDED.refs_done, \
                   updated_at = NOW()",
         );
-        builder.build().execute(pool).await?;
+        builder.build().persistent(false).execute(pool).await?;
     }
 
     Ok(())

@@ -60,7 +60,7 @@ async fn run_package_worker_loop(
     poll_interval: std::time::Duration,
 ) -> anyhow::Result<()> {
     loop {
-        match read_one_queue_message(&state.pool, &queue_name, vt_seconds).await {
+        match read_one_queue_message(&state.queue_pool, &queue_name, vt_seconds).await {
             Ok(Some(message)) => {
                 let parsed = serde_json::from_value::<PackageJobPayload>(message.payload.clone());
                 match parsed {
@@ -151,7 +151,7 @@ async fn run_package_worker_loop(
                 }
 
                 if let Err(err) =
-                    archive_queue_message(&state.pool, &queue_name, message.msg_id).await
+                    archive_queue_message(&state.queue_pool, &queue_name, message.msg_id).await
                 {
                     error!(error = %err, msg_id = message.msg_id, "failed to archive queue message");
                 }

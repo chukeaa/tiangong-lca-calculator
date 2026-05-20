@@ -19,8 +19,8 @@ checkPaths:
   - supabase/migrations/**
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
-lastReviewedAt: 2026-05-19
-lastReviewedCommit: a5cf624ebe294e40cb3d11377678b6020a362631
+lastReviewedAt: 2026-05-20
+lastReviewedCommit: f7c7d97e64dab987631281c3835eb7d2a343b94a
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -187,7 +187,7 @@ snapshot coverage diagnostics 会暴露 snapshot 构建阶段的 provider linkin
 - `requested_location_granularity_counts`：目标供应区域粒度总计，例如 `subnational`、`country`、`region`、`global`、`unspecified`。
 - `requested_location_granularity_counts_by_strategy`：按 resolved strategy 拆分的目标供应区域粒度。
 
-`build_snapshot` job 运行和完成时，`lca_jobs.diagnostics.build_snapshot_lock` 会记录全局构建并发锁信息，包括 `strategy`、`max_concurrency`、`slot`、`waiting` 与 `wait_sec`；完成时 `lca_jobs.diagnostics.build_timing_sec` 会记录 snapshot builder 主要阶段耗时。这些字段属于诊断信息，不改变 job payload、状态机或 result artifact 主契约。
+`build_snapshot` job 运行和完成时，`lca_jobs.diagnostics.build_snapshot_lock` 会记录全局构建并发锁信息，包括 `strategy`、`max_concurrency`、`slot`、`waiting` 与 `wait_sec`；当前 `strategy` 为 `postgres_transaction_advisory_lock`。完成时 `lca_jobs.diagnostics.build_timing_sec` 会记录 snapshot builder 主要阶段耗时。这些字段属于诊断信息，不改变 job payload、状态机或 result artifact 主契约。
 
 ## 6. 幂等与请求缓存（建议约束）
 
