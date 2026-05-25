@@ -1,7 +1,7 @@
 version: 1
 layout: repo
-lastReviewedAt: "2026-05-24"
-lastReviewedCommit: "b91dc5253939c88e32b9caafc48350e38fcc1bec"
+lastReviewedAt: "2026-05-25"
+lastReviewedCommit: "48a86e85dde828830d22d1de9ae9585ec1fec365"
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.
@@ -27,6 +27,7 @@ ownership:
           - .docpact/**
           - docs/agents/**
           - docs/lca-api-contract.md
+          - docs/matrix-readiness-report-contract.md
           - docs/edge-function-integration.md
           - docs/frontend-integration.md
           - docs/implicit-regional-supply-mix-modeling.md
@@ -75,6 +76,7 @@ coverage:
     - docs/agents/repo-validation.md
     - docs/agents/repo-architecture.md
     - docs/lca-api-contract.md
+    - docs/matrix-readiness-report-contract.md
     - docs/edge-function-integration.md
     - docs/frontend-integration.md
     - docs/implicit-regional-supply-mix-modeling.md
@@ -116,6 +118,15 @@ routing:
         - crates/solver-core/**
         - crates/solver-worker/src/**
         - docs/lca-api-contract.md
+        - docs/matrix-readiness-report-contract.md
+    matrix-readiness:
+      paths:
+        - crates/solver-worker/src/readiness.rs
+        - crates/solver-worker/src/bin/matrix_readiness.rs
+        - crates/solver-worker/src/bin/snapshot_builder.rs
+        - crates/solver-worker/src/compiled_graph.rs
+        - docs/matrix-readiness-report-contract.md
+        - docs/agents/repo-validation.md
     snapshot-and-provider:
       paths:
         - crates/solver-worker/src/bin/snapshot_builder.rs
@@ -165,6 +176,7 @@ routing:
         - .docpact/**
         - docs/agents/**
         - docs/lca-api-contract.md
+        - docs/matrix-readiness-report-contract.md
         - docs/edge-function-integration.md
         - docs/frontend-integration.md
         - docs/implicit-regional-supply-mix-modeling.md
@@ -182,6 +194,7 @@ docInventory:
     - docs/agents/repo-validation.md
     - docs/agents/repo-architecture.md
     - docs/lca-api-contract.md
+    - docs/matrix-readiness-report-contract.md
     - docs/edge-function-integration.md
     - docs/frontend-integration.md
     - docs/implicit-regional-supply-mix-modeling.md
@@ -329,6 +342,30 @@ rules:
       - path: docs/agents/repo-validation.md
         mode: review_or_update
     reason: Shared jobs, payload, and result semantics must stay aligned with repo runtime and proof guidance.
+  - id: calculator-matrix-readiness-report-contract
+    scope: repo
+    repo: calculator
+    triggers:
+      - path: docs/matrix-readiness-report-contract.md
+        kind: runtime-contract
+      - path: crates/solver-worker/src/readiness.rs
+        kind: runtime-code
+      - path: crates/solver-worker/src/bin/matrix_readiness.rs
+        kind: runtime-code
+      - path: crates/solver-worker/src/bin/snapshot_builder.rs
+        kind: runtime-code
+      - path: crates/solver-worker/src/compiled_graph.rs
+        kind: runtime-code
+    requiredDocs:
+      - path: .docpact/config.yaml
+        mode: review_or_update
+      - path: docs/agents/repo-validation.md
+        mode: review_or_update
+      - path: docs/agents/repo-architecture.md
+        mode: review_or_update
+      - path: docs/matrix-readiness-report-contract.md
+        mode: review_or_update
+    reason: Calculator-owned matrix-readiness report semantics must stay aligned with the CLI, snapshot artifact output, provider evidence, and proof guidance.
   - id: calculator-edge-frontend-integration-contract
     scope: repo
     repo: calculator

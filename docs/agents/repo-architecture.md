@@ -23,6 +23,7 @@ checkPaths:
   - tools/bw25-validator/**
   - supabase/migrations/**
   - docs/lca-api-contract.md
+  - docs/matrix-readiness-report-contract.md
   - docs/implicit-regional-supply-mix-modeling.md
   - docs/implicit-regional-supply-mix-modeling.en.md
   - docs/tidas-package-contract.md
@@ -30,13 +31,14 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-05-20
-lastReviewedCommit: f23848d58634dbf6f77df741210476f8d7bf61a1
+lastReviewedAt: 2026-05-25
+lastReviewedCommit: 48a86e85dde828830d22d1de9ae9585ec1fec365
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
   - ./repo-validation.md
   - ../../docs/lca-api-contract.md
+  - ../../docs/matrix-readiness-report-contract.md
 ---
 
 ## Repo Shape
@@ -96,7 +98,7 @@ These flows belong to the calculator runtime, not to the API repo.
 The snapshot builder path owns sparse payload generation, provider matching, and snapshot artifact metadata.
 The modeling basis for implicit regional supply mix, exchange-location supply-region anchors, and annual-volume provider shares lives in `docs/implicit-regional-supply-mix-modeling.md` and `docs/implicit-regional-supply-mix-modeling.en.md`.
 
-`crates/solver-worker/src/readiness.rs` owns the calculator-side verification gate for automated data production. It turns snapshot coverage, sparse payloads, and optional compiled provider decisions into a machine-readable matrix-readiness report. Foundry and CLI callers should consume that report instead of reimplementing provider closure, singular-risk, LCIA, or factorization checks outside calculator.
+`crates/solver-worker/src/readiness.rs` owns the calculator-side verification gate for automated data production. It turns snapshot coverage, sparse payloads, and optional compiled provider decisions into a machine-readable matrix-readiness report. Foundry and CLI callers should consume that report instead of reimplementing provider closure, singular-risk, LCIA, or factorization checks outside calculator. The stable report schema, blocker/finding codes, and next-action semantics live in `docs/matrix-readiness-report-contract.md`.
 
 ### Package worker
 

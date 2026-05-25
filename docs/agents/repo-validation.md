@@ -24,6 +24,7 @@ checkPaths:
   - tools/bw25-validator/**
   - supabase/migrations/**
   - docs/lca-api-contract.md
+  - docs/matrix-readiness-report-contract.md
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/implicit-regional-supply-mix-modeling.md
@@ -34,13 +35,14 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-05-20
-lastReviewedCommit: f7c7d97e64dab987631281c3835eb7d2a343b94a
+lastReviewedAt: 2026-05-25
+lastReviewedCommit: 48a86e85dde828830d22d1de9ae9585ec1fec365
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
   - ./repo-architecture.md
   - ../../docs/lca-api-contract.md
+  - ../../docs/matrix-readiness-report-contract.md
   - ../../docs/tidas-package-contract.md
 ---
 
@@ -62,7 +64,7 @@ Treat the last two commands as non-negotiable hard gates after code changes.
 | --- | --- | --- | --- |
 | `crates/**` solver or worker code | `make check`; hard Clippy gate; hard format gate | run the narrow manual script that matches the touched area, such as snapshot build, full compute debug, or BW25 validation | Record which job family or worker path was exercised. |
 | snapshot-builder or provider-matching behavior | baseline gates plus `./scripts/build_snapshot_from_ilcd.sh` when safe | run provider-link diagnostics export helpers when the task changes matching logic | Snapshot and provider diagnostics often need task-specific proof. |
-| matrix-readiness / provider-closure gate | `cargo test -p solver-worker readiness`; `cargo check -p solver-worker --bin matrix_readiness`; hard Clippy gate for the touched binary/module | run `snapshot_builder` or `matrix_readiness --input <fixture> --out <report>` against the closest available target snapshot artifact | Use `PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig` on local Homebrew setups so SuiteSparse/UMFPACK link metadata is discoverable. |
+| matrix-readiness / provider-closure gate | `cargo test -p solver-worker readiness`; `cargo check -p solver-worker --bin matrix_readiness`; hard Clippy gate for the touched binary/module | run `snapshot_builder` or `matrix_readiness --input <fixture> --out <report>` against the closest available target snapshot artifact | Keep `docs/matrix-readiness-report-contract.md` aligned with blocker/finding code, policy, and next_action changes. Use `PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig` on local Homebrew setups so SuiteSparse/UMFPACK link metadata is discoverable. |
 | package worker import or export flows | baseline gates | run the closest safe package-flow helper or record why live package proof is deferred | Package-job semantics are runtime-sensitive and may depend on storage or DB state. |
 | runtime SQL expectation docs or local migration helpers | baseline gates plus `./scripts/validate_additive_migration.sh` when the task touches migration expectations | record separately when durable schema proof is required in `database-engine` | Local migration files here are not the workspace-wide source of truth. |
 | manual debug, parity, or target-validation scripts | run the touched script with safe args or `--help` when available, plus baseline gates if code changed nearby | `./scripts/run_full_compute_debug.sh`, `./scripts/run_bw25_validation.sh`, or `./scripts/validate_lcia_targets.sh` as applicable | `bw25-validator` is manual-only and out-of-band. |

@@ -20,6 +20,7 @@ checkPaths:
   - .docpact/**/*.yaml
   - docs/agents/**
   - docs/lca-api-contract.md
+  - docs/matrix-readiness-report-contract.md
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/implicit-regional-supply-mix-modeling.md
@@ -36,13 +37,14 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-05-24
-lastReviewedCommit: b91dc5253939c88e32b9caafc48350e38fcc1bec
+lastReviewedAt: 2026-05-25
+lastReviewedCommit: 48a86e85dde828830d22d1de9ae9585ec1fec365
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
   - docs/lca-api-contract.md
+  - docs/matrix-readiness-report-contract.md
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/tidas-package-contract.md
@@ -64,6 +66,7 @@ Start here when the task may change what the compute stack does.
 | `docs/agents/repo-architecture.md` | compact repo mental model, stable path map, hotspot families, and common misreads | checklist-style proof guidance or current work queue |
 | `README.md` | repo landing context, operator setup, and runtime overview | machine-readable routing or lint semantics |
 | `docs/lca-api-contract.md` | shared jobs/results/payload/status contract for consumers | branch policy, proof matrix, or edge/frontend implementation details |
+| `docs/matrix-readiness-report-contract.md` | calculator-owned matrix-readiness CLI and report artifact schema, blocker/finding codes, next_action semantics, and policy surface | HTTP endpoint contract or edge request/auth behavior |
 | `docs/edge-function-integration.md` | edge-facing enqueue, polling, and service-role integration contract | solver internals or frontend UX rules |
 | `docs/frontend-integration.md` | frontend-facing solve/result interaction contract | edge auth implementation or solver internals |
 | `docs/implicit-regional-supply-mix-modeling.md` / `docs/implicit-regional-supply-mix-modeling.en.md` | Chinese and English modeling basis for implicit regional supply mix, exchange-location supply-region anchors, and annual-volume provider share semantics | implementation checklist or consumer API contract |
@@ -78,6 +81,7 @@ Read in this order:
 3. `docs/agents/repo-validation.md` or `docs/agents/repo-architecture.md`
 4. load only the narrow contract doc that matches the task:
    - `docs/lca-api-contract.md`
+   - `docs/matrix-readiness-report-contract.md`
    - `docs/edge-function-integration.md`
    - `docs/frontend-integration.md`
    - `docs/implicit-regional-supply-mix-modeling.md`
@@ -92,9 +96,9 @@ Do not start from the root workspace or the edge repo if the change is really ab
 - path-level ownership, routing intents, governed-doc inventory, and lint rules live in `.docpact/config.yaml`
 - minimum proof and manual helper expectations live in `docs/agents/repo-validation.md`
 - stable path groups and hotspot families live in `docs/agents/repo-architecture.md`
-- runtime-facing consumer contracts live in the narrow docs under `docs/*.md`
+- runtime-facing consumer contracts and report artifact contracts live in the narrow docs under `docs/*.md`
 - repo-local documentation maintenance is enforced by `.github/workflows/ai-doc-lint.yml` with `docpact lint`
-- the main routing intents are `solver-runtime`, `snapshot-and-provider`, `package-worker`, `runtime-sql-boundary`, `debug-and-parity`, `edge-api-boundary`, `frontend-integration`, `proof`, `repo-docs`, and `root-integration`
+- the main routing intents are `solver-runtime`, `matrix-readiness`, `snapshot-and-provider`, `package-worker`, `runtime-sql-boundary`, `debug-and-parity`, `edge-api-boundary`, `frontend-integration`, `proof`, `repo-docs`, and `root-integration`
 
 ## Minimal Execution Facts
 
@@ -122,7 +126,7 @@ At a human-readable level, this repo owns:
 - `Cargo.toml`, `Makefile`, and `crates/**` for solver topology, sparse-runtime behavior, queue workers, snapshot builder flows, and package workers
 - `scripts/**` and `tools/bw25-validator/**` for manual validation, parity, debug, snapshot, and diagnostics helpers
 - `supabase/migrations/**` for runtime SQL expectations still referenced by the calculator runtime
-- `README.md`, `docs/agents/**`, `docs/lca-api-contract.md`, `docs/edge-function-integration.md`, `docs/frontend-integration.md`, `docs/implicit-regional-supply-mix-modeling.md`, `docs/implicit-regional-supply-mix-modeling.en.md`, `docs/tidas-package-contract.md`, and repo-local governed docs
+- `README.md`, `docs/agents/**`, `docs/lca-api-contract.md`, `docs/matrix-readiness-report-contract.md`, `docs/edge-function-integration.md`, `docs/frontend-integration.md`, `docs/implicit-regional-supply-mix-modeling.md`, `docs/implicit-regional-supply-mix-modeling.en.md`, `docs/tidas-package-contract.md`, and repo-local governed docs
 
 This repo does not own:
 

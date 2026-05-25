@@ -17,13 +17,15 @@ checkPaths:
   - .docpact/config.yaml
   - crates/**
   - supabase/migrations/**
+  - docs/matrix-readiness-report-contract.md
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
-lastReviewedAt: 2026-05-20
-lastReviewedCommit: f7c7d97e64dab987631281c3835eb7d2a343b94a
+lastReviewedAt: 2026-05-25
+lastReviewedCommit: 48a86e85dde828830d22d1de9ae9585ec1fec365
 related:
   - AGENTS.md
   - .docpact/config.yaml
+  - docs/matrix-readiness-report-contract.md
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/agents/repo-validation.md
@@ -217,6 +219,8 @@ fresh `snapshot_builder` run 也会在 `report_dir` 下写出 `matrix-readiness-
 - `metrics.compute_stability`: factorization readiness、matrix validation report、sample unit solves、non-finite count 和 negative LCIA count。
 - `provider_evidence`: 每条 input edge 的 consumer、flow、candidate providers、resolution strategy、failure reason、allocation weights、ambiguity 和 confidence。
 - `findings` / `blockers`: machine-readable issue codes、severity、message 和 detail payload。
+
+当前 matrix-readiness 只通过 calculator CLI 与 `snapshot_builder` report artifact 暴露；本节不表示 Edge/API 已提供 HTTP 调用入口。稳定 code、`blockers` / `findings` / `next_action` 规则、policy 默认值和调用方消费约束由 `docs/matrix-readiness-report-contract.md` 维护。
 
 Foundry、CLI 或 Edge adapter 只能消费该 report 的 `status`、`next_action`、`blockers`、`metrics` 和 `provider_evidence`；不应在外部复制 calculator 的 provider resolution、singular-risk 或 UMFPACK readiness 规则。
 
