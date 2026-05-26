@@ -550,7 +550,6 @@ fn check_provider_closure(
                 .decisions_partial_missing_count
             + matching.volume_weight_summary.decisions_all_missing_count;
 
-    let mut missing_examples = Vec::new();
     let mut unresolved_examples = Vec::new();
     let mut fallback_examples = Vec::new();
     let mut unconserved_examples = Vec::new();
@@ -559,14 +558,11 @@ fn check_provider_closure(
     if let Some(graph) = &input.compiled_graph {
         metrics.provider_scan.provider_decisions_total = graph.provider_decisions.len();
         for decision in &graph.provider_decisions {
-            match decision.decision_kind {
-                Some(CompiledProviderDecisionKind::NoProvider) => {
-                    missing_examples.push(provider_decision_detail(decision));
-                }
-                Some(CompiledProviderDecisionKind::MultiUnresolved) => {
-                    unresolved_examples.push(provider_decision_detail(decision));
-                }
-                _ => {}
+            if matches!(
+                decision.decision_kind,
+                Some(CompiledProviderDecisionKind::MultiUnresolved)
+            ) {
+                unresolved_examples.push(provider_decision_detail(decision));
             }
             if decision.used_equal_fallback {
                 fallback_examples.push(provider_decision_detail(decision));
@@ -582,17 +578,6 @@ fn check_provider_closure(
 
     metrics.provider_scan.allocation_not_conserved_count = unconserved_examples.len();
 
-    if metrics.provider_scan.provider_missing_count > 0 || !missing_examples.is_empty() {
-        push_blocker(
-            blockers,
-            "provider_missing",
-            "product input edges have no provider candidates",
-            json!({
-                "coverage_unmatched_no_provider": matching.unmatched_no_provider,
-                "examples": missing_examples.into_iter().take(DETAIL_LIMIT).collect::<Vec<_>>()
-            }),
-        );
-    }
     if metrics.provider_scan.provider_unresolved_count > 0 || !unresolved_examples.is_empty() {
         push_blocker(
             blockers,
@@ -1162,7 +1147,7 @@ fn default_policy_profile() -> String {
 }
 
 fn default_allowed_scope_states() -> Vec<i32> {
-    (100..=199).collect()
+    std::iter::once(0).chain(100..=199).collect()
 }
 
 fn default_true() -> bool {
@@ -1221,6 +1206,32 @@ mod tests {
     }
 
     #[test]
+    fn default_policy_allows_draft_and_reviewed_scope_states() {
+        let mut input = clean_input();
+        input.process_records[0].state_code = Some(0);
+        input.process_records[1].state_code = Some(100);
+
+        let report = verify_review_submit_gate(&input);
+
+        assert_eq!(report.status, ReviewSubmitGateStatus::Passed);
+        assert!(!has_blocker(&report, "invalid_scope_state"));
+        assert_eq!(report.metrics.process_scan.invalid_scope_state_count, 0);
+    }
+
+    #[test]
+    fn default_policy_blocks_under_review_scope_state() {
+        let mut input = clean_input();
+        input.process_records[0].state_code = Some(20);
+
+        let report = verify_review_submit_gate(&input);
+
+        assert_eq!(report.status, ReviewSubmitGateStatus::Blocked);
+        assert!(has_blocker(&report, "invalid_scope_state"));
+        assert_eq!(report.metrics.process_scan.invalid_scope_state_count, 1);
+        assert!(!report.metrics.probe.factorization_checked);
+    }
+
+    #[test]
     fn blocks_historical_process_scan_failures_before_probe() {
         let mut input = clean_input();
         input.process_records.push(ReviewProcessRecord {
@@ -1228,7 +1239,7 @@ mod tests {
             process_id: input.process_records[1].process_id,
             process_version: "01.01.001".to_owned(),
             process_name: Some("consumer duplicate version".to_owned()),
-            state_code: Some(0),
+            state_code: Some(20),
             reference_exchange_id: Some("ref".to_owned()),
             exchanges: vec![
                 exchange(
@@ -1324,7 +1335,8 @@ mod tests {
 
         let report = verify_review_submit_gate(&input);
 
-        assert!(has_blocker(&report, "provider_missing"));
+        assert_eq!(report.metrics.provider_scan.provider_missing_count, 1);
+        assert!(!has_blocker(&report, "provider_missing"));
         assert!(has_blocker(&report, "provider_equal_fallback"));
         assert!(has_blocker(&report, "provider_volume_evidence_invalid"));
         assert!(has_blocker(&report, "flow_lcia_semantic_mismatch"));
