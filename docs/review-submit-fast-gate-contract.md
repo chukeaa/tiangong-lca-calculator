@@ -26,8 +26,8 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
-lastReviewedAt: 2026-05-25
-lastReviewedCommit: 48a86e85dde828830d22d1de9ae9585ec1fec365
+lastReviewedAt: 2026-05-26
+lastReviewedCommit: 877f8318a1716786beb32bc86ac208c57a9168d9
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -120,9 +120,10 @@ DB runner 写回数据库时：
 默认策略：
 
 - 要求 `expected_revision_checksum == actual_revision_checksum`。
-- `allowed_scope_states = 100..199`；不在该范围的 process record 会触发 `invalid_scope_state`。
+- `allowed_scope_states = [0] + 100..=199`；`0` 表示提交审核前 draft root，`100..=199` 用于已审核 / 可用依赖数据兼容；`20` 等审核中状态不允许，仍会触发 `invalid_scope_state`。
 - 阻断 provider equal fallback。
 - 阻断 provider volume fallback evidence。
+- provider missing 只记录在 `metrics.provider_scan.provider_missing_count`，不作为提交审核 blocker。
 - impact-ready 提交要求 LCIA factors。
 - 要求 target process probe。
 - target probe 默认最多覆盖 `32` 个 process。
@@ -143,7 +144,6 @@ DB runner 写回数据库时：
 | `invalid_allocation_fraction` | allocation fraction 不可解析、带 `%` 或超出允许数值范围 | 统一 allocation fraction 表达 |
 | `duplicate_exchange_fingerprint` | 不同 process 的 flow/direction/amount fingerprint 完全一致 | 合并重复 process 或补充可区分 exchange |
 | `service_loop_detected` | 同一 process 中同一 flow 的 input/output amount 相同或近似相同 | 修正自供给、循环或拆分 process |
-| `provider_missing` | product input edge 无 provider | 补 provider 数据或修正 product/reference flow |
 | `provider_unresolved` | multi-provider input edge 未解析 | 补 provider evidence 或缩小候选集 |
 | `provider_equal_fallback` | provider resolution 使用 equal fallback 且 policy 阻断 | 补 annual volume / evidence，避免等权兜底 |
 | `provider_allocation_not_conserved` | provider allocation weight 非有限、负数、为空或 sum 不为 1 | 修复 provider allocation |
@@ -163,7 +163,7 @@ Gate 按便宜到昂贵的顺序执行：
 
 1. revision freshness。
 2. process record scan：scope state、reference、exchange amount、allocation、duplicate fingerprint、service-loop。
-3. provider scan：missing、unresolved、equal fallback、allocation conservation、volume evidence。
+3. provider scan：missing metric、unresolved、equal fallback、allocation conservation、volume evidence。
 4. flow / LCIA semantic scan。
 5. sparse structure scan：diagonal、duplicate sparse column、singular risk。
 6. target process coverage check。
