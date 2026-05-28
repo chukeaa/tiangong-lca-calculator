@@ -101,7 +101,7 @@ Do not start from the root workspace or the edge repo if the change is really ab
 - minimum proof and manual helper expectations live in `docs/agents/repo-validation.md`
 - stable path groups and hotspot families live in `docs/agents/repo-architecture.md`
 - runtime-facing consumer contracts and report artifact contracts live in the narrow docs under `docs/*.md`
-- repo-local documentation maintenance is enforced by `.github/workflows/ai-doc-lint.yml` with `docpact lint`
+- repo-local documentation maintenance is enforced locally by the pre-push docpact gate; `.github/workflows/ai-doc-lint.yml` is manual-dispatch fallback
 - the main routing intents are `solver-runtime`, `matrix-readiness`, `snapshot-and-provider`, `review-submit-gate`, `package-worker`, `runtime-sql-boundary`, `debug-and-parity`, `edge-api-boundary`, `frontend-integration`, `proof`, `repo-docs`, and `root-integration`
 
 ## Minimal Execution Facts
