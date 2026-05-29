@@ -17,8 +17,8 @@ checkPaths:
   - .docpact/config.yaml
   - crates/solver-worker/**
   - docs/agents/repo-validation.md
-lastReviewedAt: 2026-05-20
-lastReviewedCommit: f7c7d97e64dab987631281c3835eb7d2a343b94a
+lastReviewedAt: 2026-05-29
+lastReviewedCommit: 76345d6bb9a17691dd661cfccf5017057c52047e
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -134,7 +134,34 @@ related:
 - ZIP: `application/zip`
 - report: `application/json`
 
-### 7.1 import report payload（新增字段）
+### 7.1 Artifact retention / GC 契约
+
+package artifact 必须带或刷新 `expires_at`：
+
+- `export_zip` / `export_report`：默认 30 天；
+- `import_source` / `import_report`：默认 14 天；
+- worker 写入的新 artifact 在插入时写入 `expires_at`；
+- `import_source` 由 API 上传创建时，worker 在 import job 进入 terminal 成功/失败状态后刷新 14 天 TTL；
+- `is_pinned = true` 的 artifact 不参与自动 GC；
+- `status = deleted` 表示对象 payload 已被 GC 删除，API 不应再返回可下载 URL。
+
+calculator 侧 GC 必须 object-aware：
+
+1. dry-run 先输出 eligible/protected reason；
+2. 只处理 `expires_at <= now()`、`is_pinned = false`、父 job 非 `queued/running`、且无 active/recent request-cache 引用的 ready artifact；
+3. 先删除对象存储 payload；
+4. 对象删除成功后，才把 artifact 标记为 `deleted`；
+5. 对象删除失败时只记录 `metadata.gc` 错误，不删除 DB metadata；
+6. 当一个 terminal package job 的 artifact 都已 `deleted`、且无 active/recent cache 引用后，才允许删除 job metadata，让 `lca_package_export_items` 通过 FK cascade 清理。
+
+当前 calculator 提供 `package_gc` CLI：
+
+```bash
+cargo run -p solver-worker --bin package_gc --
+cargo run -p solver-worker --bin package_gc -- --execute
+```
+
+### 7.2 import report payload（新增字段）
 
 `tidas-package-import-report:v1` 的 payload 结构扩展如下：
 

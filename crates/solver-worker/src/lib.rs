@@ -21,6 +21,7 @@ pub mod http;
 pub mod package_artifacts;
 pub mod package_db;
 pub mod package_execution;
+pub mod package_retention;
 pub mod package_types;
 pub mod pgbouncer_sqlx;
 pub mod queue;

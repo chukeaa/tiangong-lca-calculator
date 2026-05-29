@@ -12,6 +12,7 @@ use solver_worker::{
         update_package_job_status,
     },
     package_execution::clear_runtime_export_traversal_cache,
+    package_retention::refresh_import_source_retention,
     package_types::{PACKAGE_QUEUE_NAME, PackageJobPayload},
     storage::ObjectStoreUploadError,
 };
@@ -121,6 +122,22 @@ async fn run_package_worker_loop(
                                     cache_error_message.as_str(),
                                 )
                                 .await;
+                                if let PackageJobPayload::ImportPackage {
+                                    source_artifact_id, ..
+                                } = payload
+                                    && let Err(err) = refresh_import_source_retention(
+                                        &state.pool,
+                                        source_artifact_id,
+                                    )
+                                    .await
+                                {
+                                    warn!(
+                                        job_id = %job_id,
+                                        source_artifact_id = %source_artifact_id,
+                                        error = %err,
+                                        "failed to refresh import source retention after failed import job"
+                                    );
+                                }
                             }
                         } else {
                             info!("package job completed");

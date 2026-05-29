@@ -12,6 +12,7 @@ use crate::{
     package_execution::{
         clear_runtime_export_traversal_cache, execute_export_package, execute_import_package,
     },
+    package_retention::{default_package_artifact_retention_days, refresh_import_source_retention},
     package_types::{PACKAGE_QUEUE_NAME, PackageArtifactKind, PackageJobPayload},
 };
 
@@ -36,6 +37,8 @@ pub struct PackageArtifactInsert {
     pub metadata: Value,
     /// Row status.
     pub status: &'static str,
+    /// Retention window in days; `None` leaves `expires_at` unset.
+    pub retention_days: Option<i32>,
 }
 
 impl PackageArtifactInsert {
@@ -58,6 +61,7 @@ impl PackageArtifactInsert {
             content_type: meta.content_type,
             metadata,
             status: "ready",
+            retention_days: Some(default_package_artifact_retention_days(artifact_kind)),
         }
     }
 
@@ -141,10 +145,27 @@ pub async fn insert_package_artifact(
             artifact_format,
             content_type,
             metadata,
+            expires_at,
             created_at,
             updated_at
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, NOW(), NOW())
+        VALUES (
+            $1,
+            $2,
+            $3,
+            $4,
+            $5,
+            $6,
+            $7,
+            $8,
+            $9::jsonb,
+            CASE
+              WHEN $10::integer IS NULL THEN NULL
+              ELSE NOW() + make_interval(days => $10::integer)
+            END,
+            NOW(),
+            NOW()
+        )
         ON CONFLICT (job_id, artifact_kind) DO UPDATE
         SET status = EXCLUDED.status,
             artifact_url = EXCLUDED.artifact_url,
@@ -153,6 +174,7 @@ pub async fn insert_package_artifact(
             artifact_format = EXCLUDED.artifact_format,
             content_type = EXCLUDED.content_type,
             metadata = EXCLUDED.metadata,
+            expires_at = EXCLUDED.expires_at,
             updated_at = NOW()
         RETURNING id
         ",
@@ -166,6 +188,7 @@ pub async fn insert_package_artifact(
     .bind(insert.artifact_format)
     .bind(insert.content_type)
     .bind(insert.metadata)
+    .bind(insert.retention_days)
     .fetch_one(pool)
     .await?;
 
@@ -475,6 +498,15 @@ pub async fn handle_package_job_payload(
                 outcome.diagnostics,
             )
             .await?;
+            if let Err(err) = refresh_import_source_retention(&state.pool, source_artifact_id).await
+            {
+                warn!(
+                    error = %err,
+                    job_id = %job_id,
+                    source_artifact_id = %source_artifact_id,
+                    "failed to refresh import source artifact retention"
+                );
+            }
             if let Err(err) = mark_package_request_cache_ready(
                 &state.pool,
                 job_id,
