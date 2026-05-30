@@ -161,6 +161,15 @@ cargo run -p solver-worker --bin package_gc --
 cargo run -p solver-worker --bin package_gc -- --execute
 ```
 
+生产部署契约：
+
+- `package_gc` release binary 应随 `package_worker` 一起部署到所有活跃 calculator worker 主机；
+- `package-gc.timer` 只能在一个调度主机启用，其他主机保留 binary 作为故障切换候选；
+- timer 首次启用必须 dry-run，不带 `--execute`，并检查 `[retention]` eligible/protected reason 与 `[summary] dry_run=true ...`；
+- destructive 清理必须显式加 `--execute`，并在首轮保留小批量限制，例如 `PACKAGE_GC_BATCH_SIZE=100`、`PACKAGE_GC_MAX_BATCHES=1`；
+- `--execute` 模式需要对象存储环境变量，且会先删对象 payload，再标记 artifact `deleted`；对象删除失败时只记录 `metadata.gc` 错误，不删除 DB metadata；
+- `--execute` 模式使用 PostgreSQL advisory lock 防止重叠执行，但这不是三台机器都启 timer 的理由。
+
 ### 7.2 import report payload（新增字段）
 
 `tidas-package-import-report:v1` 的 payload 结构扩展如下：

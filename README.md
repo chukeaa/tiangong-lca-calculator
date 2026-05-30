@@ -313,7 +313,7 @@ Supabase 连接说明：
 - 运行时 SQLx 查询使用非持久 prepared statement，以避免后端复用导致 `sqlx_s_*` 语句名冲突；高频 pgmq polling / archive 操作使用 `raw_sql` 简单查询协议与受限队列名字面量，避免 6543 transaction pooler 不支持 prepared statement 协议导致空轮询失败。
 - `build_snapshot` 全局并发控制使用 transaction-level advisory lock，适配 transaction pooler；生产环境仍建议保持 `BUILD_SNAPSHOT_MAX_CONCURRENCY=1`。
 
-对象存储（snapshot builder / solver-worker / result_gc 必需）：
+对象存储（snapshot builder / solver-worker / result_gc 必需；`package_gc --execute` 删除 package artifact 对象时也必需）：
 
 - `S3_ENDPOINT`
 - `S3_REGION`
@@ -681,7 +681,77 @@ journalctl -u package-worker.service -f
 sudo systemctl restart package-worker.service
 ```
 
-### 6.5 结果保留与 GC（S3 + DB）
+### 6.5 TIDAS Package Artifact GC（systemd timer，推荐）
+
+`package_gc` 负责清理 package artifact 对象、过期 request cache 和已无 artifact 依赖的 terminal package job metadata。部署建议分两层：
+
+- 所有活跃 calculator worker 主机都构建并保留最新 `target/release/package_gc`，便于切换。
+- 只有一台主机启用 `package-gc.timer`。`--execute` 模式内部会使用 PostgreSQL advisory lock，但调度层仍应避免三台机器同时跑 destructive GC。
+- 首次启用必须保持 dry-run，确认日志中的 eligible/protected reason 后，再把唯一 timer 主机切到 `--execute`。
+
+构建：
+
+```bash
+cd /home/ubuntu/projects/lca_workspace/tiangong-lca-calculator
+cargo build -p solver-worker --bin package_gc --release
+```
+
+创建 dry-run 服务文件 `/etc/systemd/system/package-gc.service`：
+
+```ini
+[Unit]
+Description=TianGong LCA Package Artifact GC (dry-run)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/projects/lca_workspace/tiangong-lca-calculator
+EnvironmentFile=/home/ubuntu/projects/lca_workspace/tiangong-lca-calculator/.env
+Environment=RUST_LOG=info
+Environment=PACKAGE_GC_BATCH_SIZE=100
+Environment=PACKAGE_GC_MAX_BATCHES=1
+SyslogIdentifier=package_gc
+ExecStart=/home/ubuntu/projects/lca_workspace/tiangong-lca-calculator/target/release/package_gc
+```
+
+创建 timer 文件 `/etc/systemd/system/package-gc.timer`：
+
+```ini
+[Unit]
+Description=Daily TianGong LCA Package Artifact GC dry-run
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+RandomizedDelaySec=15m
+Persistent=true
+Unit=package-gc.service
+
+[Install]
+WantedBy=timers.target
+```
+
+启用 timer 并立即跑一次 dry-run：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now package-gc.timer
+sudo systemctl start package-gc.service
+systemctl status package-gc.timer package-gc.service --no-pager
+journalctl -u package-gc.service -n 100 --no-pager
+```
+
+日志里应出现 `[retention]` 与 `[summary] dry_run=true ...`。切到实际清理时，只在唯一 timer 主机上把 `ExecStart` 改为：
+
+```ini
+ExecStart=/home/ubuntu/projects/lca_workspace/tiangong-lca-calculator/target/release/package_gc --execute
+```
+
+`--execute` 会先删除对象存储 payload，再标记 artifact 为 `deleted`；对象删除失败时不会删除 DB metadata。建议保留 `PACKAGE_GC_BATCH_SIZE=100`、`PACKAGE_GC_MAX_BATCHES=1` 作为首轮 execute canary，再按运行结果逐步调整。
+
+### 6.6 结果保留与 GC（S3 + DB）
 
 `lca_results` 采用过期字段 + 保留规则：
 
