@@ -37,6 +37,12 @@ pub struct ObjectUploadResult {
     pub part_count: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectDeleteOutcome {
+    Deleted,
+    Missing,
+}
+
 #[derive(Debug, Clone)]
 pub struct ObjectStoreUploadError {
     pub stage: &'static str,
@@ -215,6 +221,25 @@ impl ObjectStoreClient {
 
     /// Deletes an object by full object URL.
     pub async fn delete_object_url(&self, object_url: &str) -> anyhow::Result<()> {
+        self.delete_object_url_with_outcome(object_url)
+            .await
+            .map(|_| ())
+    }
+
+    /// Deletes an object by bucket-relative object key.
+    pub async fn delete_object_key(&self, object_key: &str) -> anyhow::Result<ObjectDeleteOutcome> {
+        let key = object_key.trim_start_matches('/');
+        if key.trim().is_empty() {
+            return Err(anyhow::anyhow!("object key must not be empty"));
+        }
+        let object_url = format!("{}/{}/{}", self.endpoint, self.bucket, key);
+        self.delete_object_url_with_outcome(&object_url).await
+    }
+
+    async fn delete_object_url_with_outcome(
+        &self,
+        object_url: &str,
+    ) -> anyhow::Result<ObjectDeleteOutcome> {
         let url = Url::parse(object_url)
             .map_err(|err| anyhow::anyhow!("invalid object URL {object_url}: {err}"))?;
         let host = canonical_host(&url)?;
@@ -246,8 +271,8 @@ impl ObjectStoreClient {
         }
 
         let response = request.send().await?;
-        if response.status().is_success() || response.status() == StatusCode::NOT_FOUND {
-            return Ok(());
+        if let Some(outcome) = object_delete_outcome(response.status()) {
+            return Ok(outcome);
         }
 
         let status = response.status();
@@ -781,6 +806,16 @@ fn sigv4_timestamps() -> (String, String) {
     )
 }
 
+fn object_delete_outcome(status: StatusCode) -> Option<ObjectDeleteOutcome> {
+    if status.is_success() {
+        Some(ObjectDeleteOutcome::Deleted)
+    } else if status == StatusCode::NOT_FOUND {
+        Some(ObjectDeleteOutcome::Missing)
+    } else {
+        None
+    }
+}
+
 fn canonical_host(url: &Url) -> anyhow::Result<String> {
     let host = url
         .host_str()
@@ -866,7 +901,35 @@ fn hmac_sha256_hex(key: &[u8], data: &str) -> anyhow::Result<String> {
 mod tests {
     use reqwest::StatusCode;
 
-    use super::{ObjectStoreUploadError, extract_xml_tag, object_upload_error};
+    use super::{
+        ObjectDeleteOutcome, ObjectStoreUploadError, extract_xml_tag, object_delete_outcome,
+        object_upload_error,
+    };
+
+    #[test]
+    fn delete_treats_success_statuses_as_deleted() {
+        assert_eq!(
+            object_delete_outcome(StatusCode::NO_CONTENT),
+            Some(ObjectDeleteOutcome::Deleted)
+        );
+        assert_eq!(
+            object_delete_outcome(StatusCode::OK),
+            Some(ObjectDeleteOutcome::Deleted)
+        );
+    }
+
+    #[test]
+    fn delete_treats_404_as_successful_missing_object() {
+        assert_eq!(
+            object_delete_outcome(StatusCode::NOT_FOUND),
+            Some(ObjectDeleteOutcome::Missing)
+        );
+    }
+
+    #[test]
+    fn delete_rejects_non_success_statuses() {
+        assert_eq!(object_delete_outcome(StatusCode::FORBIDDEN), None);
+    }
 
     #[test]
     fn extract_xml_tag_reads_s3_error_code() {

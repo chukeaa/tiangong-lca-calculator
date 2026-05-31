@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly TianGong LCA Snapshot Storage GC
+
+[Timer]
+OnCalendar=Sun 20:30:00 UTC
+RandomizedDelaySec=30m
+Persistent=true
+Unit=snapshot-gc.service
+
+[Install]
+WantedBy=timers.target

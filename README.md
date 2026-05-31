@@ -751,7 +751,69 @@ ExecStart=/home/ubuntu/projects/lca_workspace/tiangong-lca-calculator/target/rel
 
 `--execute` 会先删除对象存储 payload，再标记 artifact 为 `deleted`；对象删除失败时不会删除 DB metadata。建议保留 `PACKAGE_GC_BATCH_SIZE=100`、`PACKAGE_GC_MAX_BATCHES=1` 作为首轮 execute canary，再按运行结果逐步调整。
 
-### 6.6 结果保留与 GC（S3 + DB）
+### 6.6 Snapshot Storage GC（systemd timer，推荐）
+
+`snapshot_gc` 负责清理 `lca-results/snapshots/<snapshot_id>/...` 存储目录。候选判断来自 database-engine 的 `util.list_lca_snapshot_gc_candidates(...)`，calculator 只执行对象删除与安全的 DB row 删除：
+
+- CLI 默认 dry-run；实际删除必须显式传 `--execute`。
+- active snapshot 永远保护；执行前会再次检查 `lca_active_snapshots`。
+- 非 active snapshot 超过 TTL 后，先删除该 snapshot directory 下所有 Storage objects；全部成功后才删除 `public.lca_network_snapshots`，由现有 FK cascade 清理 jobs/results/cache/latest/factorization/artifact metadata。
+- orphan storage directory 只删除 Storage objects，不做 DB 操作。
+- 404 object delete 视为成功，便于重试幂等。
+- 允许 3 台 calculator worker host 都安装 timer；`snapshot_gc` 使用 `solver_worker_snapshot_gc` PostgreSQL advisory lock，抢不到锁会写 `skipped` audit run 并退出 0。
+
+构建：
+
+```bash
+cd /home/ubuntu/projects/lca_workspace/tiangong-lca-calculator
+cargo build -p solver-worker --bin snapshot_gc --release
+```
+
+手动 dry-run：
+
+```bash
+./scripts/gc_lca_snapshots.sh
+```
+
+首轮 execute canary：
+
+```bash
+./scripts/gc_lca_snapshots.sh --execute \
+  --max-bytes 536870912 \
+  --max-snapshots 10 \
+  --max-orphan-dirs 50
+```
+
+systemd 模板位于：
+
+- `deploy/systemd/snapshot-gc.service`
+- `deploy/systemd/snapshot-gc.timer`
+
+timer 策略：
+
+```ini
+OnCalendar=Sun 20:30:00 UTC
+RandomizedDelaySec=30m
+Persistent=true
+```
+
+部署到 3 台 calculator worker host：
+
+```bash
+sudo cp deploy/systemd/snapshot-gc.service /etc/systemd/system/snapshot-gc.service
+sudo cp deploy/systemd/snapshot-gc.timer /etc/systemd/system/snapshot-gc.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now snapshot-gc.timer
+```
+
+上线后检查：
+
+```bash
+systemctl status snapshot-gc.timer snapshot-gc.service --no-pager
+journalctl -u snapshot-gc.service -n 100 --no-pager
+```
+
+### 6.7 结果保留与 GC（S3 + DB）
 
 `lca_results` 采用过期字段 + 保留规则：
 

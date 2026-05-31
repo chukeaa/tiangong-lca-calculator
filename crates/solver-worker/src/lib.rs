@@ -30,5 +30,6 @@ pub mod review_submit_gate;
 pub mod review_submit_gate_runner;
 pub mod snapshot_artifacts;
 pub mod snapshot_index;
+pub mod snapshot_retention;
 pub mod storage;
 pub mod types;
