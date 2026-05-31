@@ -17,8 +17,8 @@ checkPaths:
   - .docpact/config.yaml
   - crates/solver-worker/**
   - docs/agents/repo-validation.md
-lastReviewedAt: 2026-05-29
-lastReviewedCommit: 76345d6bb9a17691dd661cfccf5017057c52047e
+lastReviewedAt: 2026-05-31
+lastReviewedCommit: 6244c4cf04ea0b239eb82bb0d3ab7ef7ce554ef5
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -33,7 +33,7 @@ related:
 ## 1. 目标
 
 - 将完整 ZIP 导入/导出从同步 edge function 挪到异步 worker。
-- 复用当前 `pgmq + object storage + job status` 模式。
+- 在切流期兼容 legacy `pgmq + object storage + job status` 模式，并支持统一 `worker_jobs(worker_queue=package)` 生命周期。
 - 避免把 `snapshot_id` 语义强行塞进 package 任务。
 
 ## 2. 为什么不复用 `lca_jobs`
@@ -57,16 +57,35 @@ related:
 
 ## 4. 队列与 RPC
 
+legacy 路径：
+
 - `pgmq` queue: `lca_package_jobs`
 - enqueue RPC: `public.lca_package_enqueue_job(jsonb)`
 - 仅 `service_role` 可执行
 
+统一任务路径：
+
+- `worker_jobs.worker_queue`: `package`
+- enqueue RPC: `public.worker_enqueue_job(...)`
+- claim RPC: `public.worker_claim_jobs('package', ...)`
+- result RPC: `public.worker_record_job_result(...)`
+- 仅 `service_role` 可 enqueue / claim / heartbeat / record result
+
 ## 5. 任务类型
 
-`lca_package_jobs.job_type` 与 worker payload `type` 必须一致：
+legacy `lca_package_jobs.job_type` 与 worker payload `type` 必须一致：
 
 - `export_package`
 - `import_package`
+
+`worker_jobs` 路径使用 job kind 表达统一任务类型，并映射回同一组 package payload：
+
+| `worker_jobs.job_kind` | `payload_schema_version` | legacy payload `type` | result schema |
+| --- | --- | --- | --- |
+| `tidas.export_package` | `tidas.export_package.request.v1` | `export_package` | `tidas.export_package.result.v1` |
+| `tidas.import_package` | `tidas.import_package.request.v1` | `import_package` | `tidas.import_package.result.v1` |
+
+`package_worker` 默认仍走 legacy `pgmq`；使用 `--package-queue-backend worker-jobs` 或 `PACKAGE_QUEUE_BACKEND=worker-jobs` 后领取 `worker_queue=package`。`PACKAGE_WORKER_ID`、`PACKAGE_WORKER_JOBS_CLAIM_LIMIT`、`PACKAGE_WORKER_JOBS_LEASE_SECONDS` 控制 worker_jobs claim/diagnostics/lease。
 
 ## 6. Payload 契约
 
@@ -99,6 +118,15 @@ related:
   "source_artifact_id": "<uuid>"
 }
 ```
+
+`worker_jobs.payload_json` 可以使用上述 snake_case 字段，也可以使用 Edge 友好的 alias：
+
+- `jobId` / `packageJobId` -> `job_id`
+- `requestedBy` -> `requested_by`
+- `sourceArtifactId` -> `source_artifact_id`
+- export roots 中的 `tableName` / `rootTable`、`datasetId`、`datasetVersion` 会映射到 `table`、`id`、`version`
+
+切流期 payload 必须仍携带有效 `job_id`，因为 `lca_package_jobs`、`lca_package_artifacts` 和 `lca_package_request_cache` 仍是 package domain truth。
 
 ## 6.3 `import_package` worker 执行顺序（新增）
 
@@ -208,9 +236,24 @@ cargo run -p solver-worker --bin package_gc -- --execute
 - `import_package`: `queued -> running -> completed`
 - 失败统一落 `failed`
 
+`worker_jobs` 路径外层生命周期：
+
+- `queued/stale -> running -> completed|failed|cancelled`
+- `phase` 使用 `export_package` 或 `import_package`
+- `progress` 仅用于任务中心提示，不替代 package artifact 或 request-cache 状态
+- terminal `result_json` 包含 `packageJobId`、`payloadType`、`packageJobStatus`、`artifacts[]`
+- `result_ref` 指向 `{"table":"lca_package_jobs","id":"<uuid>"}`
+
+重要差异：
+
+- legacy `export_package` 多 pass 通过重新写入 `pgmq.lca_package_jobs` 继续执行；
+- `worker_jobs` 模式下，calculator 不再把 continuation 写回 legacy pgmq，而是在同一个 worker job lease 内连续执行 export pass，并在 pass 间 heartbeat；
+- 因此 `PACKAGE_WORKER_JOBS_LEASE_SECONDS` 必须大于正常单 pass 时间，长导出仍应依赖 pass 间 heartbeat 续租。
+
 ## 9. 权限边界
 
 - 前端不直接写 `lca_package_jobs`
+- 前端不直接写 `worker_jobs`
 - Edge Functions 负责鉴权、幂等和入队
 - worker 负责大包处理、对象存储写入、导入冲突规则执行
 - `authenticated` 仅可读自己的 package jobs / artifacts / request cache

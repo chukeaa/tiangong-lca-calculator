@@ -3,6 +3,20 @@ use uuid::Uuid;
 
 /// Dedicated queue name for package worker jobs.
 pub const PACKAGE_QUEUE_NAME: &str = "lca_package_jobs";
+/// Unified `worker_jobs` queue name for package worker jobs.
+pub const PACKAGE_WORKER_QUEUE: &str = "package";
+/// Unified `worker_jobs` kind for TIDAS package exports.
+pub const PACKAGE_EXPORT_WORKER_JOB_KIND: &str = "tidas.export_package";
+/// Unified `worker_jobs` kind for TIDAS package imports.
+pub const PACKAGE_IMPORT_WORKER_JOB_KIND: &str = "tidas.import_package";
+/// Payload schema for TIDAS package export worker jobs.
+pub const PACKAGE_EXPORT_PAYLOAD_SCHEMA_VERSION: &str = "tidas.export_package.request.v1";
+/// Payload schema for TIDAS package import worker jobs.
+pub const PACKAGE_IMPORT_PAYLOAD_SCHEMA_VERSION: &str = "tidas.import_package.request.v1";
+/// Result schema for TIDAS package export worker jobs.
+pub const PACKAGE_EXPORT_RESULT_SCHEMA_VERSION: &str = "tidas.export_package.result.v1";
+/// Result schema for TIDAS package import worker jobs.
+pub const PACKAGE_IMPORT_RESULT_SCHEMA_VERSION: &str = "tidas.import_package.result.v1";
 /// ZIP artifact format for exported packages and uploaded import sources.
 pub const PACKAGE_ZIP_ARTIFACT_FORMAT: &str = "tidas-package-zip:v1";
 /// JSON artifact format for export summaries.
