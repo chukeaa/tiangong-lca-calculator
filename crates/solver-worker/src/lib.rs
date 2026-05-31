@@ -33,3 +33,4 @@ pub mod snapshot_index;
 pub mod snapshot_retention;
 pub mod storage;
 pub mod types;
+pub mod worker_jobs;

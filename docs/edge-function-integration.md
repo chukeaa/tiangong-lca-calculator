@@ -20,6 +20,7 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/review-submit-fast-gate-contract.md
   - crates/solver-worker/src/review_submit_gate_runner.rs
+  - crates/solver-worker/src/worker_jobs.rs
   - crates/solver-worker/src/bin/review_submit_gate_runner.rs
   - crates/**
   - supabase/migrations/**
@@ -193,13 +194,29 @@ worker：
 
 ## 9. Review Submit Gate 集成边界
 
-提交审核前的数值稳定性 gate 分成三层：
+提交审核前的数值稳定性 gate 分成三层；legacy gate-run 表和新的 `worker_jobs` 模式在切流期并存：
 
-- Edge 负责鉴权、请求校验、调用数据库 RPC `cmd_dataset_review_submit_gate` 创建 / 读取 / rerun gate run，并把返回状态透出给 Next。
-- Database 负责 `dataset_review_submit_gate_runs`、`cmd_dataset_review_submit_gate_record_result`、`cmd_dataset_assert_review_submit_gate_passed` 等持久化和发布前断言。
-- calculator `review_submit_gate_runner` 负责领取 queued gate run、构造 request-root snapshot、执行 `review_submit_gate`，并通过 `cmd_dataset_review_submit_gate_record_result` 写入 `passed`、`blocked` 或 `error`。
+- Edge 负责鉴权、请求校验、创建 / 读取 / rerun gate task，并把返回状态透出给 Next。
+- Database 负责 `dataset_review_submit_gate_runs` legacy 状态、`worker_jobs` 生命周期、result projection、lease fencing 和发布前断言。
+- calculator `review_submit_gate_runner` legacy 模式负责领取 queued gate run，并通过 `cmd_dataset_review_submit_gate_record_result` 写入 `passed`、`blocked` 或 `error`。
+- calculator `review_submit_gate_runner --worker-jobs` 模式负责领取 `worker_queue=review_submit_gate` 的 `review_submit.gate` job，并通过 `worker_record_job_result` 写入 `completed`、`blocked` 或 `failed`。
 
 Edge 不应执行 snapshot builder、provider scan、sparse factorization probe 或 targeted RHS solve。Edge 也不应直接更新 `dataset_review_submit_gate_runs.calculator_report`；结果写入只能由 calculator runner 使用 service-role DB 连接完成。
+
+worker_jobs enqueue payload 只需要表达 dataset revision 与可选诊断 checksum：
+
+```json
+{
+  "datasetRevision": {
+    "table": "processes",
+    "id": "<process uuid>",
+    "version": "01.00.000",
+    "revisionChecksum": "optional diagnostic checksum"
+  }
+}
+```
+
+calculator 会从 `processes.json_ordered` 计算权威 checksum，并在 worker job result 的 `datasetRevision.revisionChecksum` 返回。Edge 不应把浏览器端 checksum 当作权威值。
 
 状态语义：
 
@@ -210,3 +227,5 @@ Edge 不应执行 snapshot builder、provider scan、sparse factorization probe 
 - `stale`：旧 gate run 被新的 ensure/rerun 替代，Edge/Next 应读取最新 gate run。
 
 部署上，`review_submit_gate_runner` 需要与 solver worker 相同的 DB 和 S3 artifact 环境变量。常驻运行时使用 `REVIEW_SUBMIT_GATE_POLL_MS` 轮询；运维和 CI smoke 可使用 `--once` 处理一条后退出。
+
+worker_jobs 模式部署时增加 `--worker-jobs` 或 `REVIEW_SUBMIT_GATE_WORKER_JOBS=true`。`REVIEW_SUBMIT_GATE_WORKER_ID` 用于 operator 诊断；`REVIEW_SUBMIT_GATE_WORKER_LEASE_SECONDS` 默认 `900`，必须大于一次 heartbeat 间隔和常见 snapshot build 阶段耗时。

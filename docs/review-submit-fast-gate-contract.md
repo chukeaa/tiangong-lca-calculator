@@ -20,6 +20,7 @@ checkPaths:
   - crates/solver-worker/src/review_submit_gate.rs
   - crates/solver-worker/src/bin/review_submit_gate.rs
   - crates/solver-worker/src/review_submit_gate_runner.rs
+  - crates/solver-worker/src/worker_jobs.rs
   - crates/solver-worker/src/bin/review_submit_gate_runner.rs
   - crates/solver-worker/src/bin/snapshot_builder.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
@@ -49,7 +50,7 @@ related:
 calculator 暴露两个入口：
 
 - `review_submit_gate`：纯文件输入/输出 CLI，适合 fixture、CI、Foundry 或手工诊断。
-- `review_submit_gate_runner`：数据库运行时 runner，负责领取持久化 gate run、构造 snapshot、执行 calculator gate，并把结果写回数据库 RPC。
+- `review_submit_gate_runner`：数据库运行时 runner，兼容 legacy gate-run 模式和 `worker_jobs` 模式；两种模式都构造 snapshot、执行同一 calculator gate，再通过对应数据库 RPC 写回结果。
 
 纯文件 CLI：
 
@@ -67,13 +68,41 @@ DB runner：
 cargo run -p solver-worker --bin review_submit_gate_runner -- --once
 ```
 
-runner 读取 `DATABASE_URL` / `CONN` 与 S3 artifact 环境变量，直接访问 `public.dataset_review_submit_gate_runs`。它只领取：
+worker_jobs once-mode：
+
+```bash
+cargo run -p solver-worker --bin review_submit_gate_runner -- \
+  --worker-jobs \
+  --once \
+  --worker-id review_submit_gate_runner
+```
+
+runner 读取 `DATABASE_URL` / `CONN` 与 S3 artifact 环境变量。legacy 模式直接访问 `public.dataset_review_submit_gate_runs`。它只领取：
 
 - `policy_profile = review_submit_fast.v1`
 - `report_schema_version = review_submit_gate_report.v1`
 - `status = queued`，以及超过 `REVIEW_SUBMIT_GATE_STALE_RUNNING_SECONDS` 的 stale `running` 记录
 
 领取后状态变为 `running`。执行完成后，runner 调用 `public.cmd_dataset_review_submit_gate_record_result` 写入 `passed`、`blocked` 或 `error`。`--once` 用于一次性处理一条或空转退出；常驻模式会按 `REVIEW_SUBMIT_GATE_POLL_MS` 轮询。
+
+worker_jobs 模式只领取 `worker_queue=review_submit_gate` 中的 `review_submit.gate` job。claim、heartbeat 和 result 写入都必须携带 `lease_token`；如果 lease 过期或被其他 worker reclaim，旧 worker 的 heartbeat/result 必须失败，不允许覆盖新 lease 的结果。`REVIEW_SUBMIT_GATE_WORKER_LEASE_SECONDS` 默认 `900`，每次 heartbeat 会续租。
+
+worker_jobs payload schema version 为 `review_submit.gate.request.v1`：
+
+```json
+{
+  "datasetRevision": {
+    "table": "processes",
+    "id": "<process uuid>",
+    "version": "01.00.000",
+    "revisionChecksum": "optional diagnostic checksum"
+  },
+  "policyProfile": "review_submit_fast.v1",
+  "reportSchemaVersion": "review_submit_gate_report.v1"
+}
+```
+
+`revisionChecksum` 是兼容 / 诊断输入。runner 会从 `processes.json_ordered` 计算权威 checksum，并把它写入 worker job result 的 `datasetRevision.revisionChecksum`。如果 payload 没有传 checksum，gate 输入中的 expected checksum 使用本次权威 checksum；如果传入旧 checksum，则仍会通过 `revision_report_stale` blocker 表达 stale 结果。
 
 ## 输入
 
@@ -118,6 +147,14 @@ DB runner 写回数据库时：
 - `passed`：`blockingReasons = []`，`calculatorReport` 为 `review_submit_gate_report.v1`。
 - `blocked`：`blockingReasons` 由 `report.blockers` 直接映射，`calculatorReport` 为完整 report。
 - `error`：表示 runner、snapshot builder、artifact、DB 可见性或暂不支持的数据集类型导致 calculator 没有产出 passed/blocked 结论；`blockingReasons` 至少包含一个 runtime blocker，`calculatorReport.status = error`。
+
+worker_jobs 模式写回 `public.worker_jobs` 时：
+
+- gate passed：`status=completed`，`result.calculatorReport.status=passed`，`result.datasetRevision.revisionChecksum` 为权威 checksum。
+- gate blocked：`status=blocked`，`blocker_codes` 取自 `calculatorReport.blockers[].code`，`resolution_scope=user`，`retryable=true`，同时保留完整 `calculatorReport`。
+- runner / S3 / DB / unsupported dataset runtime error：`status=failed`，写入 `error_code`、`error_message`、`error_details` 和 operator diagnostics。
+
+calculator 不调用 final submit，也不修改 review-submit domain 状态。worker_jobs 只代表 calculator gate 计算任务；gate passed 后的 final submit durable coordinator 属于 Edge / database 层。
 
 ## Policy 默认值
 
