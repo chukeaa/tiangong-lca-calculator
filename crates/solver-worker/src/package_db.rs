@@ -16,6 +16,18 @@ use crate::{
     package_types::{PACKAGE_QUEUE_NAME, PackageArtifactKind, PackageJobPayload},
 };
 
+/// Package worker continuation after one execution pass.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PackageJobContinuation {
+    /// The package task reached a terminal domain status.
+    Complete,
+    /// The export task has more reference collection work to process.
+    Continue {
+        next_payload: PackageJobPayload,
+        diagnostics: Value,
+    },
+}
+
 /// Insert contract for one package artifact row.
 #[derive(Debug, Clone)]
 pub struct PackageArtifactInsert {
@@ -395,11 +407,26 @@ pub async fn reschedule_retryable_package_job(
 
 /// Executes one package queue payload end-to-end.
 #[instrument(skip(state))]
-#[allow(clippy::too_many_lines)]
 pub async fn handle_package_job_payload(
     state: &AppState,
     payload: PackageJobPayload,
 ) -> anyhow::Result<()> {
+    match handle_package_job_payload_once(state, payload).await? {
+        PackageJobContinuation::Complete => Ok(()),
+        PackageJobContinuation::Continue { next_payload, .. } => {
+            let _ = enqueue_package_job_payload(&state.pool, &next_payload).await?;
+            Ok(())
+        }
+    }
+}
+
+/// Executes one package payload pass without assuming a queue backend.
+#[instrument(skip(state))]
+#[allow(clippy::too_many_lines)]
+pub async fn handle_package_job_payload_once(
+    state: &AppState,
+    payload: PackageJobPayload,
+) -> anyhow::Result<PackageJobContinuation> {
     match payload {
         PackageJobPayload::ExportPackage {
             job_id,
@@ -429,41 +456,39 @@ pub async fn handle_package_job_payload(
                 &state.pool,
                 job_id,
                 outcome.final_status,
-                outcome.diagnostics,
+                outcome.diagnostics.clone(),
             )
             .await?;
 
             if outcome.final_status == "running" {
-                let _ = enqueue_package_job_payload(
-                    &state.pool,
-                    &PackageJobPayload::ExportPackage {
+                Ok(PackageJobContinuation::Continue {
+                    next_payload: PackageJobPayload::ExportPackage {
                         job_id,
                         requested_by,
                         scope,
                         roots,
                     },
+                    diagnostics: outcome.diagnostics,
+                })
+            } else {
+                if let Err(err) = mark_package_request_cache_ready(
+                    &state.pool,
+                    job_id,
+                    outcome.export_artifact_id,
+                    outcome.report_artifact_id,
                 )
-                .await?;
-            } else if let Err(err) = mark_package_request_cache_ready(
-                &state.pool,
-                job_id,
-                outcome.export_artifact_id,
-                outcome.report_artifact_id,
-            )
-            .await
-            {
-                warn!(
-                    error = %err,
-                    job_id = %job_id,
-                    "failed to mark package request cache ready"
-                );
-            }
+                .await
+                {
+                    warn!(
+                        error = %err,
+                        job_id = %job_id,
+                        "failed to mark package request cache ready"
+                    );
+                }
 
-            if outcome.final_status != "running" {
                 clear_runtime_export_traversal_cache(job_id);
+                Ok(PackageJobContinuation::Complete)
             }
-
-            Ok(())
         }
         PackageJobPayload::ImportPackage {
             job_id,
@@ -522,7 +547,7 @@ pub async fn handle_package_job_payload(
                 );
             }
 
-            Ok(())
+            Ok(PackageJobContinuation::Complete)
         }
     }
 }

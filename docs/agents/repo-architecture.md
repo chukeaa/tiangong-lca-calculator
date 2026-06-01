@@ -117,7 +117,7 @@ The package worker handles:
 - `export_package`
 - `import_package`
 
-It also owns package-job artifacts and diagnostics.
+It also owns package-job artifacts and diagnostics. The default package worker backend consumes legacy `pgmq` messages from `lca_package_jobs`. The `PACKAGE_QUEUE_BACKEND=worker-jobs` path claims `public.worker_jobs` rows from `worker_queue=package`, maps `job_kind=tidas.export_package|tidas.import_package` into the same `PackageJobPayload` variants, heartbeats package progress, records terminal `worker_jobs` results, and keeps `lca_package_jobs` / `lca_package_artifacts` / `lca_package_request_cache` as the current package domain facts.
 
 ### Result persistence
 
