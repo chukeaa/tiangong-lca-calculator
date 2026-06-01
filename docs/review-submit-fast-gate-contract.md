@@ -74,7 +74,7 @@ worker_jobs once-mode：
 cargo run -p solver-worker --bin review_submit_gate_runner -- \
   --worker-jobs \
   --once \
-  --worker-id review_submit_gate_runner
+  --review-submit-gate-worker-id review_submit_gate_runner
 ```
 
 runner 读取 `DATABASE_URL` / `CONN` 与 S3 artifact 环境变量。legacy 模式直接访问 `public.dataset_review_submit_gate_runs`。它只领取：
