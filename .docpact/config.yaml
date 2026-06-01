@@ -1,7 +1,7 @@
 version: 1
 layout: repo
 lastReviewedAt: "2026-06-01"
-lastReviewedCommit: "58fadf136fadff7ab70c8466bcb883815ea439f5"
+lastReviewedCommit: "cc31672ee15d1769b4e8aa7e2e0b516128dd920f"
 
 # Keep deterministic governance facts here.
 # AGENTS.md remains the repo contract entrypoint.
@@ -24,6 +24,7 @@ ownership:
         include:
           - AGENTS.md
           - README.md
+          - .env.example
           - .docpact/**
           - docs/agents/**
           - docs/lca-api-contract.md
@@ -73,6 +74,7 @@ coverage:
     - scripts/install-git-hooks.sh
     - AGENTS.md
     - README.md
+    - .env.example
     - .docpact/**
     - docs/agents/repo-validation.md
     - docs/agents/repo-architecture.md
@@ -185,6 +187,7 @@ routing:
       paths:
         - AGENTS.md
         - README.md
+        - .env.example
         - .docpact/**
         - docs/agents/**
         - docs/lca-api-contract.md
@@ -248,6 +251,8 @@ rules:
     triggers:
       - path: README.md
         kind: repo-landing
+      - path: .env.example
+        kind: operator-env-template
     requiredDocs:
       - path: AGENTS.md
         mode: review_or_update

@@ -14,6 +14,7 @@ whenToUpdate:
 checkPaths:
   - README.md
   - AGENTS.md
+  - .env.example
   - .docpact/config.yaml
   - docs/agents/**
   - docs/lca-api-contract.md
@@ -21,8 +22,8 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/tidas-package-contract.md
-lastReviewedAt: 2026-05-20
-lastReviewedCommit: f23848d58634dbf6f77df741210476f8d7bf61a1
+lastReviewedAt: 2026-06-01
+lastReviewedCommit: cc31672ee15d1769b4e8aa7e2e0b516128dd920f
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -279,6 +280,8 @@ psql "$CONN" -v ON_ERROR_STOP=1 -f supabase/migrations/20260309042000_lca_latest
 - `pn_pm_candidates`：PN / PM0.2 / particle 相关的可疑 process
 
 ## 5. 环境变量
+
+可从 `.env.example` 复制模板到 `.env`、`.env.dev` 或 systemd `EnvironmentFile`，再填入真实连接串和密钥。`.env.example` 只应保留占位值和安全默认值。
 
 最小必需：
 
