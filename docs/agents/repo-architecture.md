@@ -97,6 +97,8 @@ The worker currently covers families such as:
 
 These flows belong to the calculator runtime, not to the API repo.
 
+The main solver worker has two queue backends. The default `SOLVER_QUEUE_BACKEND=pgmq` path consumes legacy `pgmq` messages from `PGMQ_QUEUE` and updates `lca_jobs`. The `SOLVER_QUEUE_BACKEND=worker-jobs` path claims `public.worker_jobs` rows from `worker_queue=solver`, maps `job_kind=lca.*` payloads back to the same internal `JobPayload` variants, heartbeats `phase/progress`, and records terminal results through `worker_record_job_result` while preserving `lca_jobs` / `lca_results` as the current result/cache domain facts.
+
 ### Snapshot builder and provider matching
 
 The snapshot builder path owns sparse payload generation, provider matching, and snapshot artifact metadata.
@@ -125,6 +127,7 @@ Result artifacts are persisted through the worker and supporting runtime storage
 
 - Solve result persistence is S3-only; treat `lca_results` as artifact metadata plus diagnostics, not as an inline result store.
 - The worker uses a main DB pool plus an optional queue-only DB pool. The main pool is configured through `DATABASE_URL` / `CONN`, `DB_MAX_CONNECTIONS`, `DB_MIN_CONNECTIONS`, and `DB_ACQUIRE_TIMEOUT_SECONDS`; it should remain on a session/direct connection or session pooler when compute paths use SQLx bound queries. The queue-only pool is configured through `QUEUE_DATABASE_URL` / `QUEUE_CONN`, `QUEUE_DB_MAX_CONNECTIONS`, `QUEUE_DB_MIN_CONNECTIONS`, and `QUEUE_DB_ACQUIRE_TIMEOUT_SECONDS`; if no queue URL is set it reuses the main pool.
+- `WORKER_ID`, `WORKER_JOBS_CLAIM_LIMIT`, and `WORKER_JOBS_LEASE_SECONDS` control solver `worker_jobs` claim diagnostics, batch size, and lease renewal. Keep the lease longer than a normal solve/snapshot heartbeat interval and use `BUILD_SNAPSHOT_MAX_CONCURRENCY` for actual snapshot build throttling.
 - `build_snapshot` is globally throttled with a PostgreSQL transaction-level advisory lock (`BUILD_SNAPSHOT_MAX_CONCURRENCY`, default `1`) across worker instances; keep `WORKER_VT_SECONDS` larger than the worst-case lock wait plus build time.
 - Runtime SQLx queries use non-persistent prepared statements so the worker does not reuse named prepared statements across PostgreSQL session reuse boundaries. High-frequency pgmq polling and archive operations use the queue-only pool plus `raw_sql` with validated queue-name literals so they can run through the simple query protocol on Supabase's 6543 transaction pooler without moving compute/package/snapshot queries onto that pooler.
 - Queue enqueue and protected writes stay on service-side runtime paths guarded by existing RLS and `service_role` boundaries.

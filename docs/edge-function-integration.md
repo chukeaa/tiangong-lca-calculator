@@ -35,12 +35,12 @@ related:
 
 # Edge Function Integration Guide
 
-本文档给 Supabase Edge Functions 项目使用，目标是把前端请求稳定地映射到 `lca_jobs + pgmq` 异步链路。
+本文档给 Supabase Edge Functions 项目使用，目标是把前端请求稳定地映射到 calculator 异步链路。legacy 路径是 `lca_jobs + pgmq`；统一任务路径是 `worker_jobs(worker_queue=solver)`，但 result/cache domain truth 在切流期仍保留 `lca_jobs` / `lca_results`。
 
 ## 1. 为什么必须走 Edge Function
 
 - 前端不应持有 `service_role`。
-- `lca_jobs` 创建、`pgmq.send`、缓存去重都属于受控写操作。
+- `lca_jobs` 创建、`worker_enqueue_job` / `pgmq.send`、缓存去重都属于受控写操作。
 - RLS 已收紧，前端只适合读取自己的 `jobs/results`，不适合写任务。
 
 ## 2. 推荐的 Edge API
@@ -147,9 +147,10 @@ Header 建议：
    - 若 `ready` 且有 `result_id`，直接返回 `cache_hit`
    - 若 `pending/running` 且有 `job_id`，返回 `in_progress`
    - 否则创建 `lca_jobs(status=queued, requested_by=user_id, request_key, idempotency_key)`
-   - 调用 `public.lca_enqueue_job('lca_jobs', payload)` RPC 入队
+   - legacy pgmq 路径：调用 `public.lca_enqueue_job('lca_jobs', payload)` RPC 入队
+   - `worker_jobs` 路径：调用 `public.worker_enqueue_job(...)`，使用 `job_kind=lca.solve_one|lca.solve_batch|lca.solve_all_unit|lca.build_snapshot|lca.contribution_path`、`worker_queue=solver`，并在 payload 中携带 `lcaJobId`
    - 回写 `lca_result_cache.job_id/status='pending'`
-7. 返回 `queued`。
+7. 返回 `queued`。`worker_jobs` 路径应额外返回 `workerJobId`，供任务中心和 operator 查询使用。
 
 worker 侧会继续推进 `lca_result_cache`：`pending -> running -> ready`（或失败时 `failed`）。
 
@@ -168,6 +169,7 @@ worker：
 - 分解/求解
 - 写 `lca_jobs` 终态
 - 写 `lca_results`
+- `worker_jobs` 路径还会 heartbeat `phase/progress`，并用 `worker_record_job_result` 写统一任务终态；不要让 Edge 自己更新 worker lease/result 字段。
 
 ## 6. 失败与重试建议
 
@@ -182,13 +184,14 @@ worker：
 - 封装 `build_rhs(process_count, process_index, amount)`。
 - 封装 `build_solve_all_unit_payload(snapshot_id, solve, unit_batch_size)`。
 - 封装 `make_request_key(normalized_input)`。
-- 封装 `enqueue_job_and_update_cache(...)` 事务函数。
+- 封装 `enqueue_job_and_update_cache(...)` 事务函数；切到统一任务时，这个函数必须同时创建/复用 `lca_jobs` domain row 并 enqueue `worker_jobs`。
 - 输出统一错误码（如 `BAD_INPUT` / `SNAPSHOT_NOT_READY` / `QUEUE_ERROR`）。
 
 ## 8. 不要做的事
 
 - 不要让前端直接写 `lca_jobs`。
 - 不要让前端直接调用 `pgmq.send`。
+- 不要让前端直接写 `worker_jobs`；统一任务也必须由 Edge/database service-role 边界 enqueue。
 - 不要在 Edge Function 同步等待完整求解结果。
 - 不要在 Edge Function 中进行重数值计算。
 

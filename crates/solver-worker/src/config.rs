@@ -13,6 +13,15 @@ pub enum RunMode {
     Both,
 }
 
+/// Queue backend used by worker mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum QueueBackend {
+    /// Legacy pgmq queue payloads.
+    Pgmq,
+    /// Unified `public.worker_jobs` queue payloads.
+    WorkerJobs,
+}
+
 /// CLI + env config.
 #[derive(Debug, Clone, Parser)]
 #[command(name = "solver-worker")]
@@ -33,9 +42,21 @@ pub struct AppConfig {
     /// Queue-only `PostgreSQL` URL fallback used by this project in local `.env`.
     #[arg(long, env = "QUEUE_CONN")]
     pub queue_conn: Option<String>,
+    /// Worker queue backend.
+    #[arg(long, env = "SOLVER_QUEUE_BACKEND", default_value = "pgmq")]
+    pub queue_backend: QueueBackend,
     /// Queue name in pgmq.
     #[arg(long, env = "PGMQ_QUEUE", default_value = "lca_jobs")]
     pub pgmq_queue: String,
+    /// Stable worker id recorded on claimed `worker_jobs` rows.
+    #[arg(long, env = "WORKER_ID")]
+    pub worker_id: Option<String>,
+    /// Number of `worker_jobs` rows to claim per poll.
+    #[arg(long, env = "WORKER_JOBS_CLAIM_LIMIT", default_value_t = 1_i32)]
+    pub worker_jobs_claim_limit: i32,
+    /// Lease seconds used when claiming or heartbeating `worker_jobs` rows.
+    #[arg(long, env = "WORKER_JOBS_LEASE_SECONDS", default_value_t = 900_i32)]
+    pub worker_jobs_lease_seconds: i32,
     /// Poll interval for queue worker (ms).
     #[arg(long, env = "WORKER_POLL_MS", default_value_t = 1_000_u64)]
     pub worker_poll_ms: u64,
@@ -130,6 +151,31 @@ impl AppConfig {
         Duration::from_millis(self.worker_poll_ms)
     }
 
+    /// Stable worker id for `worker_jobs` claim diagnostics.
+    #[must_use]
+    pub fn worker_id(&self) -> String {
+        self.worker_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map_or_else(
+                || format!("solver-worker-{}", std::process::id()),
+                str::to_owned,
+            )
+    }
+
+    /// Sanitized `worker_jobs` claim limit.
+    #[must_use]
+    pub fn worker_jobs_claim_limit(&self) -> i32 {
+        self.worker_jobs_claim_limit.clamp(1, 50)
+    }
+
+    /// Sanitized `worker_jobs` lease seconds.
+    #[must_use]
+    pub fn worker_jobs_lease_seconds(&self) -> i32 {
+        self.worker_jobs_lease_seconds.clamp(1, 86_400)
+    }
+
     /// Sanitized maximum DB connections for the worker process.
     #[must_use]
     pub fn db_max_connections(&self) -> u32 {
@@ -188,7 +234,7 @@ impl AppConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::AppConfig;
+    use super::{AppConfig, QueueBackend};
     use clap::Parser;
     use std::time::Duration;
 
@@ -211,6 +257,10 @@ mod tests {
         assert_eq!(config.queue_db_max_connections(), 2);
         assert_eq!(config.queue_db_min_connections(), 0);
         assert_eq!(config.queue_db_acquire_timeout(), Duration::from_secs(30));
+        assert_eq!(config.queue_backend, QueueBackend::Pgmq);
+        assert!(config.worker_id().starts_with("solver-worker-"));
+        assert_eq!(config.worker_jobs_claim_limit(), 1);
+        assert_eq!(config.worker_jobs_lease_seconds(), 900);
         assert_eq!(config.build_snapshot_max_concurrency(), 1);
         assert_eq!(
             config.build_snapshot_lock_poll_interval(),
@@ -236,6 +286,10 @@ mod tests {
             "4",
             "--queue-db-acquire-timeout-seconds",
             "0",
+            "--worker-jobs-claim-limit",
+            "0",
+            "--worker-jobs-lease-seconds",
+            "0",
             "--build-snapshot-max-concurrency",
             "0",
             "--build-snapshot-lock-poll-ms",
@@ -248,6 +302,8 @@ mod tests {
         assert_eq!(config.queue_db_max_connections(), 1);
         assert_eq!(config.queue_db_min_connections(), 1);
         assert_eq!(config.queue_db_acquire_timeout(), Duration::from_secs(1));
+        assert_eq!(config.worker_jobs_claim_limit(), 1);
+        assert_eq!(config.worker_jobs_lease_seconds(), 1);
         assert_eq!(config.build_snapshot_max_concurrency(), 1);
         assert_eq!(
             config.build_snapshot_lock_poll_interval(),
@@ -270,5 +326,27 @@ mod tests {
             "postgres://pooler.example.local/app"
         );
         assert!(config.has_explicit_queue_database_url());
+    }
+
+    #[test]
+    fn worker_jobs_backend_and_worker_id_parse_from_cli() {
+        let config = AppConfig::parse_from([
+            "solver-worker",
+            "--database-url",
+            "postgres://example.local/app",
+            "--queue-backend",
+            "worker-jobs",
+            "--worker-id",
+            " solver-a ",
+            "--worker-jobs-claim-limit",
+            "100",
+            "--worker-jobs-lease-seconds",
+            "90000",
+        ]);
+
+        assert_eq!(config.queue_backend, QueueBackend::WorkerJobs);
+        assert_eq!(config.worker_id(), "solver-a");
+        assert_eq!(config.worker_jobs_claim_limit(), 50);
+        assert_eq!(config.worker_jobs_lease_seconds(), 86_400);
     }
 }

@@ -38,7 +38,7 @@ related:
 - 调 Edge API 发起计算。
 - 轮询或订阅 job/result 状态并展示。
 
-前端不要直接写 `lca_jobs` / `pgmq`。
+前端不要直接写 `lca_jobs`、`pgmq` 或 `worker_jobs`。
 
 ## 2. 推荐交互流程
 
@@ -48,7 +48,7 @@ related:
 2. 前端 `POST /lca/solve`（带 `X-Idempotency-Key`）。
 3. 根据返回模式处理：
    - `cache_hit`: 直接拉结果并渲染。
-   - `queued` / `in_progress`: 进入 job 进度页。
+   - `queued` / `in_progress`: 进入任务中心或 job 进度页，由 Edge 返回的服务端 projection 驱动展示。
 4. 轮询 `GET /lca/jobs/:jobId`，直到：
    - `completed` / `ready`：查询结果
    - `failed`：展示失败原因
@@ -141,6 +141,8 @@ export type JobStatus =
 - `failed`：表示 runner、S3、DB 或部署错误；应与数据 blocker 分开展示，支持重试或联系运维。
 
 `worker_jobs` 的 `progress`、`phase`、`heartbeatAt` 适合任务中心展示。浏览器本地 task 只能作为 UI cache，不能作为任务事实来源。
+
+LCA solver/snapshot 切到 `worker_jobs(worker_queue=solver)` 后，前端仍然不读表；Edge 应把 `workerJobId`、`lcaJobId`、`phase`、`progress`、`resultId` 和失败摘要投影给任务中心。`lcaJobId` 在切流期仍是读取 `lca_results` / `lca_result_cache` 的 domain key，不能被浏览器伪造。
 
 ## 10. 前端验收清单
 

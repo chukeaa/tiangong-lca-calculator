@@ -1,18 +1,21 @@
 use std::sync::Arc;
 
-use crate::pgbouncer_sqlx as sqlx;
-use serde_json::Value;
+use crate::pgbouncer_sqlx::{self as sqlx, Row};
+use serde_json::{Map, Value, json};
 use tokio::time::sleep;
 use tracing::{error, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::{
     db::{
-        AppState, archive_queue_message, handle_job_payload, mark_result_cache_failed,
-        read_one_queue_message, update_job_status,
+        AppState, archive_queue_message, handle_job_payload, latest_result_id_for_job,
+        mark_result_cache_failed, read_one_queue_message, update_job_status,
     },
     types::JobPayload,
+    worker_jobs::{WorkerJob, WorkerJobResult, claim_worker_jobs, record_worker_job_result},
 };
+
+const SOLVER_WORKER_QUEUE: &str = "solver";
 
 fn extract_snapshot_id(payload: &JobPayload) -> Option<Uuid> {
     match payload {
@@ -224,6 +227,413 @@ async fn build_failure_diagnostics(
     diag
 }
 
+#[instrument(skip(state))]
+pub async fn run_solver_worker_jobs_loop(
+    state: Arc<AppState>,
+    worker_id: String,
+    claim_limit: i32,
+    lease_seconds: i32,
+    poll_interval: std::time::Duration,
+) -> anyhow::Result<()> {
+    loop {
+        match claim_worker_jobs(
+            &state.pool,
+            SOLVER_WORKER_QUEUE,
+            &worker_id,
+            claim_limit,
+            lease_seconds,
+        )
+        .await
+        {
+            Ok(jobs) if jobs.is_empty() => {
+                sleep(poll_interval).await;
+            }
+            Ok(jobs) => {
+                for job in jobs {
+                    process_solver_worker_job(&state, job, lease_seconds).await;
+                }
+            }
+            Err(err) => {
+                error!(error = %err, "worker_jobs claim error");
+                sleep(poll_interval).await;
+            }
+        }
+    }
+}
+
+async fn process_solver_worker_job(state: &AppState, job: WorkerJob, lease_seconds: i32) {
+    let payload = match solver_worker_job_payload(&job) {
+        Ok(payload) => payload,
+        Err(err) => {
+            let err_message = err.to_string();
+            record_invalid_solver_worker_job_payload(state, &job, &err_message).await;
+            return;
+        }
+    };
+
+    let lca_job_id = extract_job_id(&payload);
+    let phase = solver_worker_phase(&payload);
+    if let Err(err) = crate::worker_jobs::heartbeat_worker_job(
+        &state.pool,
+        job.id,
+        job.lease_token,
+        phase,
+        0.05,
+        Some(json!({
+            "lcaJobId": lca_job_id,
+            "payloadType": payload_type_name(&payload),
+        })),
+        lease_seconds,
+    )
+    .await
+    {
+        error!(
+            error = %err,
+            worker_job_id = %job.id,
+            lca_job_id = %lca_job_id,
+            "failed to heartbeat solver worker_jobs row before execution"
+        );
+        return;
+    }
+
+    match handle_job_payload(state, payload.clone()).await {
+        Ok(()) => {
+            record_solver_worker_job_success(state, &job, &payload, lca_job_id).await;
+        }
+        Err(err) => {
+            record_solver_worker_job_failure(state, &job, &payload, lca_job_id, &err.to_string())
+                .await;
+        }
+    }
+}
+
+async fn record_invalid_solver_worker_job_payload(
+    state: &AppState,
+    job: &WorkerJob,
+    err_message: &str,
+) {
+    error!(
+        error = %err_message,
+        worker_job_id = %job.id,
+        job_kind = %job.job_kind,
+        "invalid solver worker_jobs payload"
+    );
+    let result = WorkerJobResult::failed(
+        "invalid_solver_worker_job_payload",
+        err_message.to_owned(),
+        json!({
+            "workerJobId": job.id,
+            "jobKind": job.job_kind,
+            "payloadSchemaVersion": job.payload_schema_version,
+        }),
+        Some(json!({"error": err_message})),
+        None,
+    );
+    if let Err(record_err) =
+        record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
+    {
+        error!(error = %record_err, worker_job_id = %job.id, "failed to record invalid worker_jobs payload");
+    }
+}
+
+async fn record_solver_worker_job_failure(
+    state: &AppState,
+    job: &WorkerJob,
+    payload: &JobPayload,
+    lca_job_id: Uuid,
+    err_message: &str,
+) {
+    error!(
+        error = %err_message,
+        worker_job_id = %job.id,
+        lca_job_id = %lca_job_id,
+        "solver worker_jobs execution failed"
+    );
+    let diagnostics = build_failure_diagnostics(&state.pool, payload, err_message).await;
+    let _ = update_job_status(&state.pool, lca_job_id, "failed", diagnostics.clone()).await;
+    let _ = mark_result_cache_failed(&state.pool, lca_job_id, "job_execution_failed", err_message)
+        .await;
+    let result = WorkerJobResult::failed(
+        "solver_worker_job_failed",
+        err_message.to_owned(),
+        json!({
+            "workerJobId": job.id,
+            "lcaJobId": lca_job_id,
+            "payloadType": payload_type_name(payload),
+        }),
+        Some(diagnostics),
+        None,
+    );
+    if let Err(record_err) =
+        record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
+    {
+        error!(error = %record_err, worker_job_id = %job.id, "failed to record worker_jobs failure");
+    }
+}
+
+async fn record_solver_worker_job_success(
+    state: &AppState,
+    job: &WorkerJob,
+    payload: &JobPayload,
+    lca_job_id: Uuid,
+) {
+    match build_solver_worker_job_result(state, payload).await {
+        Ok(result) => {
+            if let Err(err) =
+                record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
+            {
+                error!(error = %err, worker_job_id = %job.id, lca_job_id = %lca_job_id, "failed to record worker_jobs success");
+            } else {
+                info!(worker_job_id = %job.id, lca_job_id = %lca_job_id, "solver worker_jobs job completed");
+            }
+        }
+        Err(err) => {
+            let err_message = err.to_string();
+            error!(
+                error = %err_message,
+                worker_job_id = %job.id,
+                lca_job_id = %lca_job_id,
+                "solver worker_jobs execution completed but result projection failed"
+            );
+            let result = WorkerJobResult::failed(
+                "solver_worker_job_projection_failed",
+                err_message.clone(),
+                json!({
+                    "workerJobId": job.id,
+                    "lcaJobId": lca_job_id,
+                    "payloadType": payload_type_name(payload),
+                }),
+                Some(json!({"error": err_message})),
+                None,
+            );
+            if let Err(record_err) =
+                record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
+            {
+                error!(error = %record_err, worker_job_id = %job.id, "failed to record worker_jobs projection failure");
+            }
+        }
+    }
+}
+
+async fn build_solver_worker_job_result(
+    state: &AppState,
+    payload: &JobPayload,
+) -> anyhow::Result<WorkerJobResult> {
+    let lca_job_id = extract_job_id(payload);
+    let job_projection = fetch_lca_job_projection(&state.pool, lca_job_id).await?;
+    let result_id = latest_result_id_for_job(&state.pool, lca_job_id).await?;
+    let result_ref = result_id.map(|id| json!({"table": "lca_results", "id": id}));
+    let result_json = json!({
+        "lcaJobId": lca_job_id,
+        "payloadType": payload_type_name(payload),
+        "snapshotId": job_projection.get("snapshotId").cloned().unwrap_or(Value::Null),
+        "lcaJobStatus": job_projection.get("status").cloned().unwrap_or(Value::Null),
+        "resultId": result_id,
+    });
+
+    Ok(WorkerJobResult {
+        status: "completed".to_owned(),
+        result_json: Some(result_json),
+        result_schema_version: Some(result_schema_version_for_payload(payload).to_owned()),
+        result_ref,
+        diagnostics: Some(json!({
+            "lcaJob": job_projection,
+        })),
+        error_code: None,
+        error_message: None,
+        error_details: None,
+        blocker_codes: Vec::new(),
+        resolution_scope: None,
+        retryable: None,
+    })
+}
+
+async fn fetch_lca_job_projection(pool: &sqlx::PgPool, job_id: Uuid) -> anyhow::Result<Value> {
+    let row = sqlx::query(
+        r"
+        SELECT status, job_type, snapshot_id, diagnostics
+        FROM public.lca_jobs
+        WHERE id = $1
+        ",
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map_or_else(
+        || json!({"id": job_id, "missing": true}),
+        |row| {
+            json!({
+                "id": job_id,
+                "status": row.try_get::<String, _>("status").ok(),
+                "jobType": row.try_get::<String, _>("job_type").ok(),
+                "snapshotId": row.try_get::<Uuid, _>("snapshot_id").ok(),
+                "diagnostics": row.try_get::<Value, _>("diagnostics").ok(),
+            })
+        },
+    ))
+}
+
+fn solver_worker_job_payload(job: &WorkerJob) -> anyhow::Result<JobPayload> {
+    if job.worker_queue != SOLVER_WORKER_QUEUE {
+        return Err(anyhow::anyhow!(
+            "unsupported worker queue for solver job: {}",
+            job.worker_queue
+        ));
+    }
+
+    let expected_schema = payload_schema_version_for_job_kind(&job.job_kind)
+        .ok_or_else(|| anyhow::anyhow!("unsupported solver worker job kind: {}", job.job_kind))?;
+    if job.payload_schema_version != expected_schema {
+        return Err(anyhow::anyhow!(
+            "unsupported payload schema for {}: {}",
+            job.job_kind,
+            job.payload_schema_version
+        ));
+    }
+
+    let mut payload = normalize_worker_payload_object(job.payload.clone())?;
+    if !payload.contains_key("type") {
+        payload.insert(
+            "type".to_owned(),
+            Value::String(
+                payload_type_for_job_kind(&job.job_kind)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("unsupported solver worker job kind: {}", job.job_kind)
+                    })?
+                    .to_owned(),
+            ),
+        );
+    }
+
+    Ok(serde_json::from_value(Value::Object(payload))?)
+}
+
+fn normalize_worker_payload_object(value: Value) -> anyhow::Result<Map<String, Value>> {
+    let Value::Object(mut payload) = value else {
+        return Err(anyhow::anyhow!(
+            "solver worker job payload must be an object"
+        ));
+    };
+
+    copy_alias(&mut payload, "jobId", "job_id");
+    copy_alias(&mut payload, "lcaJobId", "job_id");
+    copy_alias(&mut payload, "snapshotId", "snapshot_id");
+    copy_alias(&mut payload, "modelVersion", "snapshot_id");
+    copy_alias(&mut payload, "rhsBatch", "rhs_batch");
+    copy_alias(&mut payload, "unitBatchSize", "unit_batch_size");
+    copy_alias(&mut payload, "printLevel", "print_level");
+    copy_alias(&mut payload, "processId", "process_id");
+    copy_alias(&mut payload, "processIndex", "process_index");
+    copy_alias(&mut payload, "impactId", "impact_id");
+    copy_alias(&mut payload, "impactIndex", "impact_index");
+    copy_alias(&mut payload, "processStates", "process_states");
+    copy_alias(&mut payload, "includeUserId", "include_user_id");
+    copy_alias(&mut payload, "requestRoots", "request_roots");
+    copy_alias(&mut payload, "providerRule", "provider_rule");
+    copy_alias(
+        &mut payload,
+        "referenceNormalizationMode",
+        "reference_normalization_mode",
+    );
+    copy_alias(
+        &mut payload,
+        "allocationFractionMode",
+        "allocation_fraction_mode",
+    );
+    copy_alias(&mut payload, "processLimit", "process_limit");
+    copy_alias(&mut payload, "selfLoopCutoff", "self_loop_cutoff");
+    copy_alias(&mut payload, "singularEps", "singular_eps");
+    copy_alias(&mut payload, "methodId", "method_id");
+    copy_alias(&mut payload, "methodVersion", "method_version");
+    copy_alias(&mut payload, "noLcia", "no_lcia");
+    normalize_request_roots(&mut payload);
+
+    Ok(payload)
+}
+
+fn copy_alias(payload: &mut Map<String, Value>, alias: &str, canonical: &str) {
+    if !payload.contains_key(canonical)
+        && let Some(value) = payload.get(alias).cloned()
+    {
+        payload.insert(canonical.to_owned(), value);
+    }
+}
+
+fn normalize_request_roots(payload: &mut Map<String, Value>) {
+    let Some(Value::Array(roots)) = payload.get_mut("request_roots") else {
+        return;
+    };
+    for root in roots {
+        let Value::Object(root_obj) = root else {
+            continue;
+        };
+        copy_alias(root_obj, "processId", "process_id");
+        copy_alias(root_obj, "processVersion", "process_version");
+        copy_alias(root_obj, "version", "process_version");
+    }
+}
+
+fn payload_schema_version_for_job_kind(job_kind: &str) -> Option<&'static str> {
+    match job_kind {
+        "lca.solve_one" => Some("lca.solve_one.request.v1"),
+        "lca.solve_batch" => Some("lca.solve_batch.request.v1"),
+        "lca.solve_all_unit" => Some("lca.solve_all_unit.request.v1"),
+        "lca.build_snapshot" => Some("lca.build_snapshot.request.v1"),
+        "lca.contribution_path" => Some("lca.contribution_path.request.v1"),
+        "lca.factorization_prepare" => Some("lca.factorization_prepare.request.v1"),
+        _ => None,
+    }
+}
+
+fn payload_type_for_job_kind(job_kind: &str) -> Option<&'static str> {
+    match job_kind {
+        "lca.solve_one" => Some("solve_one"),
+        "lca.solve_batch" => Some("solve_batch"),
+        "lca.solve_all_unit" => Some("solve_all_unit"),
+        "lca.build_snapshot" => Some("build_snapshot"),
+        "lca.contribution_path" => Some("analyze_contribution_path"),
+        "lca.factorization_prepare" => Some("prepare_factorization"),
+        _ => None,
+    }
+}
+
+fn result_schema_version_for_payload(payload: &JobPayload) -> &'static str {
+    match payload {
+        JobPayload::BuildSnapshot { .. } => "lca.snapshot.result.v1",
+        JobPayload::AnalyzeContributionPath { .. } => "lca.contribution_path.result.v1",
+        JobPayload::PrepareFactorization { .. } => "lca.factorization_prepare.result.v1",
+        _ => "lca.solve.result.v1",
+    }
+}
+
+fn payload_type_name(payload: &JobPayload) -> &'static str {
+    match payload {
+        JobPayload::PrepareFactorization { .. } => "prepare_factorization",
+        JobPayload::SolveOne { .. } => "solve_one",
+        JobPayload::SolveBatch { .. } => "solve_batch",
+        JobPayload::SolveAllUnit { .. } => "solve_all_unit",
+        JobPayload::AnalyzeContributionPath { .. } => "analyze_contribution_path",
+        JobPayload::InvalidateFactorization { .. } => "invalidate_factorization",
+        JobPayload::RebuildFactorization { .. } => "rebuild_factorization",
+        JobPayload::BuildSnapshot { .. } => "build_snapshot",
+    }
+}
+
+fn solver_worker_phase(payload: &JobPayload) -> &'static str {
+    match payload {
+        JobPayload::BuildSnapshot { .. } => "build_snapshot",
+        JobPayload::AnalyzeContributionPath { .. } => "analyze_contribution_path",
+        JobPayload::PrepareFactorization { .. } | JobPayload::RebuildFactorization { .. } => {
+            "prepare_factorization"
+        }
+        JobPayload::InvalidateFactorization { .. } => "invalidate_factorization",
+        JobPayload::SolveOne { .. } => "solve_one",
+        JobPayload::SolveBatch { .. } => "solve_batch",
+        JobPayload::SolveAllUnit { .. } => "solve_all_unit",
+    }
+}
+
 /// Runs pgmq polling loop.
 #[instrument(skip(state))]
 pub async fn run_worker_loop(
@@ -315,4 +725,197 @@ fn extract_job_id_from_raw_payload(payload: &Value) -> Option<Uuid> {
         .get("job_id")
         .and_then(Value::as_str)
         .and_then(|raw| Uuid::parse_str(raw).ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use crate::{
+        queue::{payload_type_name, solver_worker_job_payload},
+        types::JobPayload,
+        worker_jobs::WorkerJob,
+    };
+
+    fn worker_job(
+        job_kind: &str,
+        payload_schema_version: &str,
+        payload: serde_json::Value,
+    ) -> WorkerJob {
+        WorkerJob {
+            id: Uuid::new_v4(),
+            job_kind: job_kind.to_owned(),
+            worker_queue: "solver".to_owned(),
+            payload_schema_version: payload_schema_version.to_owned(),
+            payload,
+            requested_by: Some(Uuid::new_v4()),
+            lease_token: Uuid::new_v4(),
+            attempt_count: 1,
+        }
+    }
+
+    #[test]
+    fn maps_worker_jobs_solve_one_payload_with_camel_case_aliases() {
+        let lca_job_id = Uuid::new_v4();
+        let snapshot_id = Uuid::new_v4();
+        let job = worker_job(
+            "lca.solve_one",
+            "lca.solve_one.request.v1",
+            json!({
+                "lcaJobId": lca_job_id,
+                "snapshotId": snapshot_id,
+                "rhs": [1.0, 0.0],
+                "printLevel": 1.0,
+                "solve": {
+                    "return_x": true,
+                    "return_g": false,
+                    "return_h": true
+                }
+            }),
+        );
+
+        let payload = solver_worker_job_payload(&job).expect("payload");
+
+        match payload {
+            JobPayload::SolveOne {
+                job_id,
+                snapshot_id: parsed_snapshot_id,
+                rhs,
+                print_level,
+                ..
+            } => {
+                assert_eq!(job_id, lca_job_id);
+                assert_eq!(parsed_snapshot_id, snapshot_id);
+                assert_eq!(rhs, vec![1.0, 0.0]);
+                assert_eq!(print_level, Some(1.0));
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_worker_jobs_contribution_path_kind_to_legacy_payload_type() {
+        let lca_job_id = Uuid::new_v4();
+        let snapshot_id = Uuid::new_v4();
+        let process_id = Uuid::new_v4();
+        let impact_id = Uuid::new_v4();
+        let job = worker_job(
+            "lca.contribution_path",
+            "lca.contribution_path.request.v1",
+            json!({
+                "jobId": lca_job_id,
+                "snapshotId": snapshot_id,
+                "processId": process_id,
+                "processIndex": 2,
+                "impactId": impact_id,
+                "impactIndex": 3,
+                "amount": 4.0
+            }),
+        );
+
+        let payload = solver_worker_job_payload(&job).expect("payload");
+
+        match payload {
+            JobPayload::AnalyzeContributionPath {
+                job_id,
+                snapshot_id: parsed_snapshot_id,
+                process_id: parsed_process_id,
+                process_index,
+                impact_id: parsed_impact_id,
+                impact_index,
+                amount,
+                ..
+            } => {
+                assert_eq!(job_id, lca_job_id);
+                assert_eq!(parsed_snapshot_id, snapshot_id);
+                assert_eq!(parsed_process_id, process_id);
+                assert_eq!(process_index, 2);
+                assert_eq!(parsed_impact_id, impact_id);
+                assert_eq!(impact_index, 3);
+                assert!((amount - 4.0).abs() < f64::EPSILON);
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_worker_jobs_build_snapshot_request_roots() {
+        let lca_job_id = Uuid::new_v4();
+        let snapshot_id = Uuid::new_v4();
+        let process_id = Uuid::new_v4();
+        let job = worker_job(
+            "lca.build_snapshot",
+            "lca.build_snapshot.request.v1",
+            json!({
+                "jobId": lca_job_id,
+                "snapshotId": snapshot_id,
+                "requestRoots": [
+                    {
+                        "processId": process_id,
+                        "version": "01.00.000"
+                    }
+                ],
+                "processStates": "100,101",
+                "includeUserId": Uuid::new_v4(),
+                "noLcia": true
+            }),
+        );
+
+        let payload = solver_worker_job_payload(&job).expect("payload");
+
+        match payload {
+            JobPayload::BuildSnapshot {
+                job_id,
+                snapshot_id: parsed_snapshot_id,
+                request_roots,
+                process_states,
+                no_lcia,
+                ..
+            } => {
+                assert_eq!(job_id, lca_job_id);
+                assert_eq!(parsed_snapshot_id, snapshot_id);
+                assert_eq!(request_roots.expect("roots")[0].process_id, process_id);
+                assert_eq!(process_states.as_deref(), Some("100,101"));
+                assert_eq!(no_lcia, Some(true));
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_wrong_solver_worker_jobs_schema() {
+        let job = worker_job(
+            "lca.solve_batch",
+            "lca.solve_one.request.v1",
+            json!({
+                "job_id": Uuid::new_v4(),
+                "snapshot_id": Uuid::new_v4(),
+                "rhs_batch": [[1.0]]
+            }),
+        );
+
+        let err = solver_worker_job_payload(&job).expect_err("schema mismatch");
+        assert!(err.to_string().contains("unsupported payload schema"));
+    }
+
+    #[test]
+    fn preserves_legacy_payload_type_when_supplied() {
+        let lca_job_id = Uuid::new_v4();
+        let snapshot_id = Uuid::new_v4();
+        let job = worker_job(
+            "lca.factorization_prepare",
+            "lca.factorization_prepare.request.v1",
+            json!({
+                "type": "prepare_factorization",
+                "job_id": lca_job_id,
+                "snapshot_id": snapshot_id
+            }),
+        );
+
+        let payload = solver_worker_job_payload(&job).expect("payload");
+
+        assert_eq!(payload_type_name(&payload), "prepare_factorization");
+        assert!(matches!(payload, JobPayload::PrepareFactorization { .. }));
+    }
 }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::serve;
 use clap::Parser;
 use solver_worker::{
-    config::{AppConfig, RunMode},
+    config::{AppConfig, QueueBackend, RunMode},
     db::AppState,
     http, queue,
 };
@@ -22,14 +22,7 @@ async fn main() -> anyhow::Result<()> {
     match config.mode {
         RunMode::Worker => {
             info!("starting queue worker mode");
-            let queue_name = config.pgmq_queue.clone();
-            queue::run_worker_loop(
-                state,
-                queue_name,
-                config.worker_vt_seconds,
-                config.poll_interval(),
-            )
-            .await?;
+            run_worker(state, &config).await?;
         }
         RunMode::Http => {
             info!("starting internal HTTP mode");
@@ -38,12 +31,9 @@ async fn main() -> anyhow::Result<()> {
         RunMode::Both => {
             info!("starting worker + internal HTTP mode");
             let worker_state = Arc::clone(&state);
-            let queue_name = config.pgmq_queue.clone();
-            let vt = config.worker_vt_seconds;
-            let poll = config.poll_interval();
-            let worker_handle = tokio::spawn(async move {
-                queue::run_worker_loop(worker_state, queue_name, vt, poll).await
-            });
+            let worker_config = config.clone();
+            let worker_handle =
+                tokio::spawn(async move { run_worker(worker_state, &worker_config).await });
 
             let http_handle =
                 tokio::spawn(run_http(Arc::clone(&state), config.http_socket_addr()?));
@@ -63,6 +53,31 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+async fn run_worker(state: Arc<AppState>, config: &AppConfig) -> anyhow::Result<()> {
+    match config.queue_backend {
+        QueueBackend::Pgmq => {
+            let queue_name = config.pgmq_queue.clone();
+            queue::run_worker_loop(
+                state,
+                queue_name,
+                config.worker_vt_seconds,
+                config.poll_interval(),
+            )
+            .await
+        }
+        QueueBackend::WorkerJobs => {
+            queue::run_solver_worker_jobs_loop(
+                state,
+                config.worker_id(),
+                config.worker_jobs_claim_limit(),
+                config.worker_jobs_lease_seconds(),
+                config.poll_interval(),
+            )
+            .await
+        }
+    }
 }
 
 async fn run_http(state: Arc<AppState>, addr: std::net::SocketAddr) -> anyhow::Result<()> {
