@@ -681,19 +681,74 @@ journalctl -u package-worker.service -f
 sudo systemctl restart package-worker.service
 ```
 
-### 6.5 TIDAS Package Artifact GC（systemd timer，推荐）
+### 6.5 Maintenance Worker Jobs（systemd，推荐）
 
-`package_gc` 负责清理 package artifact 对象、过期 request cache 和已无 artifact 依赖的 terminal package job metadata。部署建议分两层：
-
-- 所有活跃 calculator worker 主机都构建并保留最新 `target/release/package_gc`，便于切换。
-- 只有一台主机启用 `package-gc.timer`。`--execute` 模式内部会使用 PostgreSQL advisory lock，但调度层仍应避免三台机器同时跑 destructive GC。
-- 首次启用必须保持 dry-run，确认日志中的 eligible/protected reason 后，再把唯一 timer 主机切到 `--execute`。
+`worker_jobs` 模式下，GC timer/operator action 不再直接代表任务事实；它们只 enqueue `worker_queue=maintenance` job。常驻 `maintenance_worker` 负责 claim job、调用现有 GC binary、写回 summary 和 operator-only report artifact metadata。
 
 构建：
 
 ```bash
 cd /home/ubuntu/projects/lca_workspace/tiangong-lca-calculator
-cargo build -p solver-worker --bin package_gc --release
+cargo build -p solver-worker --bin maintenance_worker --bin maintenance_enqueue --bin package_gc --bin snapshot_gc --bin result_gc --release
+```
+
+创建常驻 worker 服务 `/etc/systemd/system/maintenance-worker.service`：
+
+```ini
+[Unit]
+Description=TianGong LCA Maintenance Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/projects/lca_workspace/tiangong-lca-calculator
+EnvironmentFile=/home/ubuntu/projects/lca_workspace/tiangong-lca-calculator/.env
+Environment=RUST_LOG=info
+Environment=MAINTENANCE_JOB_ENVIRONMENT=main
+ExecStart=/home/ubuntu/projects/lca_workspace/tiangong-lca-calculator/target/release/maintenance_worker
+Restart=always
+RestartSec=2
+TimeoutStopSec=30
+LimitNOFILE=65535
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+启用：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now maintenance-worker.service
+```
+
+手动 enqueue dry-run 示例：
+
+```bash
+target/release/maintenance_enqueue snapshot-gc --environment main --batch-size 50
+target/release/maintenance_enqueue result-gc --environment main --batch-size 100 --max-batches 1
+target/release/maintenance_enqueue package-artifact-gc --environment main --batch-size 100 --max-batches 1
+```
+
+destructive execute 必须显式传 `--execute`。`maintenance_enqueue` 会为 dry-run / execute 生成不同的 idempotency/concurrency key；execute 默认 `max_attempts=1`。
+
+### 6.6 TIDAS Package Artifact GC（systemd timer，推荐）
+
+`package_gc` 负责清理 package artifact 对象、过期 request cache 和已无 artifact 依赖的 terminal package job metadata。统一队列模式下，timer 只 enqueue `tidas.package_artifact_gc` job，实际执行由 `maintenance_worker` 调用 `package_gc`。
+
+- 所有活跃 calculator worker 主机都构建并保留最新 `target/release/package_gc` 和 `target/release/maintenance_worker`，便于切换。
+- `package-gc.timer` 只负责调用 `maintenance_enqueue package-artifact-gc` enqueue worker job，不直接执行删除。
+- 首次启用必须保持 dry-run，确认 `worker_jobs.result_json.summary` 与 operator report 后，再把 timer 切到 `--execute`。
+
+构建：
+
+```bash
+cd /home/ubuntu/projects/lca_workspace/tiangong-lca-calculator
+cargo build -p solver-worker --bin maintenance_enqueue --bin maintenance_worker --bin package_gc --release
 ```
 
 创建 dry-run 服务文件 `/etc/systemd/system/package-gc.service`：
@@ -711,10 +766,9 @@ Group=ubuntu
 WorkingDirectory=/home/ubuntu/projects/lca_workspace/tiangong-lca-calculator
 EnvironmentFile=/home/ubuntu/projects/lca_workspace/tiangong-lca-calculator/.env
 Environment=RUST_LOG=info
-Environment=PACKAGE_GC_BATCH_SIZE=100
-Environment=PACKAGE_GC_MAX_BATCHES=1
-SyslogIdentifier=package_gc
-ExecStart=/home/ubuntu/projects/lca_workspace/tiangong-lca-calculator/target/release/package_gc
+Environment=MAINTENANCE_JOB_ENVIRONMENT=main
+SyslogIdentifier=maintenance_enqueue
+ExecStart=/home/ubuntu/projects/lca_workspace/tiangong-lca-calculator/target/release/maintenance_enqueue package-artifact-gc --batch-size 100 --max-batches 1
 ```
 
 创建 timer 文件 `/etc/systemd/system/package-gc.timer`：
@@ -743,15 +797,15 @@ systemctl status package-gc.timer package-gc.service --no-pager
 journalctl -u package-gc.service -n 100 --no-pager
 ```
 
-日志里应出现 `[retention]` 与 `[summary] dry_run=true ...`。切到实际清理时，只在唯一 timer 主机上把 `ExecStart` 改为：
+job 完成后，`worker_jobs.result_json.summary` 里应出现 `dry_run=true` 和候选/保护摘要，`result_ref` 指向 operator-only `maintenance_gc_report` artifact metadata。切到实际清理时，把 `ExecStart` 改为：
 
 ```ini
-ExecStart=/home/ubuntu/projects/lca_workspace/tiangong-lca-calculator/target/release/package_gc --execute
+ExecStart=/home/ubuntu/projects/lca_workspace/tiangong-lca-calculator/target/release/maintenance_enqueue package-artifact-gc --execute --batch-size 100 --max-batches 1
 ```
 
-`--execute` 会先删除对象存储 payload，再标记 artifact 为 `deleted`；对象删除失败时不会删除 DB metadata。建议保留 `PACKAGE_GC_BATCH_SIZE=100`、`PACKAGE_GC_MAX_BATCHES=1` 作为首轮 execute canary，再按运行结果逐步调整。
+execute job 由 `maintenance_worker` 调用 `package_gc --execute`，仍会先删除对象存储 payload，再标记 artifact 为 `deleted`；对象删除失败时不会删除 DB metadata。建议保留 `--batch-size 100 --max-batches 1` 作为首轮 execute canary，再按运行结果逐步调整。
 
-### 6.6 Snapshot Storage GC（systemd timer，推荐）
+### 6.7 Snapshot Storage GC（systemd timer，推荐）
 
 `snapshot_gc` 负责清理 `lca-results/snapshots/<snapshot_id>/...` 存储目录。候选判断来自 database-engine 的 `util.list_lca_snapshot_gc_candidates(...)`，calculator 只执行对象删除与安全的 DB row 删除：
 
@@ -760,13 +814,13 @@ ExecStart=/home/ubuntu/projects/lca_workspace/tiangong-lca-calculator/target/rel
 - 非 active snapshot 超过 TTL 后，先删除该 snapshot directory 下所有 Storage objects；全部成功后才删除 `public.lca_network_snapshots`，由现有 FK cascade 清理 jobs/results/cache/latest/factorization/artifact metadata。
 - orphan storage directory 只删除 Storage objects，不做 DB 操作。
 - 404 object delete 视为成功，便于重试幂等。
-- 允许 3 台 calculator worker host 都安装 timer；`snapshot_gc` 使用 `solver_worker_snapshot_gc` PostgreSQL advisory lock，抢不到锁会写 `skipped` audit run 并退出 0。
+- timer 只负责 enqueue `lca.snapshot_gc` worker job；`snapshot_gc` 仍使用 `solver_worker_snapshot_gc` PostgreSQL advisory lock，抢不到锁会写 `skipped` audit run 并退出 0。
 
 构建：
 
 ```bash
 cd /home/ubuntu/projects/lca_workspace/tiangong-lca-calculator
-cargo build -p solver-worker --bin snapshot_gc --release
+cargo build -p solver-worker --bin maintenance_enqueue --bin maintenance_worker --bin snapshot_gc --release
 ```
 
 手动 dry-run：
@@ -775,7 +829,7 @@ cargo build -p solver-worker --bin snapshot_gc --release
 ./scripts/gc_lca_snapshots.sh
 ```
 
-首轮 execute canary：
+首轮 execute canary enqueue：
 
 ```bash
 ./scripts/gc_lca_snapshots.sh --execute \
@@ -797,7 +851,7 @@ RandomizedDelaySec=30m
 Persistent=true
 ```
 
-部署到 3 台 calculator worker host：
+部署 timer：
 
 ```bash
 sudo cp deploy/systemd/snapshot-gc.service /etc/systemd/system/snapshot-gc.service
@@ -813,7 +867,7 @@ systemctl status snapshot-gc.timer snapshot-gc.service --no-pager
 journalctl -u snapshot-gc.service -n 100 --no-pager
 ```
 
-### 6.7 结果保留与 GC（S3 + DB）
+### 6.8 结果保留与 GC（S3 + DB）
 
 `lca_results` 采用过期字段 + 保留规则：
 

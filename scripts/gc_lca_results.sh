@@ -11,4 +11,4 @@ if [ -f .env ]; then
   set +a
 fi
 
-exec cargo run -p solver-worker --bin result_gc --release -- "$@"
+exec cargo run -p solver-worker --bin maintenance_enqueue --release -- result-gc "$@"

@@ -10,11 +10,6 @@ Group=ubuntu
 WorkingDirectory=/home/ubuntu/projects/lca_workspace/tiangong-lca-calculator
 EnvironmentFile=/home/ubuntu/projects/lca_workspace/tiangong-lca-calculator/.env
 Environment=RUST_LOG=info
-Environment=SNAPSHOT_GC_SNAPSHOT_RETENTION_DAYS=30
-Environment=SNAPSHOT_GC_ORPHAN_RETENTION_DAYS=30
-Environment=SNAPSHOT_GC_MAX_SNAPSHOTS=100
-Environment=SNAPSHOT_GC_MAX_ORPHAN_DIRS=200
-Environment=SNAPSHOT_GC_MAX_BYTES=2147483648
-Environment=SNAPSHOT_GC_BATCH_SIZE=50
-SyslogIdentifier=snapshot_gc
-ExecStart=/home/ubuntu/projects/lca_workspace/tiangong-lca-calculator/target/release/snapshot_gc --execute
+Environment=MAINTENANCE_JOB_ENVIRONMENT=main
+SyslogIdentifier=maintenance_enqueue
+ExecStart=/home/ubuntu/projects/lca_workspace/tiangong-lca-calculator/target/release/maintenance_enqueue snapshot-gc --execute --snapshot-retention-days 30 --orphan-retention-days 30 --max-snapshots 100 --max-orphan-dirs 200 --max-bytes 2147483648 --batch-size 50

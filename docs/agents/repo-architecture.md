@@ -110,6 +110,16 @@ The modeling basis for implicit regional supply mix, exchange-location supply-re
 
 `crates/solver-worker/src/review_submit_gate_runner.rs`, `crates/solver-worker/src/worker_jobs.rs`, and `crates/solver-worker/src/bin/review_submit_gate_runner.rs` are the DB runtime bridge for that gate. The legacy mode claims persisted `dataset_review_submit_gate_runs`; the `--worker-jobs` mode claims `review_submit.gate` jobs from `public.worker_jobs`. Both modes build a no-LCIA review-submit baseline plus draft overlay snapshot for the submitted process revision, compute the `json_ordered` checksum, execute `review_submit_gate`, and record the result through the database RPC. Edge and Next consume the DB status; they do not run calculator-side numerical checks or final submit inside calculator.
 
+### Maintenance worker
+
+`crates/solver-worker/src/bin/maintenance_enqueue.rs` is the operator/timer entrypoint that enqueues calculator maintenance jobs through `public.worker_enqueue_job`. `crates/solver-worker/src/bin/maintenance_worker.rs` is the `worker_jobs` consumer for calculator maintenance work that should be observable through the shared job lifecycle. It claims `worker_queue=maintenance` and dispatches these job kinds:
+
+- `lca.snapshot_gc`
+- `lca.result_gc`
+- `tidas.package_artifact_gc`
+
+The maintenance worker is intentionally a thin orchestrator over the existing `snapshot_gc`, `result_gc`, and `package_gc` binaries. Those binaries keep their deletion safety rules, object-first metadata updates, active snapshot/package protections, and PostgreSQL advisory locks. The `worker_jobs` layer records dry-run/execute intent, phase/heartbeat, exit status, stdout/stderr tails, parsed `[summary]` metrics, and an operator-only `maintenance_gc_report` artifact metadata row for operator visibility.
+
 ### Package worker
 
 The package worker handles:

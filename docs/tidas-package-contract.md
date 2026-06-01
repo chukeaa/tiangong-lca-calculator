@@ -189,14 +189,18 @@ cargo run -p solver-worker --bin package_gc --
 cargo run -p solver-worker --bin package_gc -- --execute
 ```
 
+切到统一 `worker_jobs` 后，package artifact GC 使用 `job_kind=tidas.package_artifact_gc`、`worker_queue=maintenance`。timer/operator action 通过 `maintenance_enqueue package-artifact-gc` 创建任务；`maintenance_worker` 领取任务后仍调用现有 `package_gc` binary。payload 表达 `execute`、`batchSize`、`maxBatches`、`jobRetentionDays` 和 `requestCacheRetentionDays`，result 记录 parsed `[summary]`、exit code、stdout/stderr tail，并通过 `result_ref` 指向 operator-only `maintenance_gc_report` artifact metadata row。缺省不传 `execute=true` 时必须保持 dry-run 行为。
+
 生产部署契约：
 
 - `package_gc` release binary 应随 `package_worker` 一起部署到所有活跃 calculator worker 主机；
-- `package-gc.timer` 只能在一个调度主机启用，其他主机保留 binary 作为故障切换候选；
+- legacy `package-gc.timer` 只能在一个调度主机启用，其他主机保留 binary 作为故障切换候选；
+- 统一队列模式下，timer 或 operator action 只负责 enqueue `tidas.package_artifact_gc` worker job，不直接代表任务事实；
 - timer 首次启用必须 dry-run，不带 `--execute`，并检查 `[retention]` eligible/protected reason 与 `[summary] dry_run=true ...`；
 - destructive 清理必须显式加 `--execute`，并在首轮保留小批量限制，例如 `PACKAGE_GC_BATCH_SIZE=100`、`PACKAGE_GC_MAX_BATCHES=1`；
 - `--execute` 模式需要对象存储环境变量，且会先删对象 payload，再标记 artifact `deleted`；对象删除失败时只记录 `metadata.gc` 错误，不删除 DB metadata；
-- `--execute` 模式使用 PostgreSQL advisory lock 防止重叠执行，但这不是三台机器都启 timer 的理由。
+- `--execute` 模式使用 PostgreSQL advisory lock 防止重叠执行；在统一队列模式下还必须使用 `worker_jobs.concurrency_key` 防止同环境同类 GC 并发；
+- destructive execute job 默认 `max_attempts=1`，失败后由 operator 显式 retry，避免删除类任务自动重复执行。
 
 ### 7.2 import report payload（新增字段）
 
