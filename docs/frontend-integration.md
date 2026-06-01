@@ -133,6 +133,15 @@ export type JobStatus =
 
 前端不要复制 calculator 的 provider、sparse factorization、targeted RHS solve 或 blocker 判定逻辑。
 
+切到 `worker_jobs` 后，前端仍然只消费 Edge 返回的服务端 projection，不直接读写 `public.worker_jobs`。状态映射为：
+
+- `queued` / `running`：进入任务中心并展示服务端任务状态，不需要在提交按钮上长时间 blocking loading。
+- `completed`：表示 calculator gate passed；Edge / database coordinator 才能继续 final submit。前端应使用 result 中的 `datasetRevision.revisionChecksum` 作为权威 checksum 展示 / 传递依据。
+- `blocked`：表示 calculator 发现数据 blocker；主提示使用 `blocker_codes` / `calculatorReport.blockers` 的友好文案，raw details 仅作为诊断信息。
+- `failed`：表示 runner、S3、DB 或部署错误；应与数据 blocker 分开展示，支持重试或联系运维。
+
+`worker_jobs` 的 `progress`、`phase`、`heartbeatAt` 适合任务中心展示。浏览器本地 task 只能作为 UI cache，不能作为任务事实来源。
+
 ## 10. 前端验收清单
 
 - 同一请求重复提交不会生成重复 job。
@@ -141,3 +150,4 @@ export type JobStatus =
 - 结果读取按 artifact 元数据路径工作（不依赖 inline payload）。
 - 用户无法读取他人的 job/result。
 - review-submit gate 的 `blocked` 能显示 blocker code/message/details，`error` 与数据 blocker 文案分开。
+- review-submit gate 切到 `worker_jobs` 后，提交动作能进入任务中心并从服务端恢复状态。

@@ -4,7 +4,10 @@ use clap::Parser;
 use solver_worker::{
     config::AppConfig,
     db::AppState,
-    review_submit_gate_runner::{ReviewSubmitGateRunnerOptions, run_review_submit_gate_runner},
+    review_submit_gate_runner::{
+        ReviewSubmitGateRunnerOptions, ReviewSubmitGateWorkerJobsOptions,
+        run_review_submit_gate_runner, run_review_submit_gate_worker_jobs_runner,
+    },
 };
 use tracing::info;
 
@@ -26,6 +29,20 @@ struct Cli {
         default_value_t = 21_600_u64
     )]
     stale_running_after_seconds: u64,
+    #[arg(long, env = "REVIEW_SUBMIT_GATE_WORKER_JOBS", default_value_t = false)]
+    worker_jobs: bool,
+    #[arg(
+        long,
+        env = "REVIEW_SUBMIT_GATE_WORKER_ID",
+        default_value = "review_submit_gate_runner"
+    )]
+    worker_id: String,
+    #[arg(
+        long,
+        env = "REVIEW_SUBMIT_GATE_WORKER_LEASE_SECONDS",
+        default_value_t = 900_i32
+    )]
+    worker_lease_seconds: i32,
 }
 
 #[tokio::main]
@@ -36,14 +53,28 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let state = AppState::new(&cli.config).await?;
-    let options = ReviewSubmitGateRunnerOptions {
-        poll_interval: Duration::from_millis(cli.poll_ms.max(100)),
-        max_runs: cli.max_runs.or_else(|| cli.once.then_some(1)),
-        exit_when_idle: cli.once,
-        stale_running_after: Duration::from_secs(cli.stale_running_after_seconds.max(60)),
-    };
+    let poll_interval = Duration::from_millis(cli.poll_ms.max(100));
+    let max_runs = cli.max_runs.or_else(|| cli.once.then_some(1));
+    let exit_when_idle = cli.once;
 
-    let summary = run_review_submit_gate_runner(&state, options).await?;
+    let summary = if cli.worker_jobs {
+        let options = ReviewSubmitGateWorkerJobsOptions {
+            poll_interval,
+            max_runs,
+            exit_when_idle,
+            worker_id: cli.worker_id,
+            lease_seconds: cli.worker_lease_seconds.max(60),
+        };
+        run_review_submit_gate_worker_jobs_runner(&state, options).await?
+    } else {
+        let options = ReviewSubmitGateRunnerOptions {
+            poll_interval,
+            max_runs,
+            exit_when_idle,
+            stale_running_after: Duration::from_secs(cli.stale_running_after_seconds.max(60)),
+        };
+        run_review_submit_gate_runner(&state, options).await?
+    };
     info!(?summary, "review-submit gate runner stopped");
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())

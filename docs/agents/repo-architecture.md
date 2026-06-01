@@ -106,7 +106,7 @@ The modeling basis for implicit regional supply mix, exchange-location supply-re
 
 `crates/solver-worker/src/review_submit_gate.rs` owns the calculator-side fast gate for dataset revision review submission. It layers revision freshness, process/exchange scans, provider evidence, sparse structural checks, and targeted RHS probes into a binary `passed` / `blocked` report without full matrix inversion or full `solve_all_unit`.
 
-`crates/solver-worker/src/review_submit_gate_runner.rs` and `crates/solver-worker/src/bin/review_submit_gate_runner.rs` are the DB runtime bridge for that gate. The runner claims persisted `dataset_review_submit_gate_runs`, builds a no-LCIA review-submit baseline plus draft overlay snapshot for the submitted process revision, computes the `json_ordered` checksum, executes `review_submit_gate`, and records the result through the database RPC. Edge and Next consume the DB status; they do not run calculator-side numerical checks.
+`crates/solver-worker/src/review_submit_gate_runner.rs`, `crates/solver-worker/src/worker_jobs.rs`, and `crates/solver-worker/src/bin/review_submit_gate_runner.rs` are the DB runtime bridge for that gate. The legacy mode claims persisted `dataset_review_submit_gate_runs`; the `--worker-jobs` mode claims `review_submit.gate` jobs from `public.worker_jobs`. Both modes build a no-LCIA review-submit baseline plus draft overlay snapshot for the submitted process revision, compute the `json_ordered` checksum, execute `review_submit_gate`, and record the result through the database RPC. Edge and Next consume the DB status; they do not run calculator-side numerical checks or final submit inside calculator.
 
 ### Package worker
 

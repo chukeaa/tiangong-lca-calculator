@@ -26,6 +26,10 @@ use crate::{
         ReviewSubmitGateReport, ReviewSubmitGateStatus, verify_review_submit_gate,
     },
     snapshot_index::SnapshotIndexDocument,
+    worker_jobs::{
+        REVIEW_SUBMIT_GATE_WORKER_QUEUE, WorkerJob, WorkerJobProgress, WorkerJobResult,
+        claim_worker_jobs, record_worker_job_result,
+    },
 };
 
 pub const REVIEW_SUBMIT_GATE_POLICY_PROFILE: &str = "review_submit_fast.v1";
@@ -40,6 +44,27 @@ pub struct ReviewSubmitGateRunnerOptions {
     pub max_runs: Option<usize>,
     pub exit_when_idle: bool,
     pub stale_running_after: Duration,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReviewSubmitGateWorkerJobsOptions {
+    pub poll_interval: Duration,
+    pub max_runs: Option<usize>,
+    pub exit_when_idle: bool,
+    pub worker_id: String,
+    pub lease_seconds: i32,
+}
+
+impl Default for ReviewSubmitGateWorkerJobsOptions {
+    fn default() -> Self {
+        Self {
+            poll_interval: Duration::from_secs(1),
+            max_runs: None,
+            exit_when_idle: false,
+            worker_id: RUNNER_NAME.to_owned(),
+            lease_seconds: 900,
+        }
+    }
 }
 
 impl Default for ReviewSubmitGateRunnerOptions {
@@ -79,7 +104,7 @@ pub struct ReviewSubmitGateRun {
     pub dataset_table: String,
     pub dataset_id: Uuid,
     pub dataset_version: String,
-    pub revision_checksum: String,
+    pub revision_checksum: Option<String>,
     pub policy_profile: String,
     pub report_schema_version: String,
     pub requested_by: Uuid,
@@ -108,6 +133,7 @@ struct GateExecutionOutcome {
     calculator_report: Value,
     blocking_reasons: Value,
     audit: Value,
+    authoritative_revision_checksum: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +173,34 @@ pub async fn run_review_submit_gate_runner(
     Ok(summary)
 }
 
+pub async fn run_review_submit_gate_worker_jobs_runner(
+    state: &AppState,
+    options: ReviewSubmitGateWorkerJobsOptions,
+) -> anyhow::Result<ReviewSubmitGateRunnerSummary> {
+    let mut summary = ReviewSubmitGateRunnerSummary::default();
+
+    loop {
+        if options
+            .max_runs
+            .is_some_and(|max_runs| summary.claimed >= max_runs)
+        {
+            break;
+        }
+
+        if let Some(status) = run_one_review_submit_gate_worker_job(state, &options).await? {
+            summary.record_status(status);
+        } else {
+            summary.idle_polls += 1;
+            if options.exit_when_idle {
+                break;
+            }
+            sleep(options.poll_interval).await;
+        }
+    }
+
+    Ok(summary)
+}
+
 pub async fn run_one_review_submit_gate(
     state: &AppState,
     stale_running_after: Duration,
@@ -160,11 +214,32 @@ pub async fn run_one_review_submit_gate(
     Ok(Some(status))
 }
 
+pub async fn run_one_review_submit_gate_worker_job(
+    state: &AppState,
+    options: &ReviewSubmitGateWorkerJobsOptions,
+) -> anyhow::Result<Option<RecordedGateStatus>> {
+    let jobs = claim_worker_jobs(
+        &state.pool,
+        REVIEW_SUBMIT_GATE_WORKER_QUEUE,
+        &options.worker_id,
+        1,
+        options.lease_seconds,
+    )
+    .await?;
+
+    let Some(job) = jobs.into_iter().next() else {
+        return Ok(None);
+    };
+
+    let status = process_claimed_review_submit_gate_worker_job(state, &job, options).await?;
+    Ok(Some(status))
+}
+
 async fn process_claimed_review_submit_gate_run(
     state: &AppState,
     run: &ReviewSubmitGateRun,
 ) -> anyhow::Result<RecordedGateStatus> {
-    let outcome = match execute_claimed_gate_run(state, run).await {
+    let outcome = match execute_claimed_gate_run(state, run, None).await {
         Ok(outcome) => outcome,
         Err(err) => {
             warn!(
@@ -205,9 +280,71 @@ async fn process_claimed_review_submit_gate_run(
     Ok(outcome.status)
 }
 
+async fn process_claimed_review_submit_gate_worker_job(
+    state: &AppState,
+    job: &WorkerJob,
+    options: &ReviewSubmitGateWorkerJobsOptions,
+) -> anyhow::Result<RecordedGateStatus> {
+    let progress =
+        WorkerJobProgress::new(&state.pool, job.id, job.lease_token, options.lease_seconds);
+    let run = match worker_job_to_gate_run(job) {
+        Ok(run) => run,
+        Err(err) => {
+            record_worker_job_result(
+                &state.pool,
+                job.id,
+                job.lease_token,
+                WorkerJobResult::failed(
+                    "invalid_review_submit_gate_job",
+                    "review-submit gate worker job payload is invalid",
+                    json!({ "error": err.to_string() }),
+                    Some(json!({ "runner": RUNNER_NAME, "workerJobId": job.id })),
+                    None,
+                ),
+            )
+            .await?;
+            return Ok(RecordedGateStatus::Error);
+        }
+    };
+
+    let outcome = match execute_claimed_gate_run(state, &run, Some(&progress)).await {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            warn!(
+                worker_job_id = %job.id,
+                dataset_table = %run.dataset_table,
+                dataset_id = %run.dataset_id,
+                dataset_version = %run.dataset_version,
+                error = %err,
+                "worker_jobs review-submit gate execution failed; recording failed result"
+            );
+            runtime_error_outcome(
+                &run,
+                "calculator_gate_error",
+                "calculator review-submit gate worker failed before producing a passed/blocked report",
+                json!({ "error": err.to_string(), "worker_job_id": job.id }),
+            )?
+        }
+    };
+
+    let worker_result = worker_job_result_for_outcome(&run, &outcome);
+    record_worker_job_result(&state.pool, job.id, job.lease_token, worker_result).await?;
+
+    info!(
+        worker_job_id = %job.id,
+        dataset_table = %run.dataset_table,
+        dataset_id = %run.dataset_id,
+        dataset_version = %run.dataset_version,
+        status = outcome.status.as_str(),
+        "recorded worker_jobs review-submit gate result"
+    );
+    Ok(outcome.status)
+}
+
 async fn execute_claimed_gate_run(
     state: &AppState,
     run: &ReviewSubmitGateRun,
+    progress: Option<&WorkerJobProgress<'_>>,
 ) -> anyhow::Result<GateExecutionOutcome> {
     if run.dataset_table != SUPPORTED_DATASET_TABLE {
         return runtime_error_outcome(
@@ -216,6 +353,10 @@ async fn execute_claimed_gate_run(
             "calculator review-submit gate runner currently supports process revisions only",
             json!({ "dataset_table": run.dataset_table }),
         );
+    }
+
+    if let Some(progress) = progress {
+        progress.heartbeat("fetching_revision", 0.05, None).await?;
     }
 
     let revision = fetch_process_revision(&state.pool, run.dataset_id, &run.dataset_version)
@@ -227,10 +368,27 @@ async fn execute_claimed_gate_run(
             )
         })?;
     let actual_revision_checksum = stable_json_sha256(&revision.json_ordered)?;
+    let expected_revision_checksum = run
+        .revision_checksum
+        .clone()
+        .unwrap_or_else(|| actual_revision_checksum.clone());
     let request_roots = vec![RequestRootProcess::new(
         run.dataset_id,
         run.dataset_version.clone(),
     )];
+    if let Some(progress) = progress {
+        progress
+            .heartbeat(
+                "building_snapshot",
+                0.15,
+                Some(json!({
+                    "datasetTable": run.dataset_table,
+                    "datasetId": run.dataset_id,
+                    "datasetVersion": run.dataset_version,
+                })),
+            )
+            .await?;
+    }
     let snapshot = db::run_review_submit_gate_snapshot_builder(
         state,
         run.id,
@@ -240,6 +398,19 @@ async fn execute_claimed_gate_run(
     )
     .await
     .context("failed to build review-submit gate snapshot")?;
+    if let Some(progress) = progress {
+        progress
+            .heartbeat(
+                "loading_snapshot_artifact",
+                0.65,
+                Some(json!({
+                    "requestedSnapshotId": snapshot.requested_snapshot_id,
+                    "resolvedSnapshotId": snapshot.resolved_snapshot_id,
+                    "snapshotExitCode": snapshot.exit_code,
+                })),
+            )
+            .await?;
+    }
     let artifact = db::fetch_decoded_snapshot_artifact(state, snapshot.resolved_snapshot_id)
         .await
         .context("failed to fetch decoded review-submit gate snapshot artifact")?;
@@ -255,7 +426,7 @@ async fn execute_claimed_gate_run(
     let input = ReviewSubmitGateInput {
         schema_version: "review_submit_gate_input.v1".to_owned(),
         dataset_revision_id: Some(run.dataset_id),
-        expected_revision_checksum: Some(run.revision_checksum.clone()),
+        expected_revision_checksum: Some(expected_revision_checksum),
         actual_revision_checksum: Some(actual_revision_checksum),
         snapshot_id: Some(snapshot.resolved_snapshot_id),
         config: Some(artifact.config),
@@ -267,6 +438,9 @@ async fn execute_claimed_gate_run(
         policy,
     };
 
+    if let Some(progress) = progress {
+        progress.heartbeat("running_gate", 0.80, None).await?;
+    }
     let report = verify_review_submit_gate(&input);
     let status = recorded_status_for_report(&report);
     let blocking_reasons = blocking_reasons_for_report(&report)?;
@@ -284,12 +458,22 @@ async fn execute_claimed_gate_run(
         },
         "blocker_count": report.blockers.len()
     });
+    if let Some(progress) = progress {
+        progress
+            .heartbeat(
+                "recording_result",
+                0.95,
+                Some(json!({ "blockerCount": report.blockers.len() })),
+            )
+            .await?;
+    }
 
     Ok(GateExecutionOutcome {
         status,
         calculator_report,
         blocking_reasons,
         audit,
+        authoritative_revision_checksum: input.actual_revision_checksum,
     })
 }
 
@@ -356,11 +540,101 @@ fn review_submit_gate_run_from_row(
         dataset_table: row.try_get::<String, _>("dataset_table")?,
         dataset_id: row.try_get::<Uuid, _>("dataset_id")?,
         dataset_version: row.try_get::<String, _>("dataset_version")?,
-        revision_checksum: row.try_get::<String, _>("revision_checksum")?,
+        revision_checksum: Some(row.try_get::<String, _>("revision_checksum")?),
         policy_profile: row.try_get::<String, _>("policy_profile")?,
         report_schema_version: row.try_get::<String, _>("report_schema_version")?,
         requested_by: row.try_get::<Uuid, _>("requested_by")?,
     })
+}
+
+fn worker_job_to_gate_run(job: &WorkerJob) -> anyhow::Result<ReviewSubmitGateRun> {
+    let request = job.review_submit_gate_request()?;
+    Ok(ReviewSubmitGateRun {
+        id: job.id,
+        dataset_table: request.dataset_table,
+        dataset_id: request.dataset_id,
+        dataset_version: request.dataset_version,
+        revision_checksum: request.revision_checksum,
+        policy_profile: request
+            .policy_profile
+            .unwrap_or_else(|| REVIEW_SUBMIT_GATE_POLICY_PROFILE.to_owned()),
+        report_schema_version: request
+            .report_schema_version
+            .unwrap_or_else(|| REVIEW_SUBMIT_GATE_REPORT_SCHEMA_VERSION.to_owned()),
+        requested_by: request.requested_by,
+    })
+}
+
+fn worker_job_result_for_outcome(
+    run: &ReviewSubmitGateRun,
+    outcome: &GateExecutionOutcome,
+) -> WorkerJobResult {
+    let result_json = json!({
+        "status": outcome.status.as_str(),
+        "datasetRevision": {
+            "table": run.dataset_table,
+            "id": run.dataset_id,
+            "version": run.dataset_version,
+            "revisionChecksum": outcome.authoritative_revision_checksum
+        },
+        "calculatorReport": outcome.calculator_report,
+        "blockingReasons": outcome.blocking_reasons
+    });
+
+    let mut worker_result = match outcome.status {
+        RecordedGateStatus::Passed => {
+            WorkerJobResult::completed(result_json, REVIEW_SUBMIT_GATE_REPORT_SCHEMA_VERSION)
+        }
+        RecordedGateStatus::Blocked => WorkerJobResult::blocked(
+            result_json,
+            REVIEW_SUBMIT_GATE_REPORT_SCHEMA_VERSION,
+            blocker_codes_from_reasons(&outcome.blocking_reasons),
+            "user",
+            true,
+        ),
+        RecordedGateStatus::Error => WorkerJobResult::failed(
+            runtime_error_code(&outcome.calculator_report),
+            runtime_error_message(&outcome.calculator_report),
+            json!({
+                "calculatorReport": outcome.calculator_report,
+                "blockingReasons": outcome.blocking_reasons
+            }),
+            None,
+            Some(result_json),
+        ),
+    };
+    worker_result.diagnostics = Some(outcome.audit.clone());
+    worker_result
+}
+
+fn blocker_codes_from_reasons(blocking_reasons: &Value) -> Vec<String> {
+    blocking_reasons
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|reason| reason.get("code").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn runtime_error_code(report: &Value) -> String {
+    report
+        .get("runtime_error")
+        .and_then(|value| value.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or("calculator_gate_error")
+        .to_owned()
+}
+
+fn runtime_error_message(report: &Value) -> String {
+    report
+        .get("runtime_error")
+        .and_then(|value| value.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or(
+            "calculator review-submit gate worker failed before producing a passed/blocked report",
+        )
+        .to_owned()
 }
 
 async fn record_review_submit_gate_result(
@@ -492,6 +766,7 @@ fn runtime_error_outcome(
         calculator_report,
         blocking_reasons,
         audit,
+        authoritative_revision_checksum: None,
     })
 }
 
@@ -679,8 +954,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        ProcessRevision, RecordedGateStatus, ReviewSubmitGateRun, build_review_process_record,
-        stable_json_sha256,
+        GateExecutionOutcome, ProcessRevision, RecordedGateStatus, ReviewSubmitGateRun,
+        build_review_process_record, stable_json_sha256, worker_job_result_for_outcome,
     };
 
     #[test]
@@ -766,7 +1041,7 @@ mod tests {
             dataset_table: "lifecyclemodels".to_owned(),
             dataset_id: Uuid::new_v4(),
             dataset_version: "01.00.000".to_owned(),
-            revision_checksum: "a".repeat(64),
+            revision_checksum: Some("a".repeat(64)),
             policy_profile: super::REVIEW_SUBMIT_GATE_POLICY_PROFILE.to_owned(),
             report_schema_version: super::REVIEW_SUBMIT_GATE_REPORT_SCHEMA_VERSION.to_owned(),
             requested_by: Uuid::new_v4(),
@@ -783,5 +1058,45 @@ mod tests {
         assert_eq!(outcome.status, RecordedGateStatus::Error);
         assert!(outcome.blocking_reasons.is_array());
         assert_eq!(outcome.calculator_report["status"], "error");
+    }
+
+    #[test]
+    fn worker_job_result_maps_blocked_report_to_blocker_codes() {
+        let run = ReviewSubmitGateRun {
+            id: Uuid::new_v4(),
+            dataset_table: "processes".to_owned(),
+            dataset_id: Uuid::new_v4(),
+            dataset_version: "01.00.000".to_owned(),
+            revision_checksum: None,
+            policy_profile: super::REVIEW_SUBMIT_GATE_POLICY_PROFILE.to_owned(),
+            report_schema_version: super::REVIEW_SUBMIT_GATE_REPORT_SCHEMA_VERSION.to_owned(),
+            requested_by: Uuid::new_v4(),
+        };
+        let outcome = GateExecutionOutcome {
+            status: RecordedGateStatus::Blocked,
+            calculator_report: json!({
+                "status": "blocked",
+                "blockers": [{ "code": "service_loop_detected" }]
+            }),
+            blocking_reasons: json!([{ "code": "service_loop_detected" }]),
+            audit: json!({ "runner": "review_submit_gate_runner" }),
+            authoritative_revision_checksum: Some("b".repeat(64)),
+        };
+
+        let result = worker_job_result_for_outcome(&run, &outcome);
+
+        assert_eq!(result.status, "blocked");
+        assert_eq!(result.blocker_codes, vec!["service_loop_detected"]);
+        assert_eq!(result.resolution_scope.as_deref(), Some("user"));
+        assert_eq!(result.retryable, Some(true));
+        assert_eq!(
+            result
+                .result_json
+                .as_ref()
+                .unwrap()
+                .pointer("/datasetRevision/revisionChecksum")
+                .and_then(serde_json::Value::as_str),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
     }
 }
