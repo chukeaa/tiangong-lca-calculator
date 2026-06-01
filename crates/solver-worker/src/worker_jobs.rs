@@ -230,7 +230,11 @@ pub async fn claim_worker_jobs(
 ) -> anyhow::Result<Vec<WorkerJob>> {
     let row = sqlx::query(
         r"
+        WITH _service_role AS (
+            SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
         SELECT public.worker_claim_jobs($1, $2, $3, $4) AS result
+        FROM _service_role
         ",
     )
     .bind(worker_queue)
@@ -259,7 +263,11 @@ pub async fn heartbeat_worker_job(
 ) -> anyhow::Result<()> {
     let row = sqlx::query(
         r"
+        WITH _service_role AS (
+            SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
         SELECT public.worker_heartbeat_job($1, $2, $3, $4::double precision::numeric, $5::jsonb, $6) AS result
+        FROM _service_role
         ",
     )
     .bind(job_id)
@@ -283,6 +291,9 @@ pub async fn record_worker_job_result(
 ) -> anyhow::Result<Value> {
     let row = sqlx::query(
         r"
+        WITH _service_role AS (
+            SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
         SELECT public.worker_record_job_result(
             $1,
             $2,
@@ -298,6 +309,7 @@ pub async fn record_worker_job_result(
             $12,
             $13
         ) AS result
+        FROM _service_role
         ",
     )
     .bind(job_id)

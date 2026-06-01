@@ -32,17 +32,17 @@ struct Cli {
     #[arg(long, env = "REVIEW_SUBMIT_GATE_WORKER_JOBS", default_value_t = false)]
     worker_jobs: bool,
     #[arg(
-        long,
+        long = "review-submit-gate-worker-id",
         env = "REVIEW_SUBMIT_GATE_WORKER_ID",
         default_value = "review_submit_gate_runner"
     )]
-    worker_id: String,
+    review_submit_gate_worker_id: String,
     #[arg(
-        long,
+        long = "review-submit-gate-worker-lease-seconds",
         env = "REVIEW_SUBMIT_GATE_WORKER_LEASE_SECONDS",
         default_value_t = 900_i32
     )]
-    worker_lease_seconds: i32,
+    review_submit_gate_worker_lease_seconds: i32,
 }
 
 #[tokio::main]
@@ -62,8 +62,8 @@ async fn main() -> anyhow::Result<()> {
             poll_interval,
             max_runs,
             exit_when_idle,
-            worker_id: cli.worker_id,
-            lease_seconds: cli.worker_lease_seconds.max(60),
+            worker_id: cli.review_submit_gate_worker_id,
+            lease_seconds: cli.review_submit_gate_worker_lease_seconds.max(60),
         };
         run_review_submit_gate_worker_jobs_runner(&state, options).await?
     } else {

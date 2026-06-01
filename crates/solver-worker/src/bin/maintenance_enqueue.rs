@@ -154,6 +154,9 @@ async fn enqueue_maintenance_job(
 
     let row = solver_worker::pgbouncer_sqlx::query(
         r"
+        WITH _service_role AS (
+          SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
         SELECT public.worker_enqueue_job(
           p_job_kind => $1,
           p_payload_json => $2::jsonb,
@@ -167,6 +170,7 @@ async fn enqueue_maintenance_job(
           p_visibility => $10,
           p_max_attempts => $11
         ) AS result
+        FROM _service_role
         ",
     )
     .bind(cli.job_kind.job_kind())
