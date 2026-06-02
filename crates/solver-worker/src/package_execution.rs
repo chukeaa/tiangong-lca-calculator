@@ -656,7 +656,7 @@ pub fn clear_runtime_export_traversal_cache(job_id: Uuid) {
 }
 
 async fn fetch_package_job_diagnostics(pool: &PgPool, job_id: Uuid) -> anyhow::Result<Value> {
-    let row = sqlx::query(
+    let result = sqlx::query(
         r"
         SELECT diagnostics
         FROM lca_package_jobs
@@ -665,10 +665,15 @@ async fn fetch_package_job_diagnostics(pool: &PgPool, job_id: Uuid) -> anyhow::R
     )
     .bind(job_id)
     .fetch_one(pool)
-    .await?;
-    Ok(row
-        .try_get::<Option<Value>, _>("diagnostics")?
-        .unwrap_or_else(|| json!({})))
+    .await;
+    match result {
+        Ok(row) => Ok(row
+            .try_get::<Option<Value>, _>("diagnostics")?
+            .unwrap_or_else(|| json!({}))),
+        Err(sqlx::Error::RowNotFound) => Ok(json!({})),
+        Err(err) if is_undefined_table(&err) => Ok(json!({})),
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn load_export_seed_scan_state(diagnostics: &Value) -> ExportSeedScanState {
@@ -772,7 +777,7 @@ async fn update_package_job_root_count(
     job_id: Uuid,
     root_count: i64,
 ) -> anyhow::Result<()> {
-    let _ = sqlx::query(
+    let result = sqlx::query(
         r"
         UPDATE lca_package_jobs
         SET root_count = $2,
@@ -783,8 +788,12 @@ async fn update_package_job_root_count(
     .bind(job_id)
     .bind(root_count.max(0))
     .execute(pool)
-    .await?;
-    Ok(())
+    .await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(err) if is_undefined_table(&err) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
 }
 
 async fn fetch_scope_root_refs(
@@ -1647,7 +1656,7 @@ async fn fetch_export_entries_by_items(
             "fetched_entry_count": entries.len(),
         }),
     );
-    let _ = sqlx::query(
+    let result = sqlx::query(
         r"
         UPDATE lca_package_jobs
         SET status = 'running',
@@ -1659,7 +1668,12 @@ async fn fetch_export_entries_by_items(
     .bind(job_id)
     .bind(diagnostics)
     .execute(&state.pool)
-    .await?;
+    .await;
+    match result {
+        Ok(_) => {}
+        Err(err) if is_undefined_table(&err) => {}
+        Err(err) => return Err(err.into()),
+    }
 
     Ok(sort_entries(entries))
 }
@@ -1693,6 +1707,13 @@ fn export_progress_diagnostics(
     }
 
     value
+}
+
+fn is_undefined_table(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Database(db_err) => db_err.code().as_deref() == Some("42P01"),
+        _ => false,
+    }
 }
 
 fn validator_command_candidates(input_dir: &Path) -> Vec<(String, Vec<String>)> {

@@ -21,7 +21,7 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/review-submit-fast-gate-contract.md
 lastReviewedAt: 2026-06-02
-lastReviewedCommit: 85b34dbdc910346055ce2188918f0d7d6332f361
+lastReviewedCommit: 07c46d2f1c5a01b702caa5c7b52d5fd6480a2fa6
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -142,7 +142,7 @@ export type JobStatus =
 
 `worker_jobs` 的 `progress`、`phase`、`heartbeatAt` 适合任务中心展示。浏览器本地 task 只能作为 UI cache，不能作为任务事实来源。
 
-LCA solver/snapshot 使用 `worker_jobs(worker_queue=solver)` 后，前端仍然不读表；Edge 应把 `workerJobId`、`lcaJobId`、`phase`、`progress`、`resultId` 和失败摘要投影给任务中心。worker result ref 使用 `{"domainSource":"lca_jobs","lcaJobId":"<uuid>"}` 这类服务端诊断结构；前端不直接解释 raw `result_ref`，而是消费 Edge projection。`lcaJobId` 是读取 retained `lca_results` / `lca_result_cache` 的 domain key，不能被浏览器伪造。
+LCA solver/snapshot 使用 `worker_jobs(worker_queue=solver)` 后，前端仍然不读表；Edge 应把 `workerJobId`、`lcaJobId`、`phase`、`progress`、`resultId` 和失败摘要投影给任务中心。worker result ref 使用 `{"domainSource":"worker_jobs","workerJobId":"<uuid>","lcaJobId":"<uuid>"}` 这类服务端诊断结构；前端不直接解释 raw `result_ref`，而是消费 Edge projection。`lcaJobId` 是读取 `lca_results` / `lca_result_cache` 历史 `job_id` columns 的 compatibility domain key，不能被浏览器伪造，也不表示必须存在 `lca_jobs` parent row。
 
 ## 10. 前端验收清单
 

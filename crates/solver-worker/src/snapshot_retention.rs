@@ -201,7 +201,13 @@ pub async fn fetch_snapshot_retention_summary(
     .bind(policy.snapshot_retention_days)
     .bind(policy.orphan_retention_days)
     .fetch_all(pool)
-    .await?;
+    .await;
+
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(err) if is_undefined_table(&err) => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
 
     rows.into_iter()
         .map(|row| {
@@ -265,7 +271,13 @@ pub async fn fetch_snapshot_gc_candidates(
     .bind(policy.max_orphan_dirs)
     .bind(policy.max_bytes)
     .fetch_all(pool)
-    .await?;
+    .await;
+
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(err) if is_undefined_table(&err) => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
 
     rows.into_iter()
         .map(|row| {
@@ -290,6 +302,13 @@ pub async fn fetch_snapshot_gc_candidates(
         })
         .collect::<Result<Vec<_>, sqlx::Error>>()
         .map_err(Into::into)
+}
+
+fn is_undefined_table(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Database(db_err) => db_err.code().as_deref() == Some("42P01"),
+        _ => false,
+    }
 }
 
 pub async fn create_snapshot_gc_run(

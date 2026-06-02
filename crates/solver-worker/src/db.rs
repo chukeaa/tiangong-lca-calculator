@@ -286,7 +286,7 @@ pub async fn update_job_status(
     diagnostics: Value,
 ) -> anyhow::Result<f64> {
     let db_write_started = Instant::now();
-    let _ = sqlx::query(
+    let update_result = sqlx::query(
         r"
         UPDATE lca_jobs
         SET status = $2,
@@ -301,8 +301,20 @@ pub async fn update_job_status(
     .bind(status)
     .bind(diagnostics.clone())
     .execute(pool)
-    .await?;
+    .await;
     let db_write_sec = db_write_started.elapsed().as_secs_f64();
+    match update_result {
+        Ok(_) => {}
+        Err(err) if is_undefined_table(&err) => {
+            warn!(
+                job_id = %job_id,
+                status,
+                "skipping legacy lca_jobs status update because the table is not present"
+            );
+            return Ok(db_write_sec);
+        }
+        Err(err) => return Err(err.into()),
+    }
 
     let diagnostics_with_timing =
         merge_job_status_update_timing(diagnostics.clone(), status, db_write_sec);
@@ -384,7 +396,7 @@ async fn set_job_diagnostics(
     job_id: Uuid,
     diagnostics: Value,
 ) -> anyhow::Result<()> {
-    let _ = sqlx::query(
+    let result = sqlx::query(
         r"
         UPDATE lca_jobs
         SET diagnostics = $2::jsonb
@@ -394,8 +406,12 @@ async fn set_job_diagnostics(
     .bind(job_id)
     .bind(diagnostics)
     .execute(pool)
-    .await?;
-    Ok(())
+    .await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(err) if is_undefined_table(&err) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
 }
 
 /// Marks request cache row as running for a given job.
@@ -1844,7 +1860,7 @@ async fn fetch_snapshot_source_hash(
 }
 
 async fn set_job_snapshot_id(pool: &PgPool, job_id: Uuid, snapshot_id: Uuid) -> anyhow::Result<()> {
-    let _ = sqlx::query(
+    let result = sqlx::query(
         r"
         UPDATE lca_jobs
         SET snapshot_id = $2,
@@ -1855,8 +1871,12 @@ async fn set_job_snapshot_id(pool: &PgPool, job_id: Uuid, snapshot_id: Uuid) -> 
     .bind(job_id)
     .bind(snapshot_id)
     .execute(pool)
-    .await?;
-    Ok(())
+    .await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(err) if is_undefined_table(&err) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
 }
 
 async fn upsert_active_snapshot(

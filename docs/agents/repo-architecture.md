@@ -97,7 +97,7 @@ The worker currently covers families such as:
 
 These flows belong to the worker runtime, not to the API repo.
 
-The main solver worker has two queue backends. The default `SOLVER_QUEUE_BACKEND=worker-jobs` path claims `public.worker_jobs` rows from `worker_queue=solver`, maps `job_kind=lca.*` payloads back to the same internal `JobPayload` variants, heartbeats `phase/progress`, records terminal results through `worker_record_job_result`, and links retained `lca_jobs` / `lca_results` / cache rows back to the canonical `worker_jobs` id. The `SOLVER_QUEUE_BACKEND=pgmq` path is legacy compatibility/debug only, consumes `pgmq` messages from `PGMQ_QUEUE`, and requires the explicit `ALLOW_LEGACY_JOB_TABLE_BACKEND=true` / `--allow-legacy-job-table-backend` guard.
+The main solver worker has two queue backends. The default `SOLVER_QUEUE_BACKEND=worker-jobs` path claims `public.worker_jobs` rows from `worker_queue=solver`, maps `job_kind=lca.*` payloads back to the same internal `JobPayload` variants, heartbeats `phase/progress`, records terminal results through `worker_record_job_result`, and links `lca_results` / cache / latest / factorization rows back to the canonical `worker_jobs` id. Optional `lca_jobs` rows are best-effort compatibility only; production worker_jobs paths must run when `public.lca_jobs` is absent. The `SOLVER_QUEUE_BACKEND=pgmq` path is legacy compatibility/debug only, consumes `pgmq` messages from `PGMQ_QUEUE`, and requires the explicit `ALLOW_LEGACY_JOB_TABLE_BACKEND=true` / `--allow-legacy-job-table-backend` guard.
 
 ### Snapshot builder and provider matching
 
@@ -127,7 +127,7 @@ The package worker handles:
 - `export_package`
 - `import_package`
 
-It also owns package-job artifacts and diagnostics. The default `PACKAGE_QUEUE_BACKEND=worker-jobs` path claims `public.worker_jobs` rows from `worker_queue=package`, maps `job_kind=tidas.export_package|tidas.import_package` into the same `PackageJobPayload` variants, heartbeats package progress, records terminal `worker_jobs` results, and links retained `lca_package_jobs` / artifacts / request-cache rows back to the canonical `worker_jobs` id. The `PACKAGE_QUEUE_BACKEND=pgmq` path is legacy compatibility/debug only, consumes `pgmq` messages from `lca_package_jobs`, and requires the explicit `ALLOW_LEGACY_JOB_TABLE_BACKEND=true` / `--allow-legacy-job-table-backend` guard.
+It also owns package-job artifacts and diagnostics. The default `PACKAGE_QUEUE_BACKEND=worker-jobs` path claims `public.worker_jobs` rows from `worker_queue=package`, maps `job_kind=tidas.export_package|tidas.import_package` into the same `PackageJobPayload` variants, heartbeats package progress, records terminal `worker_jobs` results, and links package artifacts / export items / request-cache rows back to the canonical `worker_jobs` id. Optional `lca_package_jobs` rows are best-effort compatibility only; production worker_jobs paths must run when `public.lca_package_jobs` is absent. The `PACKAGE_QUEUE_BACKEND=pgmq` path is legacy compatibility/debug only, consumes `pgmq` messages from `lca_package_jobs`, and requires the explicit `ALLOW_LEGACY_JOB_TABLE_BACKEND=true` / `--allow-legacy-job-table-backend` guard.
 
 ### Result persistence
 

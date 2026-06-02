@@ -468,7 +468,7 @@ async fn record_package_worker_job_failure(
         status: "failed".to_owned(),
         result_json: None,
         result_schema_version: None,
-        result_ref: Some(package_worker_result_ref(package_job_id)),
+        result_ref: Some(package_worker_result_ref(job.id, package_job_id)),
         diagnostics: Some(diagnostics),
         error_code: Some(cache_error_code),
         error_message: Some(cache_error_message),
@@ -537,6 +537,7 @@ async fn build_package_worker_job_result(
     let package_job = fetch_package_job_projection(&state.pool, package_job_id).await?;
     let artifacts = fetch_package_artifact_projection(&state.pool, package_job_id).await?;
     let result_json = json!({
+        "workerJobId": worker_job_id,
         "packageJobId": package_job_id,
         "payloadType": package_payload_type_name(payload),
         "packageJobStatus": package_job.get("status").cloned().unwrap_or(Value::Null),
@@ -547,7 +548,7 @@ async fn build_package_worker_job_result(
         status: "completed".to_owned(),
         result_json: Some(result_json),
         result_schema_version: Some(package_result_schema_version(payload).to_owned()),
-        result_ref: Some(package_worker_result_ref(package_job_id)),
+        result_ref: Some(package_worker_result_ref(worker_job_id, package_job_id)),
         diagnostics: Some(json!({
             "packageJob": package_job,
         })),
@@ -565,52 +566,82 @@ async fn link_package_worker_job_domain_refs(
     worker_job_id: Uuid,
     package_job_id: Uuid,
 ) -> anyhow::Result<()> {
-    sqlx::query(
+    execute_optional_worker_job_ref_update(
+        pool,
         r"
-        WITH package_job AS (
-            UPDATE public.lca_package_jobs
-               SET worker_job_id = $1
-             WHERE id = $2
-            RETURNING id
-        ),
-        artifacts AS (
-            UPDATE public.lca_package_artifacts
-               SET worker_job_id = $1
-             WHERE job_id = $2
-            RETURNING id
-        ),
-        export_items AS (
-            UPDATE public.lca_package_export_items
-               SET worker_job_id = $1
-             WHERE job_id = $2
-            RETURNING id
-        ),
-        request_cache AS (
-            UPDATE public.lca_package_request_cache
-               SET worker_job_id = $1
-             WHERE job_id = $2
-            RETURNING id
-        )
-        SELECT 1
+        UPDATE public.lca_package_jobs
+           SET worker_job_id = $1
+         WHERE id = $2
         ",
+        worker_job_id,
+        package_job_id,
     )
-    .bind(worker_job_id)
-    .bind(package_job_id)
-    .execute(pool)
+    .await?;
+    execute_optional_worker_job_ref_update(
+        pool,
+        r"
+        UPDATE public.lca_package_artifacts
+           SET worker_job_id = $1
+         WHERE job_id = $2
+        ",
+        worker_job_id,
+        package_job_id,
+    )
+    .await?;
+    execute_optional_worker_job_ref_update(
+        pool,
+        r"
+        UPDATE public.lca_package_export_items
+           SET worker_job_id = $1
+         WHERE job_id = $2
+        ",
+        worker_job_id,
+        package_job_id,
+    )
+    .await?;
+    execute_optional_worker_job_ref_update(
+        pool,
+        r"
+        UPDATE public.lca_package_request_cache
+           SET worker_job_id = $1
+         WHERE job_id = $2
+        ",
+        worker_job_id,
+        package_job_id,
+    )
     .await?;
 
     Ok(())
 }
 
-fn package_worker_result_ref(package_job_id: Uuid) -> Value {
+async fn execute_optional_worker_job_ref_update(
+    pool: &sqlx::PgPool,
+    statement: &str,
+    worker_job_id: Uuid,
+    compat_job_id: Uuid,
+) -> anyhow::Result<()> {
+    let result = sqlx::query(statement)
+        .bind(worker_job_id)
+        .bind(compat_job_id)
+        .execute(pool)
+        .await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(err) if is_undefined_table(&err) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn package_worker_result_ref(worker_job_id: Uuid, package_job_id: Uuid) -> Value {
     json!({
-        "domainSource": "lca_package_jobs",
+        "domainSource": "worker_jobs",
+        "workerJobId": worker_job_id,
         "packageJobId": package_job_id,
     })
 }
 
 async fn fetch_package_job_projection(pool: &sqlx::PgPool, job_id: Uuid) -> anyhow::Result<Value> {
-    let row = sqlx::query(
+    let result = sqlx::query(
         r"
         SELECT status, job_type, scope, root_count, diagnostics
         FROM public.lca_package_jobs
@@ -619,7 +650,19 @@ async fn fetch_package_job_projection(pool: &sqlx::PgPool, job_id: Uuid) -> anyh
     )
     .bind(job_id)
     .fetch_optional(pool)
-    .await?;
+    .await;
+
+    let row = match result {
+        Ok(row) => row,
+        Err(err) if is_undefined_table(&err) => {
+            return Ok(json!({
+                "id": job_id,
+                "missing": true,
+                "legacyTableMissing": true,
+            }));
+        }
+        Err(err) => return Err(err.into()),
+    };
 
     Ok(row.map_or_else(
         || json!({"id": job_id, "missing": true}),
@@ -634,6 +677,13 @@ async fn fetch_package_job_projection(pool: &sqlx::PgPool, job_id: Uuid) -> anyh
             })
         },
     ))
+}
+
+fn is_undefined_table(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Database(db_err) => db_err.code().as_deref() == Some("42P01"),
+        _ => false,
+    }
 }
 
 async fn fetch_package_artifact_projection(
@@ -966,15 +1016,17 @@ mod tests {
     }
 
     #[test]
-    fn package_worker_result_ref_points_to_package_domain_source() {
+    fn package_worker_result_ref_points_to_worker_jobs_domain_source() {
+        let worker_job_id = Uuid::new_v4();
         let package_job_id = Uuid::new_v4();
 
-        let result_ref = package_worker_result_ref(package_job_id);
+        let result_ref = package_worker_result_ref(worker_job_id, package_job_id);
 
         assert_eq!(
             result_ref,
             json!({
-                "domainSource": "lca_package_jobs",
+                "domainSource": "worker_jobs",
+                "workerJobId": worker_job_id,
                 "packageJobId": package_job_id,
             })
         );

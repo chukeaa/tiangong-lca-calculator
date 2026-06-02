@@ -18,7 +18,7 @@ checkPaths:
   - crates/solver-worker/**
   - docs/agents/repo-validation.md
 lastReviewedAt: 2026-06-02
-lastReviewedCommit: 85b34dbdc910346055ce2188918f0d7d6332f361
+lastReviewedCommit: 07c46d2f1c5a01b702caa5c7b52d5fd6480a2fa6
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -49,7 +49,7 @@ related:
 ## 3. 关键表
 
 - `lca_package_jobs`
-  - retained package domain/history 表，用于兼容状态、artifact FK 和历史诊断
+  - optional retained package domain/history 表，用于 legacy pgmq/debug 路径、历史状态和诊断；统一 `worker_jobs` 路径不得要求该表存在
 - `lca_package_artifacts`
   - import 源 ZIP、export ZIP、import/export report 的 artifact 元数据
 - `lca_package_request_cache`
@@ -128,7 +128,7 @@ legacy `lca_package_jobs.job_type` 与 worker payload `type` 必须一致：
 - `sourceArtifactId` -> `source_artifact_id`
 - export roots 中的 `tableName` / `rootTable`、`datasetId`、`datasetVersion` 会映射到 `table`、`id`、`version`
 
-兼容期 payload 必须仍携带有效 `job_id`，因为 retained `lca_package_jobs`、`lca_package_artifacts` 和 `lca_package_request_cache` 仍承载 package domain/cache metadata 与历史诊断。
+payload 必须仍携带有效 `job_id` compatibility UUID，因为 `lca_package_artifacts`、`lca_package_export_items` 和 `lca_package_request_cache` 的历史 `job_id` columns 仍用于同一次 package 请求内分组与 artifact/cache lookup。该 UUID 不要求存在 `lca_package_jobs` parent row。
 
 ## 6.3 `import_package` worker 执行顺序（新增）
 
@@ -182,7 +182,7 @@ worker 侧 GC 必须 object-aware：
 3. 先删除对象存储 payload；
 4. 对象删除成功后，才把 artifact 标记为 `deleted`；
 5. 对象删除失败时只记录 `metadata.gc` 错误，不删除 DB metadata；
-6. 当一个 terminal package job 的 artifact 都已 `deleted`、且无 active/recent cache 引用后，才允许删除 job metadata，让 `lca_package_export_items` 通过 FK cascade 清理。
+6. 当 optional `lca_package_jobs` 仍存在时，一个 terminal package job 的 artifact 都已 `deleted`、且无 active/recent cache 引用后，才允许删除 legacy job metadata。`lca_package_export_items` 已不依赖该表 FK；新路径应以 `worker_job_id` 和 artifact/cache TTL 作为保护条件。
 
 当前 worker runtime 提供 `package_gc` CLI：
 
@@ -227,7 +227,7 @@ cargo run -p solver-worker --bin package_gc -- --execute
 
 ## 8. 状态机
 
-`lca_package_jobs.status`：
+legacy `lca_package_jobs.status`：
 
 - `queued`
 - `running`
@@ -236,7 +236,7 @@ cargo run -p solver-worker --bin package_gc -- --execute
 - `failed`
 - `stale`
 
-当前建议语义：
+legacy pgmq/debug 路径语义：
 
 - `export_package`: `queued -> running -> ready`
 - `import_package`: `queued -> running -> completed`
@@ -247,8 +247,9 @@ cargo run -p solver-worker --bin package_gc -- --execute
 - `queued/stale -> running -> completed|failed|cancelled`
 - `phase` 使用 `export_package` 或 `import_package`
 - `progress` 仅用于任务中心提示，不替代 package artifact 或 request-cache 状态
-- terminal `result_json` 包含 `packageJobId`、`payloadType`、`packageJobStatus`、`artifacts[]`
-- `result_ref` 使用 `{"domainSource":"lca_package_jobs","packageJobId":"<uuid>"}`，并且 worker 会把 `lca_package_jobs`、`lca_package_artifacts`、`lca_package_export_items`、`lca_package_request_cache` 中可关联的 retained rows 回填到同一个 `worker_job_id`
+- terminal `result_json` 包含 `workerJobId`、`packageJobId`、`payloadType`、`packageJobStatus`、`artifacts[]`
+- `result_ref` 使用 `{"domainSource":"worker_jobs","workerJobId":"<uuid>","packageJobId":"<uuid>"}`，并且 worker 会把 `lca_package_artifacts`、`lca_package_export_items`、`lca_package_request_cache` 中可关联的 rows 回填到同一个 `worker_job_id`
+- optional `lca_package_jobs` 存在时，worker 也会 best-effort 回填 `lca_package_jobs.worker_job_id`、状态和 diagnostics；该表不存在时不得影响任务完成
 
 重要差异：
 

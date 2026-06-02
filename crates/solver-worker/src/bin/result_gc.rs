@@ -68,16 +68,20 @@ const GC_CANDIDATE_QUERY: &str = r"
             r.expires_at,
             r.is_pinned,
             ROW_NUMBER() OVER (
-              PARTITION BY j.requested_by, j.snapshot_id, COALESCE(j.request_key, j.id::text)
+              PARTITION BY
+                w.requested_by,
+                r.snapshot_id,
+                COALESCE(rc.request_key, w.request_hash, r.job_id::text)
               ORDER BY r.created_at DESC, r.id DESC
             ) AS rn,
             rc.result_id AS active_cache_result_id
           FROM public.lca_results AS r
-          JOIN public.lca_jobs AS j
-            ON j.id = r.job_id
+          LEFT JOIN public.worker_jobs AS w
+            ON w.id = r.worker_job_id
           LEFT JOIN public.lca_result_cache AS rc
             ON rc.result_id = r.id
            AND rc.status IN ('pending', 'running', 'ready')
+          WHERE r.worker_job_id IS NOT NULL
         )
         SELECT result_id, artifact_url
         FROM ranked
@@ -275,6 +279,22 @@ mod tests {
         assert!(
             GC_CANDIDATE_QUERY.contains("rn > 1"),
             "result_gc must keep the latest result for a request partition"
+        );
+    }
+
+    #[test]
+    fn candidate_query_uses_worker_jobs_not_legacy_lca_jobs() {
+        assert!(
+            GC_CANDIDATE_QUERY.contains("public.worker_jobs AS w"),
+            "result_gc must group retained results through canonical worker_jobs"
+        );
+        assert!(
+            GC_CANDIDATE_QUERY.contains("w.id = r.worker_job_id"),
+            "result_gc must link results through lca_results.worker_job_id"
+        );
+        assert!(
+            !GC_CANDIDATE_QUERY.contains("public.lca_jobs AS j"),
+            "result_gc must not depend on the retired legacy lca_jobs table"
         );
     }
 }

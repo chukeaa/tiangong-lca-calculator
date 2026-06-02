@@ -52,6 +52,25 @@ pub async fn fetch_package_retention_summary(
     job_retention_days: i32,
     request_cache_retention_days: i32,
 ) -> anyhow::Result<Vec<PackageRetentionSummaryRow>> {
+    if legacy_package_jobs_exists(pool).await? {
+        fetch_package_retention_summary_with_legacy_jobs(
+            pool,
+            job_retention_days,
+            request_cache_retention_days,
+        )
+        .await
+    } else {
+        fetch_package_retention_summary_without_legacy_jobs(pool, request_cache_retention_days)
+            .await
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn fetch_package_retention_summary_with_legacy_jobs(
+    pool: &PgPool,
+    job_retention_days: i32,
+    request_cache_retention_days: i32,
+) -> anyhow::Result<Vec<PackageRetentionSummaryRow>> {
     let rows = sqlx::query(
         r"
         WITH job_rollup AS (
@@ -205,6 +224,116 @@ pub async fn fetch_package_retention_summary(
         .map_err(Into::into)
 }
 
+#[allow(clippy::too_many_lines)]
+async fn fetch_package_retention_summary_without_legacy_jobs(
+    pool: &PgPool,
+    request_cache_retention_days: i32,
+) -> anyhow::Result<Vec<PackageRetentionSummaryRow>> {
+    let rows = sqlx::query(
+        r"
+        WITH artifact_classified AS (
+          SELECT
+            'lca_package_artifacts'::text AS retention_area,
+            'delete_object_then_mark_deleted'::text AS retention_action,
+            (classified.reason = 'eligible_expired_unpinned_artifact') AS is_eligible,
+            classified.reason,
+            1::bigint AS row_count,
+            COALESCE(classified.artifact_byte_size, 0)::bigint AS total_artifact_bytes,
+            0::bigint AS total_hit_count
+          FROM (
+            SELECT
+              artifacts.*,
+              worker_job.status AS parent_worker_job_status,
+              CASE
+                WHEN artifacts.worker_job_id IS NULL THEN 'protected_missing_parent_worker_job'
+                WHEN worker_job.id IS NULL THEN 'protected_missing_parent_worker_job'
+                WHEN artifacts.is_pinned THEN 'protected_pinned_artifact'
+                WHEN artifacts.status = 'deleted' THEN 'protected_already_deleted'
+                WHEN artifacts.status <> 'ready' THEN 'protected_artifact_not_ready'
+                WHEN worker_job.status IN ('queued', 'running', 'waiting') THEN 'protected_active_parent_worker_job'
+                WHEN artifacts.expires_at IS NULL THEN 'protected_missing_expires_at'
+                WHEN artifacts.expires_at > NOW() THEN 'protected_expires_at_in_future'
+                WHEN EXISTS (
+                  SELECT 1
+                  FROM public.lca_package_request_cache AS recent_cache
+                  WHERE (
+                      recent_cache.export_artifact_id = artifacts.id
+                      OR recent_cache.report_artifact_id = artifacts.id
+                    )
+                    AND (
+                      recent_cache.status IN ('pending', 'running')
+                      OR recent_cache.last_accessed_at >= NOW() - make_interval(days => $1::integer)
+                    )
+                ) THEN 'protected_request_cache_reference'
+                ELSE 'eligible_expired_unpinned_artifact'
+              END AS reason
+            FROM public.lca_package_artifacts AS artifacts
+            LEFT JOIN public.worker_jobs AS worker_job
+              ON worker_job.id = artifacts.worker_job_id
+          ) AS classified
+        ),
+        request_cache_classified AS (
+          SELECT
+            'lca_package_request_cache'::text AS retention_area,
+            'delete_stale_request_cache_row'::text AS retention_action,
+            (classified.reason = 'eligible_stale_request_cache') AS is_eligible,
+            classified.reason,
+            1::bigint AS row_count,
+            0::bigint AS total_artifact_bytes,
+            classified.hit_count::bigint AS total_hit_count
+          FROM (
+            SELECT
+              request_cache.*,
+              worker_job.status AS parent_worker_job_status,
+              CASE
+                WHEN request_cache.status IN ('pending', 'running') THEN 'protected_active_request_cache'
+                WHEN request_cache.last_accessed_at >= NOW() - make_interval(days => $1::integer) THEN 'protected_recent_request_cache_access'
+                WHEN worker_job.status IN ('queued', 'running', 'waiting') THEN 'protected_active_parent_worker_job'
+                ELSE 'eligible_stale_request_cache'
+              END AS reason
+            FROM public.lca_package_request_cache AS request_cache
+            LEFT JOIN public.worker_jobs AS worker_job
+              ON worker_job.id = request_cache.worker_job_id
+          ) AS classified
+        ),
+        classified AS (
+          SELECT * FROM artifact_classified
+          UNION ALL
+          SELECT * FROM request_cache_classified
+        )
+        SELECT
+          retention_area,
+          retention_action,
+          is_eligible,
+          reason,
+          SUM(row_count)::bigint AS row_count,
+          COALESCE(SUM(total_artifact_bytes), 0)::bigint AS total_artifact_bytes,
+          COALESCE(SUM(total_hit_count), 0)::bigint AS total_hit_count
+        FROM classified
+        GROUP BY retention_area, retention_action, is_eligible, reason
+        ORDER BY retention_area, is_eligible DESC, reason
+        ",
+    )
+    .bind(request_cache_retention_days)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(PackageRetentionSummaryRow {
+                retention_area: row.try_get("retention_area")?,
+                retention_action: row.try_get("retention_action")?,
+                is_eligible: row.try_get("is_eligible")?,
+                reason: row.try_get("reason")?,
+                row_count: row.try_get("row_count")?,
+                total_artifact_bytes: row.try_get("total_artifact_bytes")?,
+                total_hit_count: row.try_get("total_hit_count")?,
+            })
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()
+        .map_err(Into::into)
+}
+
 pub async fn fetch_package_artifact_gc_candidates(
     pool: &PgPool,
     batch_size: i64,
@@ -218,13 +347,13 @@ pub async fn fetch_package_artifact_gc_candidates(
           artifacts.artifact_kind,
           artifacts.artifact_url
         FROM public.lca_package_artifacts AS artifacts
-        JOIN public.lca_package_jobs AS jobs
-          ON jobs.id = artifacts.job_id
+        JOIN public.worker_jobs AS worker_job
+          ON worker_job.id = artifacts.worker_job_id
         WHERE artifacts.status = 'ready'
           AND artifacts.is_pinned = FALSE
           AND artifacts.expires_at IS NOT NULL
           AND artifacts.expires_at <= NOW()
-          AND jobs.status NOT IN ('queued', 'running')
+          AND worker_job.status NOT IN ('queued', 'running', 'waiting')
           AND NOT EXISTS (
             SELECT 1
             FROM public.lca_package_request_cache AS request_cache
@@ -326,11 +455,11 @@ pub async fn delete_stale_package_request_cache_rows(
         WITH candidates AS (
           SELECT request_cache.id
           FROM public.lca_package_request_cache AS request_cache
-          LEFT JOIN public.lca_package_jobs AS jobs
-            ON jobs.id = request_cache.job_id
+          LEFT JOIN public.worker_jobs AS worker_job
+            ON worker_job.id = request_cache.worker_job_id
           WHERE request_cache.status NOT IN ('pending', 'running')
             AND request_cache.last_accessed_at < NOW() - make_interval(days => $2::integer)
-            AND COALESCE(jobs.status NOT IN ('queued', 'running'), TRUE)
+            AND COALESCE(worker_job.status NOT IN ('queued', 'running', 'waiting'), TRUE)
           ORDER BY request_cache.last_accessed_at ASC, request_cache.id ASC
           LIMIT $1
           FOR UPDATE OF request_cache SKIP LOCKED
@@ -354,6 +483,10 @@ pub async fn delete_package_jobs_after_object_gc(
     job_retention_days: i32,
     request_cache_retention_days: i32,
 ) -> anyhow::Result<u64> {
+    if !legacy_package_jobs_exists(pool).await? {
+        return Ok(0);
+    }
+
     let result = sqlx::query(
         r"
         WITH candidates AS (
@@ -399,6 +532,14 @@ pub async fn delete_package_jobs_after_object_gc(
     .await?;
 
     Ok(result.rows_affected())
+}
+
+async fn legacy_package_jobs_exists(pool: &PgPool) -> anyhow::Result<bool> {
+    let table_name =
+        sqlx::query_scalar::<Option<String>>("SELECT to_regclass('public.lca_package_jobs')::text")
+            .fetch_one(pool)
+            .await?;
+    Ok(table_name.is_some())
 }
 
 pub async fn refresh_import_source_retention(

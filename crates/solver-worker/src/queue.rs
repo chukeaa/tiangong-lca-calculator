@@ -372,7 +372,7 @@ async fn record_solver_worker_job_failure(
         Some(diagnostics),
         None,
     );
-    result.result_ref = Some(solver_worker_result_ref(lca_job_id, None));
+    result.result_ref = Some(solver_worker_result_ref(job.id, lca_job_id, None));
     if let Err(record_err) =
         record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
     {
@@ -415,7 +415,7 @@ async fn record_solver_worker_job_success(
                 Some(json!({"error": err_message})),
                 None,
             );
-            result.result_ref = Some(solver_worker_result_ref(lca_job_id, None));
+            result.result_ref = Some(solver_worker_result_ref(job.id, lca_job_id, None));
             if let Err(record_err) =
                 record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
             {
@@ -434,11 +434,18 @@ async fn build_solver_worker_job_result(
     link_lca_worker_job_domain_refs(&state.pool, worker_job_id, lca_job_id).await?;
     let job_projection = fetch_lca_job_projection(&state.pool, lca_job_id).await?;
     let result_id = latest_result_id_for_job(&state.pool, lca_job_id).await?;
-    let result_ref = solver_worker_result_ref(lca_job_id, result_id);
+    let result_ref = solver_worker_result_ref(worker_job_id, lca_job_id, result_id);
+    let snapshot_id = job_projection
+        .get("snapshotId")
+        .cloned()
+        .filter(|value| !value.is_null())
+        .or_else(|| extract_snapshot_id(payload).map(|id| json!(id)))
+        .unwrap_or(Value::Null);
     let result_json = json!({
+        "workerJobId": worker_job_id,
         "lcaJobId": lca_job_id,
         "payloadType": payload_type_name(payload),
-        "snapshotId": job_projection.get("snapshotId").cloned().unwrap_or(Value::Null),
+        "snapshotId": snapshot_id,
         "lcaJobStatus": job_projection.get("status").cloned().unwrap_or(Value::Null),
         "resultId": result_id,
     });
@@ -465,52 +472,91 @@ async fn link_lca_worker_job_domain_refs(
     worker_job_id: Uuid,
     lca_job_id: Uuid,
 ) -> anyhow::Result<()> {
-    sqlx::query(
+    execute_optional_worker_job_ref_update(
+        pool,
         r"
-        WITH lca_job AS (
-            UPDATE public.lca_jobs
-               SET worker_job_id = $1
-             WHERE id = $2
-            RETURNING id
-        ),
-        results AS (
-            UPDATE public.lca_results
-               SET worker_job_id = $1
-             WHERE job_id = $2
-            RETURNING id
-        ),
-        result_cache AS (
-            UPDATE public.lca_result_cache
-               SET worker_job_id = $1
-             WHERE job_id = $2
-            RETURNING id
-        ),
-        latest_all_unit AS (
-            UPDATE public.lca_latest_all_unit_results
-               SET worker_job_id = $1
-             WHERE job_id = $2
-            RETURNING id
-        ),
-        factorization AS (
-            UPDATE public.lca_factorization_registry
-               SET prepared_worker_job_id = $1
-             WHERE prepared_job_id = $2
-            RETURNING id
-        )
-        SELECT 1
+        UPDATE public.lca_jobs
+           SET worker_job_id = $1
+         WHERE id = $2
         ",
+        worker_job_id,
+        lca_job_id,
     )
-    .bind(worker_job_id)
-    .bind(lca_job_id)
-    .execute(pool)
+    .await?;
+    execute_optional_worker_job_ref_update(
+        pool,
+        r"
+        UPDATE public.lca_results
+           SET worker_job_id = $1
+         WHERE job_id = $2
+        ",
+        worker_job_id,
+        lca_job_id,
+    )
+    .await?;
+    execute_optional_worker_job_ref_update(
+        pool,
+        r"
+        UPDATE public.lca_result_cache
+           SET worker_job_id = $1
+         WHERE job_id = $2
+        ",
+        worker_job_id,
+        lca_job_id,
+    )
+    .await?;
+    execute_optional_worker_job_ref_update(
+        pool,
+        r"
+        UPDATE public.lca_latest_all_unit_results
+           SET worker_job_id = $1
+         WHERE job_id = $2
+        ",
+        worker_job_id,
+        lca_job_id,
+    )
+    .await?;
+    execute_optional_worker_job_ref_update(
+        pool,
+        r"
+        UPDATE public.lca_factorization_registry
+           SET prepared_worker_job_id = $1
+         WHERE prepared_job_id = $2
+        ",
+        worker_job_id,
+        lca_job_id,
+    )
     .await?;
 
     Ok(())
 }
 
-fn solver_worker_result_ref(lca_job_id: Uuid, result_id: Option<Uuid>) -> Value {
+async fn execute_optional_worker_job_ref_update(
+    pool: &sqlx::PgPool,
+    statement: &str,
+    worker_job_id: Uuid,
+    compat_job_id: Uuid,
+) -> anyhow::Result<()> {
+    let result = sqlx::query(statement)
+        .bind(worker_job_id)
+        .bind(compat_job_id)
+        .execute(pool)
+        .await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(err) if is_undefined_table(&err) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn solver_worker_result_ref(
+    worker_job_id: Uuid,
+    lca_job_id: Uuid,
+    result_id: Option<Uuid>,
+) -> Value {
     json!({
-        "domainSource": "lca_jobs",
+        "domainSource": "worker_jobs",
+        "workerJobId": worker_job_id,
         "lcaJobId": lca_job_id,
         "result": result_id.map(|id| json!({
             "table": "lca_results",
@@ -520,7 +566,7 @@ fn solver_worker_result_ref(lca_job_id: Uuid, result_id: Option<Uuid>) -> Value 
 }
 
 async fn fetch_lca_job_projection(pool: &sqlx::PgPool, job_id: Uuid) -> anyhow::Result<Value> {
-    let row = sqlx::query(
+    let result = sqlx::query(
         r"
         SELECT status, job_type, snapshot_id, diagnostics
         FROM public.lca_jobs
@@ -529,7 +575,19 @@ async fn fetch_lca_job_projection(pool: &sqlx::PgPool, job_id: Uuid) -> anyhow::
     )
     .bind(job_id)
     .fetch_optional(pool)
-    .await?;
+    .await;
+
+    let row = match result {
+        Ok(row) => row,
+        Err(err) if is_undefined_table(&err) => {
+            return Ok(json!({
+                "id": job_id,
+                "missing": true,
+                "legacyTableMissing": true,
+            }));
+        }
+        Err(err) => return Err(err.into()),
+    };
 
     Ok(row.map_or_else(
         || json!({"id": job_id, "missing": true}),
@@ -543,6 +601,13 @@ async fn fetch_lca_job_projection(pool: &sqlx::PgPool, job_id: Uuid) -> anyhow::
             })
         },
     ))
+}
+
+fn is_undefined_table(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Database(db_err) => db_err.code().as_deref() == Some("42P01"),
+        _ => false,
+    }
 }
 
 fn solver_worker_job_payload(job: &WorkerJob) -> anyhow::Result<JobPayload> {
@@ -971,16 +1036,18 @@ mod tests {
     }
 
     #[test]
-    fn solver_worker_result_ref_points_to_lca_domain_source() {
+    fn solver_worker_result_ref_points_to_worker_jobs_domain_source() {
+        let worker_job_id = Uuid::new_v4();
         let lca_job_id = Uuid::new_v4();
         let result_id = Uuid::new_v4();
 
-        let result_ref = solver_worker_result_ref(lca_job_id, Some(result_id));
+        let result_ref = solver_worker_result_ref(worker_job_id, lca_job_id, Some(result_id));
 
         assert_eq!(
             result_ref,
             json!({
-                "domainSource": "lca_jobs",
+                "domainSource": "worker_jobs",
+                "workerJobId": worker_job_id,
                 "lcaJobId": lca_job_id,
                 "result": {
                     "table": "lca_results",
