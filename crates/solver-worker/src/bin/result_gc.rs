@@ -59,6 +59,36 @@ struct GcTotals {
     batches: i64,
 }
 
+const GC_CANDIDATE_QUERY: &str = r"
+        WITH ranked AS (
+          SELECT
+            r.id AS result_id,
+            r.artifact_url,
+            r.created_at,
+            r.expires_at,
+            r.is_pinned,
+            ROW_NUMBER() OVER (
+              PARTITION BY j.requested_by, j.snapshot_id, COALESCE(j.request_key, j.id::text)
+              ORDER BY r.created_at DESC, r.id DESC
+            ) AS rn,
+            rc.result_id AS active_cache_result_id
+          FROM public.lca_results AS r
+          JOIN public.lca_jobs AS j
+            ON j.id = r.job_id
+          LEFT JOIN public.lca_result_cache AS rc
+            ON rc.result_id = r.id
+           AND rc.status IN ('pending', 'running', 'ready')
+        )
+        SELECT result_id, artifact_url
+        FROM ranked
+        WHERE expires_at < now()
+          AND is_pinned = false
+          AND active_cache_result_id IS NULL
+          AND rn > 1
+        ORDER BY created_at ASC
+        LIMIT $1
+        ";
+
 fn required<'a>(value: Option<&'a str>, name: &str) -> anyhow::Result<&'a str> {
     value.ok_or_else(|| anyhow::anyhow!("missing {name}"))
 }
@@ -180,40 +210,10 @@ async fn fetch_gc_candidates(
     pool: &sqlx::PgPool,
     batch_size: i64,
 ) -> anyhow::Result<Vec<GcCandidate>> {
-    let rows = sqlx::query(
-        r"
-        WITH ranked AS (
-          SELECT
-            r.id AS result_id,
-            r.artifact_url,
-            r.created_at,
-            r.expires_at,
-            r.is_pinned,
-            ROW_NUMBER() OVER (
-              PARTITION BY j.requested_by, j.snapshot_id, COALESCE(j.request_key, j.id::text)
-              ORDER BY r.created_at DESC, r.id DESC
-            ) AS rn,
-            rc.result_id AS active_cache_result_id
-          FROM public.lca_results AS r
-          JOIN public.lca_jobs AS j
-            ON j.id = r.job_id
-          LEFT JOIN public.lca_result_cache AS rc
-            ON rc.result_id = r.id
-           AND rc.status IN ('pending', 'running', 'ready')
-        )
-        SELECT result_id, artifact_url
-        FROM ranked
-        WHERE expires_at < now()
-          AND is_pinned = false
-          AND active_cache_result_id IS NULL
-          AND rn > 1
-        ORDER BY created_at ASC
-        LIMIT $1
-        ",
-    )
-    .bind(batch_size)
-    .fetch_all(pool)
-    .await?;
+    let rows = sqlx::query(GC_CANDIDATE_QUERY)
+        .bind(batch_size)
+        .fetch_all(pool)
+        .await?;
 
     rows.into_iter()
         .map(|r| {
@@ -232,4 +232,49 @@ async fn delete_results_by_ids(pool: &sqlx::PgPool, ids: Vec<Uuid>) -> anyhow::R
         .execute(pool)
         .await?;
     Ok(result.rows_affected())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GC_CANDIDATE_QUERY;
+
+    #[test]
+    fn candidate_query_uses_db_owned_retention_contract() {
+        assert!(
+            GC_CANDIDATE_QUERY.contains("r.expires_at"),
+            "result_gc must select the DB-owned lca_results.expires_at retention field"
+        );
+        assert!(
+            GC_CANDIDATE_QUERY.contains("r.is_pinned"),
+            "result_gc must select the DB-owned lca_results.is_pinned protection field"
+        );
+        assert!(
+            GC_CANDIDATE_QUERY.contains("expires_at < now()"),
+            "result_gc candidates must require an expired retention deadline"
+        );
+        assert!(
+            GC_CANDIDATE_QUERY.contains("is_pinned = false"),
+            "result_gc candidates must exclude pinned results"
+        );
+    }
+
+    #[test]
+    fn candidate_query_protects_active_and_latest_results() {
+        assert!(
+            GC_CANDIDATE_QUERY.contains("rc.status IN ('pending', 'running', 'ready')"),
+            "result_gc must keep results referenced by active cache rows"
+        );
+        assert!(
+            GC_CANDIDATE_QUERY.contains("active_cache_result_id IS NULL"),
+            "result_gc must exclude active cache result ids"
+        );
+        assert!(
+            GC_CANDIDATE_QUERY.contains("ROW_NUMBER() OVER"),
+            "result_gc must rank results within each request partition"
+        );
+        assert!(
+            GC_CANDIDATE_QUERY.contains("rn > 1"),
+            "result_gc must keep the latest result for a request partition"
+        );
+    }
 }
