@@ -17,8 +17,8 @@ checkPaths:
   - .docpact/config.yaml
   - crates/solver-worker/**
   - docs/agents/repo-validation.md
-lastReviewedAt: 2026-05-31
-lastReviewedCommit: 6244c4cf04ea0b239eb82bb0d3ab7ef7ce554ef5
+lastReviewedAt: 2026-06-02
+lastReviewedCommit: 85b34dbdc910346055ce2188918f0d7d6332f361
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -33,7 +33,7 @@ related:
 ## 1. 目标
 
 - 将完整 ZIP 导入/导出从同步 edge function 挪到异步 worker。
-- 在切流期兼容 legacy `pgmq + object storage + job status` 模式，并支持统一 `worker_jobs(worker_queue=package)` 生命周期。
+- 默认使用统一 `worker_jobs(worker_queue=package)` 生命周期，并保留 legacy `pgmq + object storage + job status` 作为显式兼容/debug 路径。
 - 避免把 `snapshot_id` 语义强行塞进 package 任务。
 
 ## 2. 为什么不复用 `lca_jobs`
@@ -49,11 +49,13 @@ related:
 ## 3. 关键表
 
 - `lca_package_jobs`
-  - package 导入/导出主任务表
+  - retained package domain/history 表，用于兼容状态、artifact FK 和历史诊断
 - `lca_package_artifacts`
   - import 源 ZIP、export ZIP、import/export report 的 artifact 元数据
 - `lca_package_request_cache`
   - 按用户 + 操作 + request key 做去重与状态追踪
+- `worker_jobs`
+  - package worker 的 canonical 生命周期、lease、进度、错误和 result projection
 
 ## 4. 队列与 RPC
 
@@ -85,7 +87,7 @@ legacy `lca_package_jobs.job_type` 与 worker payload `type` 必须一致：
 | `tidas.export_package` | `tidas.export_package.request.v1` | `export_package` | `tidas.export_package.result.v1` |
 | `tidas.import_package` | `tidas.import_package.request.v1` | `import_package` | `tidas.import_package.result.v1` |
 
-`package_worker` 默认仍走 legacy `pgmq`；使用 `--package-queue-backend worker-jobs` 或 `PACKAGE_QUEUE_BACKEND=worker-jobs` 后领取 `worker_queue=package`。`PACKAGE_WORKER_ID`、`PACKAGE_WORKER_JOBS_CLAIM_LIMIT`、`PACKAGE_WORKER_JOBS_LEASE_SECONDS` 控制 worker_jobs claim/diagnostics/lease。
+`package_worker` 默认走 `worker_jobs`；使用 `--package-queue-backend pgmq` 或 `PACKAGE_QUEUE_BACKEND=pgmq` 才进入 legacy 兼容/debug 路径。`worker_jobs` 模式领取 `worker_queue=package`。`PACKAGE_WORKER_ID`、`PACKAGE_WORKER_JOBS_CLAIM_LIMIT`、`PACKAGE_WORKER_JOBS_LEASE_SECONDS` 控制 worker_jobs claim/diagnostics/lease。
 
 ## 6. Payload 契约
 
@@ -126,7 +128,7 @@ legacy `lca_package_jobs.job_type` 与 worker payload `type` 必须一致：
 - `sourceArtifactId` -> `source_artifact_id`
 - export roots 中的 `tableName` / `rootTable`、`datasetId`、`datasetVersion` 会映射到 `table`、`id`、`version`
 
-切流期 payload 必须仍携带有效 `job_id`，因为 `lca_package_jobs`、`lca_package_artifacts` 和 `lca_package_request_cache` 仍是 package domain truth。
+兼容期 payload 必须仍携带有效 `job_id`，因为 retained `lca_package_jobs`、`lca_package_artifacts` 和 `lca_package_request_cache` 仍承载 package domain/cache metadata 与历史诊断。
 
 ## 6.3 `import_package` worker 执行顺序（新增）
 
@@ -246,7 +248,7 @@ cargo run -p solver-worker --bin package_gc -- --execute
 - `phase` 使用 `export_package` 或 `import_package`
 - `progress` 仅用于任务中心提示，不替代 package artifact 或 request-cache 状态
 - terminal `result_json` 包含 `packageJobId`、`payloadType`、`packageJobStatus`、`artifacts[]`
-- `result_ref` 指向 `{"table":"lca_package_jobs","id":"<uuid>"}`
+- `result_ref` 使用 `{"domainSource":"lca_package_jobs","packageJobId":"<uuid>"}`，并且 worker 会把 `lca_package_jobs`、`lca_package_artifacts`、`lca_package_export_items`、`lca_package_request_cache` 中可关联的 retained rows 回填到同一个 `worker_job_id`
 
 重要差异：
 

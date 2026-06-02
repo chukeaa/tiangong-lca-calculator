@@ -353,7 +353,15 @@ async fn record_solver_worker_job_failure(
     let _ = update_job_status(&state.pool, lca_job_id, "failed", diagnostics.clone()).await;
     let _ = mark_result_cache_failed(&state.pool, lca_job_id, "job_execution_failed", err_message)
         .await;
-    let result = WorkerJobResult::failed(
+    if let Err(err) = link_lca_worker_job_domain_refs(&state.pool, job.id, lca_job_id).await {
+        warn!(
+            error = %err,
+            worker_job_id = %job.id,
+            lca_job_id = %lca_job_id,
+            "failed to link solver domain rows to worker_jobs"
+        );
+    }
+    let mut result = WorkerJobResult::failed(
         "solver_worker_job_failed",
         err_message.to_owned(),
         json!({
@@ -364,6 +372,7 @@ async fn record_solver_worker_job_failure(
         Some(diagnostics),
         None,
     );
+    result.result_ref = Some(solver_worker_result_ref(lca_job_id, None));
     if let Err(record_err) =
         record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
     {
@@ -377,7 +386,7 @@ async fn record_solver_worker_job_success(
     payload: &JobPayload,
     lca_job_id: Uuid,
 ) {
-    match build_solver_worker_job_result(state, payload).await {
+    match build_solver_worker_job_result(state, job.id, payload).await {
         Ok(result) => {
             if let Err(err) =
                 record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
@@ -395,7 +404,7 @@ async fn record_solver_worker_job_success(
                 lca_job_id = %lca_job_id,
                 "solver worker_jobs execution completed but result projection failed"
             );
-            let result = WorkerJobResult::failed(
+            let mut result = WorkerJobResult::failed(
                 "solver_worker_job_projection_failed",
                 err_message.clone(),
                 json!({
@@ -406,6 +415,7 @@ async fn record_solver_worker_job_success(
                 Some(json!({"error": err_message})),
                 None,
             );
+            result.result_ref = Some(solver_worker_result_ref(lca_job_id, None));
             if let Err(record_err) =
                 record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
             {
@@ -417,12 +427,14 @@ async fn record_solver_worker_job_success(
 
 async fn build_solver_worker_job_result(
     state: &AppState,
+    worker_job_id: Uuid,
     payload: &JobPayload,
 ) -> anyhow::Result<WorkerJobResult> {
     let lca_job_id = extract_job_id(payload);
+    link_lca_worker_job_domain_refs(&state.pool, worker_job_id, lca_job_id).await?;
     let job_projection = fetch_lca_job_projection(&state.pool, lca_job_id).await?;
     let result_id = latest_result_id_for_job(&state.pool, lca_job_id).await?;
-    let result_ref = result_id.map(|id| json!({"table": "lca_results", "id": id}));
+    let result_ref = solver_worker_result_ref(lca_job_id, result_id);
     let result_json = json!({
         "lcaJobId": lca_job_id,
         "payloadType": payload_type_name(payload),
@@ -435,7 +447,7 @@ async fn build_solver_worker_job_result(
         status: "completed".to_owned(),
         result_json: Some(result_json),
         result_schema_version: Some(result_schema_version_for_payload(payload).to_owned()),
-        result_ref,
+        result_ref: Some(result_ref),
         diagnostics: Some(json!({
             "lcaJob": job_projection,
         })),
@@ -445,6 +457,65 @@ async fn build_solver_worker_job_result(
         blocker_codes: Vec::new(),
         resolution_scope: None,
         retryable: None,
+    })
+}
+
+async fn link_lca_worker_job_domain_refs(
+    pool: &sqlx::PgPool,
+    worker_job_id: Uuid,
+    lca_job_id: Uuid,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r"
+        WITH lca_job AS (
+            UPDATE public.lca_jobs
+               SET worker_job_id = $1
+             WHERE id = $2
+            RETURNING id
+        ),
+        results AS (
+            UPDATE public.lca_results
+               SET worker_job_id = $1
+             WHERE job_id = $2
+            RETURNING id
+        ),
+        result_cache AS (
+            UPDATE public.lca_result_cache
+               SET worker_job_id = $1
+             WHERE job_id = $2
+            RETURNING id
+        ),
+        latest_all_unit AS (
+            UPDATE public.lca_latest_all_unit_results
+               SET worker_job_id = $1
+             WHERE job_id = $2
+            RETURNING id
+        ),
+        factorization AS (
+            UPDATE public.lca_factorization_registry
+               SET prepared_worker_job_id = $1
+             WHERE prepared_job_id = $2
+            RETURNING id
+        )
+        SELECT 1
+        ",
+    )
+    .bind(worker_job_id)
+    .bind(lca_job_id)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+fn solver_worker_result_ref(lca_job_id: Uuid, result_id: Option<Uuid>) -> Value {
+    json!({
+        "domainSource": "lca_jobs",
+        "lcaJobId": lca_job_id,
+        "result": result_id.map(|id| json!({
+            "table": "lca_results",
+            "id": id,
+        })),
     })
 }
 
@@ -733,7 +804,7 @@ mod tests {
     use uuid::Uuid;
 
     use crate::{
-        queue::{payload_type_name, solver_worker_job_payload},
+        queue::{payload_type_name, solver_worker_job_payload, solver_worker_result_ref},
         types::JobPayload,
         worker_jobs::WorkerJob,
     };
@@ -897,6 +968,26 @@ mod tests {
 
         let err = solver_worker_job_payload(&job).expect_err("schema mismatch");
         assert!(err.to_string().contains("unsupported payload schema"));
+    }
+
+    #[test]
+    fn solver_worker_result_ref_points_to_lca_domain_source() {
+        let lca_job_id = Uuid::new_v4();
+        let result_id = Uuid::new_v4();
+
+        let result_ref = solver_worker_result_ref(lca_job_id, Some(result_id));
+
+        assert_eq!(
+            result_ref,
+            json!({
+                "domainSource": "lca_jobs",
+                "lcaJobId": lca_job_id,
+                "result": {
+                    "table": "lca_results",
+                    "id": result_id,
+                },
+            })
+        );
     }
 
     #[test]

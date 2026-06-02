@@ -43,7 +43,7 @@ pub struct AppConfig {
     #[arg(long, env = "QUEUE_CONN")]
     pub queue_conn: Option<String>,
     /// Worker queue backend.
-    #[arg(long, env = "SOLVER_QUEUE_BACKEND", default_value = "pgmq")]
+    #[arg(long, env = "SOLVER_QUEUE_BACKEND", default_value = "worker-jobs")]
     pub queue_backend: QueueBackend,
     /// Queue name in pgmq.
     #[arg(long, env = "PGMQ_QUEUE", default_value = "lca_jobs")]
@@ -257,7 +257,7 @@ mod tests {
         assert_eq!(config.queue_db_max_connections(), 2);
         assert_eq!(config.queue_db_min_connections(), 0);
         assert_eq!(config.queue_db_acquire_timeout(), Duration::from_secs(30));
-        assert_eq!(config.queue_backend, QueueBackend::Pgmq);
+        assert_eq!(config.queue_backend, QueueBackend::WorkerJobs);
         assert!(config.worker_id().starts_with("solver-worker-"));
         assert_eq!(config.worker_jobs_claim_limit(), 1);
         assert_eq!(config.worker_jobs_lease_seconds(), 900);

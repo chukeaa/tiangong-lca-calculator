@@ -24,8 +24,8 @@ checkPaths:
   - crates/solver-worker/src/bin/review_submit_gate_runner.rs
   - crates/**
   - supabase/migrations/**
-lastReviewedAt: 2026-04-23
-lastReviewedCommit: 4e04ac3c840390998ce4280a03c8a75829ba198a
+lastReviewedAt: 2026-06-02
+lastReviewedCommit: 85b34dbdc910346055ce2188918f0d7d6332f361
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -152,7 +152,7 @@ Header 建议：
    - 回写 `lca_result_cache.job_id/status='pending'`
 7. 返回 `queued`。`worker_jobs` 路径应额外返回 `workerJobId`，供任务中心和 operator 查询使用。
 
-worker 侧会继续推进 `lca_result_cache`：`pending -> running -> ready`（或失败时 `failed`）。
+worker 侧以 `worker_jobs` 为任务生命周期事实，并继续推进 domain/cache 表：`lca_result_cache` 从 `pending -> running -> ready`（或失败时 `failed`）。终态写回时会把 `lca_jobs`、`lca_results`、`lca_result_cache`、`lca_latest_all_unit_results`、`lca_factorization_registry` 中可关联的 retained rows 回填到同一个 `worker_job_id`。
 
 ## 5. 与 worker 的职责边界
 
@@ -167,14 +167,16 @@ worker：
 
 - 取快照数据
 - 分解/求解
-- 写 `lca_jobs` 终态
-- 写 `lca_results`
-- `worker_jobs` 路径还会 heartbeat `phase/progress`，并用 `worker_record_job_result` 写统一任务终态；不要让 Edge 自己更新 worker lease/result 字段。
+- heartbeat `worker_jobs.phase/progress`
+- 用 `worker_record_job_result` 写统一任务终态、错误、`result_json` 和 `result_ref`
+- 写 retained domain/cache metadata（如 `lca_jobs` 兼容状态、`lca_results` artifact、`lca_result_cache`），但这些不再是任务生命周期事实
+
+不要让 Edge 自己更新 worker lease/result 字段。
 
 ## 6. 失败与重试建议
 
 - Edge 入队失败：返回 `5xx`，前端可用同 `X-Idempotency-Key` 重试。
-- worker 失败：`lca_jobs.status=failed`，`diagnostics.error` 给出原因。
+- worker 失败：以 `worker_jobs.status=failed` 和 `error_*` 字段为任务事实；retained `lca_jobs.status=failed` 与 `diagnostics.error` 仅用于兼容诊断。
 - 前端轮询到 `failed` 时，提示用户重试并保留 `job_id` 便于追踪。
 
 ## 7. 最小实现清单
@@ -200,9 +202,9 @@ worker：
 提交审核前的数值稳定性 gate 分成三层；legacy gate-run 表和新的 `worker_jobs` 模式在切流期并存：
 
 - Edge 负责鉴权、请求校验、创建 / 读取 / rerun gate task，并把返回状态透出给 Next。
-- Database 负责 `dataset_review_submit_gate_runs` legacy 状态、`worker_jobs` 生命周期、result projection、lease fencing 和发布前断言。
+- Database 负责 `review_submit.submit` root job、`dataset_review_submit_jobs` retained coordinator/history、`worker_jobs` 生命周期、result projection、lease fencing 和发布前断言。
 - worker `review_submit_gate_runner` legacy 模式负责领取 queued gate run，并通过 `cmd_dataset_review_submit_gate_record_result` 写入 `passed`、`blocked` 或 `error`。
-- worker `review_submit_gate_runner --worker-jobs` 模式负责领取 `worker_queue=review_submit_gate` 的 `review_submit.gate` job，并通过 `worker_record_job_result` 写入 `completed`、`blocked` 或 `failed`。
+- worker `review_submit_gate_runner --worker-jobs` 模式负责领取 `worker_queue=review_submit_gate` 的 child `review_submit.gate` job，并通过 `worker_record_job_result` 写入 `completed`、`blocked` 或 `failed`。worker 不 claim `review_submit.submit` root job；root job 由 DB/Edge coordinator 随 `dataset_review_submit_jobs` 推进。
 
 Edge 不应执行 snapshot builder、provider scan、sparse factorization probe 或 targeted RHS solve。Edge 也不应直接更新 `dataset_review_submit_gate_runs.calculator_report`；结果写入只能由 worker runner 使用 service-role DB 连接完成。
 

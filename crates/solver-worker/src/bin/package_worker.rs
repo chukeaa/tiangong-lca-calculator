@@ -36,7 +36,7 @@ struct PackageWorkerCli {
     #[command(flatten)]
     app: AppConfig,
     /// Package worker queue backend override.
-    #[arg(long, env = "PACKAGE_QUEUE_BACKEND", default_value = "pgmq")]
+    #[arg(long, env = "PACKAGE_QUEUE_BACKEND", default_value = "worker-jobs")]
     package_queue_backend: PackageQueueBackend,
     /// Stable worker id recorded on claimed package `worker_jobs` rows.
     #[arg(long, env = "PACKAGE_WORKER_ID")]
@@ -439,6 +439,15 @@ async fn record_package_worker_job_failure(
         cache_error_message.as_str(),
     )
     .await;
+    if let Err(err) = link_package_worker_job_domain_refs(&state.pool, job.id, package_job_id).await
+    {
+        warn!(
+            error = %err,
+            worker_job_id = %job.id,
+            package_job_id = %package_job_id,
+            "failed to link package domain rows to worker_jobs"
+        );
+    }
     if let PackageJobPayload::ImportPackage {
         source_artifact_id, ..
     } = payload
@@ -457,7 +466,7 @@ async fn record_package_worker_job_failure(
         status: "failed".to_owned(),
         result_json: None,
         result_schema_version: None,
-        result_ref: Some(json!({"table": "lca_package_jobs", "id": package_job_id})),
+        result_ref: Some(package_worker_result_ref(package_job_id)),
         diagnostics: Some(diagnostics),
         error_code: Some(cache_error_code),
         error_message: Some(cache_error_message),
@@ -484,7 +493,7 @@ async fn record_package_worker_job_success(
     payload: &PackageJobPayload,
 ) {
     let package_job_id = extract_package_job_id(payload);
-    match build_package_worker_job_result(state, payload).await {
+    match build_package_worker_job_result(state, job.id, payload).await {
         Ok(result) => {
             if let Err(err) =
                 record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
@@ -518,9 +527,11 @@ async fn record_package_worker_job_success(
 
 async fn build_package_worker_job_result(
     state: &AppState,
+    worker_job_id: Uuid,
     payload: &PackageJobPayload,
 ) -> anyhow::Result<WorkerJobResult> {
     let package_job_id = extract_package_job_id(payload);
+    link_package_worker_job_domain_refs(&state.pool, worker_job_id, package_job_id).await?;
     let package_job = fetch_package_job_projection(&state.pool, package_job_id).await?;
     let artifacts = fetch_package_artifact_projection(&state.pool, package_job_id).await?;
     let result_json = json!({
@@ -534,7 +545,7 @@ async fn build_package_worker_job_result(
         status: "completed".to_owned(),
         result_json: Some(result_json),
         result_schema_version: Some(package_result_schema_version(payload).to_owned()),
-        result_ref: Some(json!({"table": "lca_package_jobs", "id": package_job_id})),
+        result_ref: Some(package_worker_result_ref(package_job_id)),
         diagnostics: Some(json!({
             "packageJob": package_job,
         })),
@@ -544,6 +555,55 @@ async fn build_package_worker_job_result(
         blocker_codes: Vec::new(),
         resolution_scope: None,
         retryable: None,
+    })
+}
+
+async fn link_package_worker_job_domain_refs(
+    pool: &sqlx::PgPool,
+    worker_job_id: Uuid,
+    package_job_id: Uuid,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r"
+        WITH package_job AS (
+            UPDATE public.lca_package_jobs
+               SET worker_job_id = $1
+             WHERE id = $2
+            RETURNING id
+        ),
+        artifacts AS (
+            UPDATE public.lca_package_artifacts
+               SET worker_job_id = $1
+             WHERE job_id = $2
+            RETURNING id
+        ),
+        export_items AS (
+            UPDATE public.lca_package_export_items
+               SET worker_job_id = $1
+             WHERE job_id = $2
+            RETURNING id
+        ),
+        request_cache AS (
+            UPDATE public.lca_package_request_cache
+               SET worker_job_id = $1
+             WHERE job_id = $2
+            RETURNING id
+        )
+        SELECT 1
+        ",
+    )
+    .bind(worker_job_id)
+    .bind(package_job_id)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+fn package_worker_result_ref(package_job_id: Uuid) -> Value {
+    json!({
+        "domainSource": "lca_package_jobs",
+        "packageJobId": package_job_id,
     })
 }
 
@@ -814,6 +874,7 @@ fn find_object_store_upload_error(err: &anyhow::Error) -> Option<&ObjectStoreUpl
 #[cfg(test)]
 mod tests {
     use anyhow::Error;
+    use clap::Parser;
     use reqwest::StatusCode;
     use serde_json::json;
     use solver_worker::package_types::{
@@ -826,8 +887,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        build_package_job_failure_diagnostics, package_request_cache_error_code,
-        package_request_cache_error_message, package_worker_job_payload,
+        PackageQueueBackend, PackageWorkerCli, build_package_job_failure_diagnostics,
+        package_request_cache_error_code, package_request_cache_error_message,
+        package_worker_job_payload, package_worker_result_ref,
     };
 
     fn worker_job(
@@ -854,6 +916,32 @@ mod tests {
             scope: PackageExportScope::OpenData,
             roots: Vec::new(),
         }
+    }
+
+    #[test]
+    fn package_worker_defaults_to_worker_jobs_backend() {
+        let cli = PackageWorkerCli::parse_from([
+            "package-worker",
+            "--database-url",
+            "postgres://example.local/app",
+        ]);
+
+        assert_eq!(cli.package_queue_backend, PackageQueueBackend::WorkerJobs);
+    }
+
+    #[test]
+    fn package_worker_result_ref_points_to_package_domain_source() {
+        let package_job_id = Uuid::new_v4();
+
+        let result_ref = package_worker_result_ref(package_job_id);
+
+        assert_eq!(
+            result_ref,
+            json!({
+                "domainSource": "lca_package_jobs",
+                "packageJobId": package_job_id,
+            })
+        );
     }
 
     #[test]

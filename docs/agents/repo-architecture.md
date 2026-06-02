@@ -32,8 +32,8 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-06-01
-lastReviewedCommit: 7acbbade00b55c8fb2eba40e23dabe7a99cdc0e9
+lastReviewedAt: 2026-06-02
+lastReviewedCommit: 85b34dbdc910346055ce2188918f0d7d6332f361
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -97,7 +97,7 @@ The worker currently covers families such as:
 
 These flows belong to the worker runtime, not to the API repo.
 
-The main solver worker has two queue backends. The default `SOLVER_QUEUE_BACKEND=pgmq` path consumes legacy `pgmq` messages from `PGMQ_QUEUE` and updates `lca_jobs`. The `SOLVER_QUEUE_BACKEND=worker-jobs` path claims `public.worker_jobs` rows from `worker_queue=solver`, maps `job_kind=lca.*` payloads back to the same internal `JobPayload` variants, heartbeats `phase/progress`, and records terminal results through `worker_record_job_result` while preserving `lca_jobs` / `lca_results` as the current result/cache domain facts.
+The main solver worker has two queue backends. The default `SOLVER_QUEUE_BACKEND=worker-jobs` path claims `public.worker_jobs` rows from `worker_queue=solver`, maps `job_kind=lca.*` payloads back to the same internal `JobPayload` variants, heartbeats `phase/progress`, records terminal results through `worker_record_job_result`, and links retained `lca_jobs` / `lca_results` / cache rows back to the canonical `worker_jobs` id. The `SOLVER_QUEUE_BACKEND=pgmq` path is legacy compatibility/debug only and consumes `pgmq` messages from `PGMQ_QUEUE`.
 
 ### Snapshot builder and provider matching
 
@@ -108,7 +108,7 @@ The modeling basis for implicit regional supply mix, exchange-location supply-re
 
 `crates/solver-worker/src/review_submit_gate.rs` owns the worker-side fast gate for dataset revision review submission. It layers revision freshness, process/exchange scans, provider evidence, sparse structural checks, and targeted RHS probes into a binary `passed` / `blocked` report without full matrix inversion or full `solve_all_unit`.
 
-`crates/solver-worker/src/review_submit_gate_runner.rs`, `crates/solver-worker/src/worker_jobs.rs`, and `crates/solver-worker/src/bin/review_submit_gate_runner.rs` are the DB runtime bridge for that gate. The legacy mode claims persisted `dataset_review_submit_gate_runs`; the `--worker-jobs` mode claims `review_submit.gate` jobs from `public.worker_jobs`. Both modes build a no-LCIA review-submit baseline plus draft overlay snapshot for the submitted process revision, compute the `json_ordered` checksum, execute `review_submit_gate`, and record the result through the database RPC. Edge and Next consume the DB status; they do not run worker-side numerical checks or final submit inside the worker runtime.
+`crates/solver-worker/src/review_submit_gate_runner.rs`, `crates/solver-worker/src/worker_jobs.rs`, and `crates/solver-worker/src/bin/review_submit_gate_runner.rs` are the DB runtime bridge for that gate. The legacy mode claims persisted `dataset_review_submit_gate_runs`; the `--worker-jobs` mode claims child `review_submit.gate` jobs from `public.worker_jobs`. Both modes build a no-LCIA review-submit baseline plus draft overlay snapshot for the submitted process revision, compute the `json_ordered` checksum, execute `review_submit_gate`, and record the result through the database RPC. The root `review_submit.submit` job is created and advanced by the DB/Edge coordinator contract; worker only executes the numeric gate child job.
 
 ### Maintenance worker
 
@@ -127,7 +127,7 @@ The package worker handles:
 - `export_package`
 - `import_package`
 
-It also owns package-job artifacts and diagnostics. The default package worker backend consumes legacy `pgmq` messages from `lca_package_jobs`. The `PACKAGE_QUEUE_BACKEND=worker-jobs` path claims `public.worker_jobs` rows from `worker_queue=package`, maps `job_kind=tidas.export_package|tidas.import_package` into the same `PackageJobPayload` variants, heartbeats package progress, records terminal `worker_jobs` results, and keeps `lca_package_jobs` / `lca_package_artifacts` / `lca_package_request_cache` as the current package domain facts.
+It also owns package-job artifacts and diagnostics. The default `PACKAGE_QUEUE_BACKEND=worker-jobs` path claims `public.worker_jobs` rows from `worker_queue=package`, maps `job_kind=tidas.export_package|tidas.import_package` into the same `PackageJobPayload` variants, heartbeats package progress, records terminal `worker_jobs` results, and links retained `lca_package_jobs` / artifacts / request-cache rows back to the canonical `worker_jobs` id. The `PACKAGE_QUEUE_BACKEND=pgmq` path is legacy compatibility/debug only and consumes `pgmq` messages from `lca_package_jobs`.
 
 ### Result persistence
 

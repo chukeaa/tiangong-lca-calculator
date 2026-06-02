@@ -22,8 +22,8 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
   - docs/tidas-package-contract.md
-lastReviewedAt: 2026-06-01
-lastReviewedCommit: 7acbbade00b55c8fb2eba40e23dabe7a99cdc0e9
+lastReviewedAt: 2026-06-02
+lastReviewedCommit: 85b34dbdc910346055ce2188918f0d7d6332f361
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -65,7 +65,7 @@ related:
 
 ## 1. 架构定位
 
-- Supabase: 业务数据、鉴权、Edge Functions 编排、`pgmq` 队列。
+- Supabase: 业务数据、鉴权、Edge Functions 编排、`worker_jobs` 统一任务事实表与 legacy `pgmq` 兼容队列。
 - Rust Solver Worker: 构建稀疏矩阵、缓存分解、重复回代、写回结果。
 - SuiteSparse (UMFPACK): 稀疏线性系统求解核心。
 
@@ -86,7 +86,8 @@ related:
   - `invalidate_factorization`
   - `rebuild_factorization`
 - 已完成 additive schema：
-  - `lca_jobs` / `lca_results`（作业与结果）
+  - `worker_jobs`（统一 worker 生命周期事实）
+  - `lca_jobs` / `lca_results`（retained LCA domain/history 与结果 artifact metadata）
   - `lca_network_snapshots`（snapshot 元信息）
   - `lca_snapshot_artifacts`（矩阵 artifact 元信息）
 - 已切换为结果 S3-only：
@@ -286,8 +287,10 @@ psql "$CONN" -v ON_ERROR_STOP=1 -f supabase/migrations/20260309042000_lca_latest
 最小必需：
 
 - `DATABASE_URL` 或 `CONN`
-- `QUEUE_DATABASE_URL` 或 `QUEUE_CONN`（可选；仅用于 pgmq read/archive，未设置时复用 `DATABASE_URL` / `CONN`）
-- `PGMQ_QUEUE`（默认 `lca_jobs`）
+- `QUEUE_DATABASE_URL` 或 `QUEUE_CONN`（可选；仅 legacy pgmq read/archive 需要，未设置时复用 `DATABASE_URL` / `CONN`）
+- `SOLVER_QUEUE_BACKEND`（默认 `worker-jobs`；`pgmq` 仅用于 legacy 兼容/debug）
+- `PACKAGE_QUEUE_BACKEND`（默认 `worker-jobs`；`pgmq` 仅用于 legacy 兼容/debug）
+- `PGMQ_QUEUE`（legacy pgmq 队列名，默认 `lca_jobs`）
 - `SOLVER_MODE`（`worker` / `http` / `both`）
 - `HTTP_ADDR`（默认 `0.0.0.0:8080`）
 - `WORKER_POLL_MS`（默认 `1000`）
@@ -311,7 +314,7 @@ psql "$CONN" -v ON_ERROR_STOP=1 -f supabase/migrations/20260309042000_lca_latest
 
 Supabase 连接说明：
 
-- worker / package worker 支持双连接池：`DATABASE_URL` / `CONN` 用于 solver、package、snapshot builder 与结果写入等主业务查询；`QUEUE_DATABASE_URL` / `QUEUE_CONN` 仅用于 pgmq polling / archive。
+- worker / package worker 支持双连接池：`DATABASE_URL` / `CONN` 用于 solver、package、snapshot builder 与结果写入等主业务查询；`QUEUE_DATABASE_URL` / `QUEUE_CONN` 仅用于 legacy pgmq polling / archive。
 - 推荐生产配置：主业务连接保留在 session/direct 连接或 session pooler；`QUEUE_DATABASE_URL` 使用 Supabase transaction pooler（通常是 `:6543`）。
 - 运行时 SQLx 查询使用非持久 prepared statement，以避免后端复用导致 `sqlx_s_*` 语句名冲突；高频 pgmq polling / archive 操作使用 `raw_sql` 简单查询协议与受限队列名字面量，避免 6543 transaction pooler 不支持 prepared statement 协议导致空轮询失败。
 - `build_snapshot` 全局并发控制使用 transaction-level advisory lock，适配 transaction pooler；生产环境仍建议保持 `BUILD_SNAPSHOT_MAX_CONCURRENCY=1`。
@@ -449,7 +452,7 @@ cargo run -p solver-worker --bin solver-worker --release -- --mode worker
 
 ```bash
 set -a && source .env && set +a
-cargo run -p solver-worker --bin package_worker --release -- --pgmq-queue lca_package_jobs --worker-vt-seconds 600 --worker-poll-ms 300
+cargo run -p solver-worker --bin package_worker --release
 ```
 
 启动 review-submit gate runner：
@@ -461,8 +464,8 @@ cargo run -p solver-worker --bin review_submit_gate_runner --release --
 
 说明：
 
-- `solver-worker` 消费 `lca_jobs`，处理 `prepare_factorization` / `solve_one` / `solve_all_unit` 等计算任务。
-- `package_worker` 消费 `lca_package_jobs`，处理前端 TIDAS package 导出/导入异步任务。
+- `solver-worker` 默认消费 `worker_queue=solver` 的 `worker_jobs`，处理 `prepare_factorization` / `solve_one` / `solve_all_unit` 等计算任务；`--queue-backend pgmq` 才进入 legacy `lca_jobs` 队列。
+- `package_worker` 默认消费 `worker_queue=package` 的 `worker_jobs`，处理前端 TIDAS package 导出/导入异步任务；`--package-queue-backend pgmq --pgmq-queue lca_package_jobs` 才进入 legacy package 队列。
 - `review_submit_gate_runner` 消费数据库表 `dataset_review_submit_gate_runs` 中的 gate run，执行 request-root snapshot + calculator gate，并通过数据库 RPC 写回结果。
 
 ### 6.2 计算正确性基线流程（Expected 对比）
@@ -653,7 +656,7 @@ Group=ubuntu
 WorkingDirectory=/home/ubuntu/projects/lca_workspace/tiangong-lca-worker
 EnvironmentFile=/home/ubuntu/projects/lca_workspace/tiangong-lca-worker/.env
 Environment=RUST_LOG=info
-ExecStart=/home/ubuntu/projects/lca_workspace/tiangong-lca-worker/target/release/package_worker --pgmq-queue lca_package_jobs --worker-vt-seconds 600 --worker-poll-ms 300
+ExecStart=/home/ubuntu/projects/lca_workspace/tiangong-lca-worker/target/release/package_worker
 Restart=always
 RestartSec=2
 TimeoutStopSec=30

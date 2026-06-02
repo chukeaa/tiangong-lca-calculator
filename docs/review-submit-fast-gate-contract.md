@@ -29,8 +29,8 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
-lastReviewedAt: 2026-05-26
-lastReviewedCommit: 877f8318a1716786beb32bc86ac208c57a9168d9
+lastReviewedAt: 2026-06-02
+lastReviewedCommit: 85b34dbdc910346055ce2188918f0d7d6332f361
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -154,7 +154,7 @@ worker_jobs 模式写回 `public.worker_jobs` 时：
 - gate blocked：`status=blocked`，`blocker_codes` 取自 `calculatorReport.blockers[].code`，`resolution_scope=user`，`retryable=true`，同时保留完整 `calculatorReport`。
 - runner / S3 / DB / unsupported dataset runtime error：`status=failed`，写入 `error_code`、`error_message`、`error_details` 和 operator diagnostics。
 
-worker runtime 不调用 final submit，也不修改 review-submit domain 状态。worker_jobs 只代表 worker-side gate 计算任务；gate passed 后的 final submit durable coordinator 属于 Edge / database 层。
+worker runtime 不调用 final submit，也不直接修改 review-submit domain 状态。`review_submit.gate` 是 worker-side gate child 计算任务；gate passed 后的 final submit durable coordinator 属于 Edge / database 层。数据库会为一次提交维护 `review_submit.submit` root worker job，并随着 retained `dataset_review_submit_jobs` coordinator 状态同步推进；worker runner 只 claim `worker_queue=review_submit_gate`。
 
 ## Policy 默认值
 
