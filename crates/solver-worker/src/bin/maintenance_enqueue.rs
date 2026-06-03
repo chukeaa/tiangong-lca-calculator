@@ -12,6 +12,8 @@ enum MaintenanceJobKind {
     Result,
     #[value(name = "package-artifact-gc")]
     PackageArtifact,
+    #[value(name = "flow-topology-cache")]
+    FlowTopologyCache,
 }
 
 impl MaintenanceJobKind {
@@ -20,6 +22,7 @@ impl MaintenanceJobKind {
             Self::Snapshot => "lca.snapshot_gc",
             Self::Result => "lca.result_gc",
             Self::PackageArtifact => "tidas.package_artifact_gc",
+            Self::FlowTopologyCache => "national_carbon.flow_topology_cache_build",
         }
     }
 
@@ -28,6 +31,7 @@ impl MaintenanceJobKind {
             Self::Snapshot => "lca.snapshot_gc.request.v1",
             Self::Result => "lca.result_gc.request.v1",
             Self::PackageArtifact => "tidas.package_artifact_gc.request.v1",
+            Self::FlowTopologyCache => "national_carbon.flow_topology_cache_build.request.v1",
         }
     }
 }
@@ -93,6 +97,16 @@ struct Cli {
     job_retention_days: Option<i64>,
     #[arg(long)]
     request_cache_retention_days: Option<i64>,
+    #[arg(long)]
+    build_id: Option<String>,
+    #[arg(long)]
+    limit_flows: Option<i64>,
+    #[arg(long)]
+    page_size: Option<i64>,
+    #[arg(long)]
+    cache_prefix: Option<String>,
+    #[arg(long)]
+    cache_bucket: Option<String>,
 }
 
 impl Cli {
@@ -233,6 +247,13 @@ fn maintenance_payload(cli: &Cli, environment: &str) -> Value {
                 cli.request_cache_retention_days,
             );
         }
+        MaintenanceJobKind::FlowTopologyCache => {
+            insert_string(&mut payload, "buildId", cli.build_id.as_deref());
+            insert_i64(&mut payload, "limitFlows", cli.limit_flows);
+            insert_i64(&mut payload, "pageSize", cli.page_size);
+            insert_string(&mut payload, "cachePrefix", cli.cache_prefix.as_deref());
+            insert_string(&mut payload, "cacheBucket", cli.cache_bucket.as_deref());
+        }
     }
 
     Value::Object(payload)
@@ -240,6 +261,12 @@ fn maintenance_payload(cli: &Cli, environment: &str) -> Value {
 
 fn insert_i64(payload: &mut Map<String, Value>, key: &str, value: Option<i64>) {
     if let Some(value) = value {
+        payload.insert(key.to_owned(), json!(value));
+    }
+}
+
+fn insert_string(payload: &mut Map<String, Value>, key: &str, value: Option<&str>) {
+    if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
         payload.insert(key.to_owned(), json!(value));
     }
 }
@@ -298,6 +325,11 @@ mod tests {
             max_batches: None,
             job_retention_days: None,
             request_cache_retention_days: None,
+            build_id: None,
+            limit_flows: None,
+            page_size: None,
+            cache_prefix: None,
+            cache_bucket: None,
         }
     }
 
@@ -357,6 +389,27 @@ mod tests {
         assert_eq!(
             default_concurrency_key("lca.snapshot_gc", "main", "execute"),
             "lca.snapshot_gc:main:execute"
+        );
+    }
+
+    #[test]
+    fn builds_flow_topology_cache_payload() {
+        let mut cli = base_cli(MaintenanceJobKind::FlowTopologyCache);
+        cli.build_id = Some("flow-topology-test".to_owned());
+        cli.limit_flows = Some(10);
+        cli.page_size = Some(250);
+        cli.cache_prefix = Some("national-carbon/flow-topology/v1".to_owned());
+
+        assert_eq!(
+            maintenance_payload(&cli, "dev"),
+            json!({
+                "environment": "dev",
+                "execute": false,
+                "buildId": "flow-topology-test",
+                "limitFlows": 10,
+                "pageSize": 250,
+                "cachePrefix": "national-carbon/flow-topology/v1"
+            })
         );
     }
 }

@@ -117,8 +117,9 @@ The modeling basis for implicit regional supply mix, exchange-location supply-re
 - `lca.snapshot_gc`
 - `lca.result_gc`
 - `tidas.package_artifact_gc`
+- `national_carbon.flow_topology_cache_build`
 
-The maintenance worker is intentionally a thin orchestrator over the existing `snapshot_gc`, `result_gc`, and `package_gc` binaries. Those binaries keep their deletion safety rules, object-first metadata updates, active snapshot/package protections, and PostgreSQL advisory locks. The `worker_jobs` layer records dry-run/execute intent, phase/heartbeat, exit status, stdout/stderr tails, parsed `[summary]` metrics, and an operator-only `maintenance_gc_report` artifact metadata row for operator visibility.
+The maintenance worker is intentionally a thin orchestrator over the existing `snapshot_gc`, `result_gc`, `package_gc`, and `flow_topology_cache_builder` binaries. Those binaries keep their own safety rules, object-first behavior, active snapshot/package protections, cache-prefix contracts, and PostgreSQL advisory locks where applicable. The `worker_jobs` layer records dry-run/execute intent, phase/heartbeat, exit status, stdout/stderr tails, parsed `[summary]` metrics, and an operator-only `maintenance_gc_report` artifact metadata row for operator visibility.
 
 ### Package worker
 

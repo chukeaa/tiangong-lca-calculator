@@ -17,12 +17,17 @@ const MAINTENANCE_WORKER_QUEUE: &str = "maintenance";
 const SNAPSHOT_GC_JOB_KIND: &str = "lca.snapshot_gc";
 const RESULT_GC_JOB_KIND: &str = "lca.result_gc";
 const PACKAGE_ARTIFACT_GC_JOB_KIND: &str = "tidas.package_artifact_gc";
+const FLOW_TOPOLOGY_CACHE_JOB_KIND: &str = "national_carbon.flow_topology_cache_build";
 const SNAPSHOT_GC_PAYLOAD_SCHEMA_VERSION: &str = "lca.snapshot_gc.request.v1";
 const RESULT_GC_PAYLOAD_SCHEMA_VERSION: &str = "lca.result_gc.request.v1";
 const PACKAGE_ARTIFACT_GC_PAYLOAD_SCHEMA_VERSION: &str = "tidas.package_artifact_gc.request.v1";
+const FLOW_TOPOLOGY_CACHE_PAYLOAD_SCHEMA_VERSION: &str =
+    "national_carbon.flow_topology_cache_build.request.v1";
 const SNAPSHOT_GC_RESULT_SCHEMA_VERSION: &str = "lca.snapshot_gc.result.v1";
 const RESULT_GC_RESULT_SCHEMA_VERSION: &str = "lca.result_gc.result.v1";
 const PACKAGE_ARTIFACT_GC_RESULT_SCHEMA_VERSION: &str = "tidas.package_artifact_gc.result.v1";
+const FLOW_TOPOLOGY_CACHE_RESULT_SCHEMA_VERSION: &str =
+    "national_carbon.flow_topology_cache_build.result.v1";
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "maintenance-worker")]
@@ -453,6 +458,12 @@ fn maintenance_command_for_job(job: &WorkerJob) -> anyhow::Result<MaintenanceCom
                 PACKAGE_ARTIFACT_GC_RESULT_SCHEMA_VERSION,
                 package_gc_args(payload, execute),
             ),
+            FLOW_TOPOLOGY_CACHE_JOB_KIND => (
+                "flow_topology_cache_builder",
+                FLOW_TOPOLOGY_CACHE_PAYLOAD_SCHEMA_VERSION,
+                FLOW_TOPOLOGY_CACHE_RESULT_SCHEMA_VERSION,
+                flow_topology_cache_args(payload, execute),
+            ),
             _ => {
                 return Err(anyhow::anyhow!(
                     "unsupported maintenance worker job kind: {}",
@@ -576,6 +587,39 @@ fn package_gc_args(payload: &Map<String, Value>, execute: bool) -> Vec<String> {
     args
 }
 
+fn flow_topology_cache_args(payload: &Map<String, Value>, execute: bool) -> Vec<String> {
+    let mut args = Vec::new();
+    push_string_arg(&mut args, "--build-id", payload, &["buildId", "build_id"]);
+    push_i64_arg(
+        &mut args,
+        "--limit-flows",
+        payload,
+        &["limitFlows", "limit_flows"],
+    );
+    push_i64_arg(
+        &mut args,
+        "--page-size",
+        payload,
+        &["pageSize", "page_size"],
+    );
+    push_string_arg(
+        &mut args,
+        "--cache-prefix",
+        payload,
+        &["cachePrefix", "cache_prefix"],
+    );
+    push_string_arg(
+        &mut args,
+        "--cache-bucket",
+        payload,
+        &["cacheBucket", "cache_bucket"],
+    );
+    if execute {
+        args.push("--execute".to_owned());
+    }
+    args
+}
+
 fn payload_object(value: &Value) -> anyhow::Result<&Map<String, Value>> {
     let Value::Object(payload) = value else {
         return Err(anyhow::anyhow!(
@@ -595,10 +639,33 @@ fn payload_i64(payload: &Map<String, Value>, keys: &[&str]) -> Option<i64> {
         .find_map(|key| payload.get(*key).and_then(Value::as_i64))
 }
 
+fn payload_string(payload: &Map<String, Value>, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        payload
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    })
+}
+
 fn push_i64_arg(args: &mut Vec<String>, flag: &str, payload: &Map<String, Value>, keys: &[&str]) {
     if let Some(value) = payload_i64(payload, keys) {
         args.push(flag.to_owned());
         args.push(value.to_string());
+    }
+}
+
+fn push_string_arg(
+    args: &mut Vec<String>,
+    flag: &str,
+    payload: &Map<String, Value>,
+    keys: &[&str],
+) {
+    if let Some(value) = payload_string(payload, keys) {
+        args.push(flag.to_owned());
+        args.push(value);
     }
 }
 
@@ -669,6 +736,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
+        FLOW_TOPOLOGY_CACHE_JOB_KIND, FLOW_TOPOLOGY_CACHE_PAYLOAD_SCHEMA_VERSION,
         PACKAGE_ARTIFACT_GC_JOB_KIND, PACKAGE_ARTIFACT_GC_PAYLOAD_SCHEMA_VERSION,
         RESULT_GC_JOB_KIND, RESULT_GC_PAYLOAD_SCHEMA_VERSION, SNAPSHOT_GC_JOB_KIND,
         SNAPSHOT_GC_PAYLOAD_SCHEMA_VERSION, maintenance_command_for_job, parse_summary_line,
@@ -769,6 +837,43 @@ mod tests {
                 "30",
                 "--request-cache-retention-days",
                 "7",
+                "--execute"
+            ]
+        );
+    }
+
+    #[test]
+    fn maps_flow_topology_cache_execute_to_builder_args() {
+        let job = worker_job(
+            FLOW_TOPOLOGY_CACHE_JOB_KIND,
+            FLOW_TOPOLOGY_CACHE_PAYLOAD_SCHEMA_VERSION,
+            json!({
+                "execute": true,
+                "buildId": "flow-topology-test",
+                "limitFlows": 12,
+                "pageSize": 250,
+                "cachePrefix": "national-carbon/flow-topology/v1",
+                "cacheBucket": "lca_results"
+            }),
+        );
+
+        let command = maintenance_command_for_job(&job).expect("command");
+
+        assert_eq!(command.binary_name, "flow_topology_cache_builder");
+        assert!(command.execute);
+        assert_eq!(
+            command.args,
+            vec![
+                "--build-id",
+                "flow-topology-test",
+                "--limit-flows",
+                "12",
+                "--page-size",
+                "250",
+                "--cache-prefix",
+                "national-carbon/flow-topology/v1",
+                "--cache-bucket",
+                "lca_results",
                 "--execute"
             ]
         );
