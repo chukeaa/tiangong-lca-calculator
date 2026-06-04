@@ -74,6 +74,9 @@ struct Cli {
     /// DB page size for source table scans.
     #[arg(long, default_value_t = DEFAULT_PAGE_SIZE)]
     page_size: i64,
+    /// Optional source row limit per source table for local canary runs.
+    #[arg(long)]
+    source_row_limit: Option<usize>,
     /// Execute uploads. Omit for dry-run only.
     #[arg(long)]
     execute: bool,
@@ -83,7 +86,6 @@ struct Cli {
 struct DatasetRow {
     id: String,
     json: Value,
-    json_ordered: Option<Value>,
     modified_at: Option<String>,
     version: String,
 }
@@ -227,15 +229,34 @@ async fn main() -> anyhow::Result<()> {
     let page_size = cli.page_size.clamp(1, MAX_PAGE_SIZE);
     let build_id = cli.build_id.clone().unwrap_or_else(default_build_id);
     let pool = PgPoolOptions::new()
-        .max_connections(4)
+        .max_connections(1)
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query("SET default_transaction_read_only = on")
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
         .connect(resolve_database_url(&cli)?)
         .await?;
 
-    let (flow_rows, process_rows) = tokio::try_join!(
-        fetch_all_rows(&pool, "flows", page_size),
-        fetch_all_rows(&pool, "processes", page_size),
-    )?;
+    eprintln!("[flow-topology] reading published flows from database");
+    let flow_rows =
+        fetch_all_rows_read_only(&pool, "flows", page_size, cli.source_row_limit).await?;
+    eprintln!("[flow-topology] reading published processes from database");
+    let process_rows =
+        fetch_all_rows_read_only(&pool, "processes", page_size, cli.source_row_limit).await?;
+    eprintln!(
+        "[flow-topology] source rows loaded: flows={} processes={}",
+        flow_rows.len(),
+        process_rows.len()
+    );
     let snapshots = build_snapshots(&flow_rows, &process_rows, &build_id, cli.limit_flows);
+    eprintln!(
+        "[flow-topology] built topology snapshots: {}",
+        snapshots.len()
+    );
     let summary = publish_snapshots(
         &cli,
         &snapshots,
@@ -319,42 +340,147 @@ async fn fetch_all_rows(
     pool: &sqlx::PgPool,
     table: &str,
     page_size: i64,
+    source_row_limit: Option<usize>,
 ) -> anyhow::Result<Vec<DatasetRow>> {
     let mut rows = Vec::new();
-    let mut offset = 0_i64;
+    let mut last_id: Option<String> = None;
+    let mut last_version: Option<String> = None;
 
     loop {
-        let query = format!(
-            "SELECT id, version, json, json_ordered, modified_at::text AS modified_at \
-             FROM public.{table} \
-             WHERE state_code = $1 \
-             ORDER BY id ASC, version DESC \
-             LIMIT $2 OFFSET $3"
-        );
-        let page = sqlx::query(&query)
-            .bind(PUBLISHED_STATE_CODE)
-            .bind(page_size)
-            .bind(offset)
-            .fetch_all(pool)
-            .await?;
-
-        let page_len = page.len();
-        for row in page {
-            rows.push(DatasetRow {
-                id: row.try_get("id")?,
-                json: row.try_get("json")?,
-                json_ordered: row.try_get("json_ordered")?,
-                modified_at: row.try_get("modified_at")?,
-                version: row.try_get("version")?,
-            });
-        }
-
-        if i64::try_from(page_len).unwrap_or_default() < page_size {
+        if source_row_limit.is_some_and(|limit| rows.len() >= limit) {
             break;
         }
-        offset += page_size;
+        let remaining_limit = source_row_limit
+            .and_then(|limit| i64::try_from(limit.saturating_sub(rows.len())).ok())
+            .unwrap_or(page_size);
+        let query_limit = page_size.min(remaining_limit.max(1));
+        eprintln!(
+            "[flow-topology] fetching {table} rows after={} limit={query_limit}",
+            last_id.as_deref().unwrap_or("start")
+        );
+        let page_rows = fetch_rows_page_read_only(
+            pool,
+            table,
+            query_limit,
+            last_id.as_deref(),
+            last_version.as_deref(),
+        )
+        .await?;
+
+        let page_len = page_rows.len();
+        eprintln!(
+            "[flow-topology] fetched {table} page rows={} total={}",
+            page_len,
+            rows.len() + page_len
+        );
+        if let Some(last_row) = page_rows.last() {
+            last_id = Some(last_row.id.clone());
+            last_version = Some(last_row.version.clone());
+        }
+        rows.extend(page_rows);
+
+        if i64::try_from(page_len).unwrap_or_default() < query_limit {
+            break;
+        }
     }
 
+    Ok(rows)
+}
+
+async fn fetch_all_rows_read_only(
+    pool: &sqlx::PgPool,
+    table: &str,
+    page_size: i64,
+    source_row_limit: Option<usize>,
+) -> anyhow::Result<Vec<DatasetRow>> {
+    fetch_all_rows(pool, table, page_size, source_row_limit).await
+}
+
+async fn fetch_rows_page_read_only(
+    pool: &sqlx::PgPool,
+    table: &str,
+    query_limit: i64,
+    last_id: Option<&str>,
+    last_version: Option<&str>,
+) -> anyhow::Result<Vec<DatasetRow>> {
+    let flow_type_filter = if table == "flows" {
+        "AND COALESCE(\
+            json_ordered::jsonb #>> '{flowDataSet,modellingAndValidation,LCIMethod,typeOfDataSet}', \
+            json_ordered::jsonb #>> '{flowDataSet,modellingAndValidation,LCIMethodAndAllocation,typeOfDataSet}', \
+            json_ordered::jsonb #>> '{flow_data_set,modellingAndValidation,LCIMethod,typeOfDataSet}', \
+            json_ordered::jsonb #>> '{flow_data_set,modellingAndValidation,LCIMethodAndAllocation,typeOfDataSet}', \
+            json::jsonb #>> '{flowDataSet,modellingAndValidation,LCIMethod,typeOfDataSet}', \
+            json::jsonb #>> '{flowDataSet,modellingAndValidation,LCIMethodAndAllocation,typeOfDataSet}', \
+            json::jsonb #>> '{flow_data_set,modellingAndValidation,LCIMethod,typeOfDataSet}', \
+            json::jsonb #>> '{flow_data_set,modellingAndValidation,LCIMethodAndAllocation,typeOfDataSet}' \
+         ) IS NOT NULL \
+         AND COALESCE(\
+            json_ordered::jsonb #>> '{flowDataSet,modellingAndValidation,LCIMethod,typeOfDataSet}', \
+            json_ordered::jsonb #>> '{flowDataSet,modellingAndValidation,LCIMethodAndAllocation,typeOfDataSet}', \
+            json_ordered::jsonb #>> '{flow_data_set,modellingAndValidation,LCIMethod,typeOfDataSet}', \
+            json_ordered::jsonb #>> '{flow_data_set,modellingAndValidation,LCIMethodAndAllocation,typeOfDataSet}', \
+            json::jsonb #>> '{flowDataSet,modellingAndValidation,LCIMethod,typeOfDataSet}', \
+            json::jsonb #>> '{flowDataSet,modellingAndValidation,LCIMethodAndAllocation,typeOfDataSet}', \
+            json::jsonb #>> '{flow_data_set,modellingAndValidation,LCIMethod,typeOfDataSet}', \
+            json::jsonb #>> '{flow_data_set,modellingAndValidation,LCIMethodAndAllocation,typeOfDataSet}' \
+         ) <> 'Elementary flow'"
+    } else {
+        ""
+    };
+    let query = format!(
+        "SELECT id::text AS id, version, COALESCE(json_ordered::jsonb, json::jsonb) AS json, modified_at::text AS modified_at \
+         FROM public.{table} \
+         WHERE state_code = $1 \
+           {flow_type_filter} \
+           AND ($3::text IS NULL OR (id::text, version) > ($3::text, $4::text)) \
+         ORDER BY id::text ASC, version ASC \
+         LIMIT $2"
+    );
+    let mut attempts = 0_u8;
+    loop {
+        attempts += 1;
+        match fetch_rows_page_read_only_once(pool, &query, query_limit, last_id, last_version).await
+        {
+            Ok(rows) => return Ok(rows),
+            Err(error) if attempts < 3 => {
+                eprintln!(
+                    "[flow-topology] retrying {table} page after transient read error: {error}"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn fetch_rows_page_read_only_once(
+    pool: &sqlx::PgPool,
+    query: &str,
+    query_limit: i64,
+    last_id: Option<&str>,
+    last_version: Option<&str>,
+) -> anyhow::Result<Vec<DatasetRow>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    let page = sqlx::query(query)
+        .bind(PUBLISHED_STATE_CODE)
+        .bind(query_limit)
+        .bind(last_id)
+        .bind(last_version.unwrap_or(""))
+        .fetch_all(&mut *tx)
+        .await?;
+    let mut rows = Vec::with_capacity(page.len());
+    for row in page {
+        rows.push(DatasetRow {
+            id: row.try_get("id")?,
+            json: row.try_get("json")?,
+            modified_at: row.try_get("modified_at")?,
+            version: row.try_get("version")?,
+        });
+    }
+    tx.commit().await?;
     Ok(rows)
 }
 
@@ -789,7 +915,7 @@ fn parse_process_exchanges(row: &DatasetRow, process: &ProcessMetadata) -> Vec<P
 }
 
 fn preferred_json(row: &DatasetRow) -> &Value {
-    row.json_ordered.as_ref().unwrap_or(&row.json)
+    &row.json
 }
 
 fn pick_record<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
