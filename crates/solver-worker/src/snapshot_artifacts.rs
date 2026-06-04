@@ -45,6 +45,9 @@ pub struct SnapshotBuildConfig {
     pub process_limit: i32,
     /// Provider matching mode.
     pub provider_rule: String,
+    /// Provider candidate eligibility mode.
+    #[serde(default)]
+    pub provider_candidate_eligibility_mode: String,
     /// Quantitative reference normalization mode (`strict`/`lenient`).
     #[serde(default = "default_strict_mode")]
     pub reference_normalization_mode: String,
@@ -82,6 +85,10 @@ pub struct SnapshotProviderDecisionDiagnostics {
     pub resolved_strategy_counts: BTreeMap<String, i64>,
     #[serde(default)]
     pub unresolved_reason_counts: BTreeMap<String, i64>,
+    #[serde(default)]
+    pub candidate_eligibility_counts: BTreeMap<String, i64>,
+    #[serde(default)]
+    pub rejected_non_reference_output_count: i64,
     #[serde(default)]
     pub volume_fallback_to_one_count: i64,
     #[serde(default)]
@@ -459,6 +466,7 @@ mod tests {
             request_roots: Vec::new(),
             process_limit: 0,
             provider_rule: "strict_unique_provider".to_owned(),
+            provider_candidate_eligibility_mode: "reference_output_only".to_owned(),
             reference_normalization_mode: "strict".to_owned(),
             allocation_fraction_mode: "strict".to_owned(),
             biosphere_sign_mode: "gross".to_owned(),
@@ -495,6 +503,8 @@ mod tests {
                         "rule_requires_unique_provider".to_owned(),
                         1,
                     )]),
+                    candidate_eligibility_counts: BTreeMap::new(),
+                    rejected_non_reference_output_count: 0,
                     volume_fallback_to_one_count: 0,
                     geography_tier_counts: BTreeMap::new(),
                     supply_region_source_counts: BTreeMap::new(),

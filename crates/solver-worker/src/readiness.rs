@@ -18,8 +18,9 @@ use solver_core::{
 use uuid::Uuid;
 
 use crate::compiled_graph::{
-    CompiledGraph, CompiledProviderCandidate, CompiledProviderDecision,
-    CompiledProviderDecisionKind, CompiledProviderFailureReason, CompiledProviderGeographyTier,
+    CompiledGraph, CompiledProviderCandidate, CompiledProviderCandidateEligibility,
+    CompiledProviderDecision, CompiledProviderDecisionKind, CompiledProviderFailureReason,
+    CompiledProviderGeographyTier, CompiledProviderOutputAllocationState,
     CompiledProviderResolutionStrategy, CompiledProviderSupplyRegionSource,
 };
 use crate::snapshot_artifacts::{SnapshotBuildConfig, SnapshotCoverageReport};
@@ -209,6 +210,13 @@ pub struct ProviderDecisionEvidence {
 pub struct ProviderCandidateEvidence {
     pub provider_idx: i32,
     pub provider_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_exchange_internal_id: Option<String>,
+    pub output_exchange_is_reference: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_normalized_amount: Option<f64>,
+    pub output_allocation_state: String,
+    pub eligibility: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -674,6 +682,13 @@ fn candidate_evidence(candidate: &CompiledProviderCandidate) -> ProviderCandidat
     ProviderCandidateEvidence {
         provider_idx: candidate.provider_idx,
         provider_id: candidate.provider_id,
+        output_exchange_internal_id: candidate.output_exchange_internal_id.clone(),
+        output_exchange_is_reference: candidate.output_exchange_is_reference,
+        output_normalized_amount: candidate.output_normalized_amount,
+        output_allocation_state: provider_output_allocation_state_label(
+            candidate.output_allocation_state,
+        ),
+        eligibility: provider_candidate_eligibility_label(candidate.eligibility),
         process_name: candidate.process_name.clone(),
         location: candidate.location.clone(),
         reference_year: candidate.reference_year,
@@ -771,6 +786,7 @@ fn provider_resolution_strategy_label(strategy: CompiledProviderResolutionStrate
 fn provider_failure_reason_label(reason: CompiledProviderFailureReason) -> String {
     match reason {
         CompiledProviderFailureReason::NoProviderCandidates => "no_provider_candidates",
+        CompiledProviderFailureReason::RejectedNonReferenceOnly => "rejected_non_reference_only",
         CompiledProviderFailureReason::RuleRequiresUniqueProvider => {
             "rule_requires_unique_provider"
         }
@@ -778,6 +794,31 @@ fn provider_failure_reason_label(reason: CompiledProviderFailureReason) -> Strin
         CompiledProviderFailureReason::Top1BelowTop1MinScore => "top1_below_top1_min_score",
         CompiledProviderFailureReason::Top1Top2RatioTooClose => "top1_top2_ratio_too_close",
         CompiledProviderFailureReason::ScoreSumNonPositive => "score_sum_non_positive",
+    }
+    .to_owned()
+}
+
+fn provider_candidate_eligibility_label(
+    eligibility: CompiledProviderCandidateEligibility,
+) -> String {
+    match eligibility {
+        CompiledProviderCandidateEligibility::Unknown => "unknown",
+        CompiledProviderCandidateEligibility::AcceptedReferenceOutput => {
+            "accepted_reference_output"
+        }
+        CompiledProviderCandidateEligibility::RejectedNonReferenceOutput => {
+            "rejected_non_reference_output"
+        }
+    }
+    .to_owned()
+}
+
+fn provider_output_allocation_state_label(state: CompiledProviderOutputAllocationState) -> String {
+    match state {
+        CompiledProviderOutputAllocationState::Unknown => "unknown",
+        CompiledProviderOutputAllocationState::Present => "present",
+        CompiledProviderOutputAllocationState::Missing => "missing",
+        CompiledProviderOutputAllocationState::Invalid => "invalid",
     }
     .to_owned()
 }
@@ -1064,6 +1105,11 @@ mod tests {
                 candidates: vec![CompiledProviderCandidate {
                     provider_idx: 0,
                     provider_id,
+                    output_exchange_internal_id: Some("1".to_owned()),
+                    output_exchange_is_reference: true,
+                    output_normalized_amount: Some(1.0),
+                    output_allocation_state: CompiledProviderOutputAllocationState::Present,
+                    eligibility: CompiledProviderCandidateEligibility::AcceptedReferenceOutput,
                     process_name: Some("provider".to_owned()),
                     location: Some("CN".to_owned()),
                     reference_year: Some(2024),

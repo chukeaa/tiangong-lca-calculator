@@ -203,11 +203,17 @@ legacy pgmq/debug 路径语义：
 
 snapshot coverage diagnostics 会暴露 snapshot 构建阶段的 provider linking 和矩阵写入质量统计，用于解释供应链连接完整性。当前 coverage schema 为 `snapshot_coverage.v2`，在保留 `provider_decision_diagnostics` 兼容字段的同时，新增按用途分组的 summary：
 
-- `candidate_summary`：provider candidate 数量分布。
+- `candidate_summary`：eligible provider candidate 数量分布。自动 provider linking 默认只把 reference output 计入 eligible candidate；同 flow 的非 reference output 通过 `provider_decision_diagnostics.candidate_eligibility_counts` 和逐条 candidate evidence 解释为 rejected diagnostics。
 - `resolution_summary`：resolved strategy 与 unresolved reason 分布。
 - `geography_summary`：地理层级、strategy × geography tier、supply-region anchor 来源、exchange location 覆盖情况和 location 粒度分布。
 - `volume_weight_summary`：基于 `annualSupplyOrProductionVolume` 的权重数据可用性与 fallback-to-one 情况。
 - `gap_summary`：no-provider gap 的 top flows 与 top processes。
+
+`provider_decision_diagnostics` 中与 reference-output eligibility 相关的字段包括：
+
+- `candidate_eligibility_counts`：provider output evidence 按 `accepted_reference_output`、`rejected_non_reference_output`、`unknown` 统计。
+- `rejected_non_reference_output_count`：同 flow 但未进入自动 provider linking 的 non-reference output 数量。
+- `unresolved_reason_counts.rejected_non_reference_only`：某 input flow 只有 non-reference same-flow outputs、没有 eligible reference-output provider。
 
 `geography_summary` 中的 canonical 字段包括：
 

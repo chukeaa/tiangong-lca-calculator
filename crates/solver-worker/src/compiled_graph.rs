@@ -67,10 +67,39 @@ pub struct CompiledProviderAllocation {
     pub weight: f64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompiledProviderCandidateEligibility {
+    #[default]
+    Unknown,
+    AcceptedReferenceOutput,
+    RejectedNonReferenceOutput,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompiledProviderOutputAllocationState {
+    #[default]
+    Unknown,
+    Present,
+    Missing,
+    Invalid,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompiledProviderCandidate {
     pub provider_idx: i32,
     pub provider_id: Uuid,
+    #[serde(default)]
+    pub output_exchange_internal_id: Option<String>,
+    #[serde(default)]
+    pub output_exchange_is_reference: bool,
+    #[serde(default)]
+    pub output_normalized_amount: Option<f64>,
+    #[serde(default)]
+    pub output_allocation_state: CompiledProviderOutputAllocationState,
+    #[serde(default)]
+    pub eligibility: CompiledProviderCandidateEligibility,
     #[serde(default)]
     pub process_name: Option<String>,
     #[serde(default)]
@@ -123,6 +152,7 @@ pub enum CompiledProviderSupplyRegionSource {
 #[serde(rename_all = "snake_case")]
 pub enum CompiledProviderFailureReason {
     NoProviderCandidates,
+    RejectedNonReferenceOnly,
     RuleRequiresUniqueProvider,
     NoCandidateGeMinScore,
     Top1BelowTop1MinScore,
@@ -181,6 +211,16 @@ pub struct CompiledBiosphereEdge {
 pub struct CompiledProviderOutput {
     pub flow_id: Uuid,
     pub provider_idx: i32,
+    #[serde(default)]
+    pub output_exchange_internal_id: Option<String>,
+    #[serde(default)]
+    pub output_exchange_is_reference: bool,
+    #[serde(default)]
+    pub output_normalized_amount: Option<f64>,
+    #[serde(default)]
+    pub output_allocation_state: CompiledProviderOutputAllocationState,
+    #[serde(default)]
+    pub eligibility: CompiledProviderCandidateEligibility,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
