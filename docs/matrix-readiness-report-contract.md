@@ -50,7 +50,7 @@ Edge、Foundry、CLI 或其他调用方可以消费 report 字段，但不应在
 
 - `coverage`: snapshot coverage report。
 - `payload`: `ModelSparseData` sparse payload。
-- `compiled_graph`（可选）：fresh build 时包含逐边 provider decision、candidate providers、allocation weights、geography tier 和 failure reason。没有该字段时仍可验证 coverage/compute，但 `provider_evidence` 会降级为空。
+- `compiled_graph`（可选）：fresh build 时包含逐边 provider decision、candidate providers、candidate reference-output eligibility、allocation weights、geography tier 和 failure reason。没有该字段时仍可验证 coverage/compute，但 `provider_evidence` 会降级为空。
 - `policy`: provider write percentage、unmatched / unresolved provider 容忍度、singular risk、LCIA factor、factorization 和 negative LCIA anomaly 策略。
 
 ## 输出
@@ -62,7 +62,7 @@ Edge、Foundry、CLI 或其他调用方可以消费 report 字段，但不应在
 - `metrics.provider_closure`: input edge、written edge、unmatched provider、multi-provider unresolved 和 equal-fallback 统计。
 - `metrics.graph_readiness`: process/flow/impact scale、A/B/C/M nnz、reference/allocation closure 和 singular risk。
 - `metrics.compute_stability`: factorization readiness、matrix validation report、sample unit solves、non-finite count 和 negative LCIA count。
-- `provider_evidence`: 每条 input edge 的 consumer、flow、candidate providers、resolution strategy、failure reason、allocation weights、ambiguity 和 confidence。
+- `provider_evidence`: 每条 input edge 的 consumer、flow、candidate providers、candidate reference-output status / eligibility、resolution strategy、failure reason、allocation weights、ambiguity 和 confidence。
 - `findings` / `blockers`: machine-readable issue codes、severity、message 和 detail payload。
 
 ## Blockers

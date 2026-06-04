@@ -59,6 +59,8 @@ The method does not require every provider to be a complete market participant i
 - the providers supply the same product/reference flow;
 - the providers belong to the selected supply-region tier.
 
+Automatic provider linking treats only a process's quantitative reference output as evidence that the process supplies the product/reference flow. In practice, the Output exchange `@dataSetInternalID` must equal the process `quantitativeReference.referenceToReferenceFlow`. Same-`flow_id` non-reference outputs are exposed as rejected candidate diagnostics and do not automatically enter the provider set.
+
 Within that scope, `annualSupplyOrProductionVolume` can be used as a structured signal for relative provider supply scale. It is a share weight, not an additional technical input.
 
 ### 2. An Input Exchange Can Explicitly Declare the Supply Region
@@ -129,9 +131,9 @@ For each product input exchange, the calculator applies the following link decis
 
 ### Step 1: Determine the Product/Reference Flow
 
-The calculator identifies the demanded product/reference flow `f` from the input exchange. Provider candidates must provide the same `f`.
+The calculator identifies the demanded product/reference flow `f` from the input exchange. Provider candidates must provide the same `f`. Under the default automatic linking rule, only a reference output proves that a process supplies that product/reference flow. A non-reference output with the same `flow_id` does not become a provider only because it is geographically closer or has an allocation fraction.
 
-If no provider is available, the calculator should not fabricate one. The exchange should be reported through provider-link diagnostics and resolved through data repair, additional provider data, or explicit market-process modeling.
+If no reference-output provider is available, the calculator should not fabricate one and should not fall back to arbitrary non-reference outputs. The exchange should be reported through provider-link diagnostics and resolved through data repair, additional provider data, or explicit market/co-product process modeling.
 
 ### Step 2: Determine the Supply-Region Anchor
 
@@ -245,6 +247,18 @@ The third state is intentional. Missing volume should not automatically remove a
 
 If a non-positive volume means that a provider is unavailable, that meaning should be represented through data relationships, availability, or candidate filtering, not by letting the non-positive value enter the matrix as a raw weight.
 
+## Boundary Between Allocation Fraction and Provider Eligibility
+
+`allocation_fraction` is used for exchange amount attribution:
+
+```text
+normalized exchange amount = raw amount * reference_scale * allocation_fraction
+```
+
+It may continue to scale attributed input, output, or elementary exchange amounts, but it does not grant provider eligibility. A non-reference output with an amount and allocation fraction only shows that the exchange participates in the current process dataset's allocation accounting; it does not mean that the process can automatically supply product input demand for that output flow.
+
+If allocated co-product provider linking is needed later, it should be implemented as an explicit rule with independent product-semantics, allocation, output-amount, and diagnostics evidence, not inferred from same-`flow_id` matching alone.
+
 ## Relationship to an Explicit Market Process
 
 The method can be interpreted as inlining a linear regional market process.
@@ -346,6 +360,7 @@ This method does not apply to:
 Provider-link diagnostics should record at least:
 
 - source of the supply-region anchor: `exchange.location`, consumer process location, or unspecified;
+- reference-output status and eligibility outcome for each same-flow output;
 - selected geography tier;
 - provider candidates and final provider set;
 - annual-volume parse status for each provider;
