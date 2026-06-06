@@ -696,7 +696,7 @@ sudo systemctl restart package-worker.service
 
 ```bash
 cd /home/ubuntu/projects/lca_workspace/tiangong-lca-worker
-cargo build -p solver-worker --bin maintenance_worker --bin maintenance_enqueue --bin package_gc --bin snapshot_gc --bin result_gc --bin flow_topology_cache_builder --release
+cargo build -p solver-worker --bin maintenance_worker --bin maintenance_enqueue --bin package_gc --bin snapshot_gc --bin result_gc --bin process_flow_graph_cache_builder --release
 ```
 
 创建常驻 worker 服务 `/etc/systemd/system/maintenance-worker.service`：
@@ -739,27 +739,28 @@ sudo systemctl enable --now maintenance-worker.service
 target/release/maintenance_enqueue snapshot-gc --environment main --batch-size 50
 target/release/maintenance_enqueue result-gc --environment main --batch-size 100 --max-batches 1
 target/release/maintenance_enqueue package-artifact-gc --environment main --batch-size 100 --max-batches 1
-target/release/maintenance_enqueue flow-topology-cache --environment main --limit-flows 10
+target/release/maintenance_enqueue process-flow-graph-cache --environment main --limit-flows 10 --limit-processes 20 --max-edges 200
 ```
 
 destructive execute 必须显式传 `--execute`。`maintenance_enqueue` 会为 dry-run / execute 生成不同的 idempotency/concurrency key；execute 默认 `max_attempts=1`。
 
-全国碳大屏流图谱缓存构建属于 maintenance worker job：
+全国碳大屏全量过程-流关系图缓存构建属于 maintenance worker job：
 
-- job kind：`national_carbon.flow_topology_cache_build`
-- payload schema：`national_carbon.flow_topology_cache_build.request.v1`
-- 默认 dry-run，只统计将生成的快照/对象；正式写入对象存储时使用 `--execute`
-- 生成对象前缀默认 `national-carbon/flow-topology/v1`
-- 输出 `manifest.json`、每个 flow 的 `latest.json`、以及每个 flow/version 的 `topology.json`
-- 基础流 `Elementary flow` 在构建阶段剔除
+- job kind：`national_carbon.process_flow_graph_cache_build`
+- payload schema：`national_carbon.process_flow_graph_cache_build.request.v1`
+- 默认 dry-run，只统计将生成的全局图对象；正式写入对象存储时使用 `--execute`
+- 生成对象前缀默认 `national-carbon/process-flow-graph/v1`
+- 输出 active `manifest.json`、`builds/{buildId}/manifest.json`、`graph/*.gz`、`layout/*.gz`、`indexes/*.gz`
+- worker 在构建阶段剔除基础流 `Elementary flow`，生成全量非基础 flow / process / exchange edge 图
+- worker 预计算全局 3D 球面与 2D 展开布局坐标，前端按节点定位、高亮、拖拽和缩放渲染
 
 正式执行示例：
 
 ```bash
-target/release/maintenance_enqueue flow-topology-cache \
+target/release/maintenance_enqueue process-flow-graph-cache \
   --environment main \
   --execute \
-  --cache-prefix national-carbon/flow-topology/v1
+  --cache-prefix national-carbon/process-flow-graph/v1
 ```
 
 ### 6.6 TIDAS Package Artifact GC（systemd timer，推荐）

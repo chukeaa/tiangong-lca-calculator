@@ -17,17 +17,17 @@ const MAINTENANCE_WORKER_QUEUE: &str = "maintenance";
 const SNAPSHOT_GC_JOB_KIND: &str = "lca.snapshot_gc";
 const RESULT_GC_JOB_KIND: &str = "lca.result_gc";
 const PACKAGE_ARTIFACT_GC_JOB_KIND: &str = "tidas.package_artifact_gc";
-const FLOW_TOPOLOGY_CACHE_JOB_KIND: &str = "national_carbon.flow_topology_cache_build";
+const PROCESS_FLOW_GRAPH_CACHE_JOB_KIND: &str = "national_carbon.process_flow_graph_cache_build";
 const SNAPSHOT_GC_PAYLOAD_SCHEMA_VERSION: &str = "lca.snapshot_gc.request.v1";
 const RESULT_GC_PAYLOAD_SCHEMA_VERSION: &str = "lca.result_gc.request.v1";
 const PACKAGE_ARTIFACT_GC_PAYLOAD_SCHEMA_VERSION: &str = "tidas.package_artifact_gc.request.v1";
-const FLOW_TOPOLOGY_CACHE_PAYLOAD_SCHEMA_VERSION: &str =
-    "national_carbon.flow_topology_cache_build.request.v1";
+const PROCESS_FLOW_GRAPH_CACHE_PAYLOAD_SCHEMA_VERSION: &str =
+    "national_carbon.process_flow_graph_cache_build.request.v1";
 const SNAPSHOT_GC_RESULT_SCHEMA_VERSION: &str = "lca.snapshot_gc.result.v1";
 const RESULT_GC_RESULT_SCHEMA_VERSION: &str = "lca.result_gc.result.v1";
 const PACKAGE_ARTIFACT_GC_RESULT_SCHEMA_VERSION: &str = "tidas.package_artifact_gc.result.v1";
-const FLOW_TOPOLOGY_CACHE_RESULT_SCHEMA_VERSION: &str =
-    "national_carbon.flow_topology_cache_build.result.v1";
+const PROCESS_FLOW_GRAPH_CACHE_RESULT_SCHEMA_VERSION: &str =
+    "national_carbon.process_flow_graph_cache_build.result.v1";
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "maintenance-worker")]
@@ -458,11 +458,11 @@ fn maintenance_command_for_job(job: &WorkerJob) -> anyhow::Result<MaintenanceCom
                 PACKAGE_ARTIFACT_GC_RESULT_SCHEMA_VERSION,
                 package_gc_args(payload, execute),
             ),
-            FLOW_TOPOLOGY_CACHE_JOB_KIND => (
-                "flow_topology_cache_builder",
-                FLOW_TOPOLOGY_CACHE_PAYLOAD_SCHEMA_VERSION,
-                FLOW_TOPOLOGY_CACHE_RESULT_SCHEMA_VERSION,
-                flow_topology_cache_args(payload, execute),
+            PROCESS_FLOW_GRAPH_CACHE_JOB_KIND => (
+                "process_flow_graph_cache_builder",
+                PROCESS_FLOW_GRAPH_CACHE_PAYLOAD_SCHEMA_VERSION,
+                PROCESS_FLOW_GRAPH_CACHE_RESULT_SCHEMA_VERSION,
+                process_flow_graph_cache_args(payload, execute),
             ),
             _ => {
                 return Err(anyhow::anyhow!(
@@ -587,7 +587,7 @@ fn package_gc_args(payload: &Map<String, Value>, execute: bool) -> Vec<String> {
     args
 }
 
-fn flow_topology_cache_args(payload: &Map<String, Value>, execute: bool) -> Vec<String> {
+fn process_flow_graph_cache_args(payload: &Map<String, Value>, execute: bool) -> Vec<String> {
     let mut args = Vec::new();
     push_string_arg(&mut args, "--build-id", payload, &["buildId", "build_id"]);
     push_i64_arg(
@@ -595,6 +595,24 @@ fn flow_topology_cache_args(payload: &Map<String, Value>, execute: bool) -> Vec<
         "--limit-flows",
         payload,
         &["limitFlows", "limit_flows"],
+    );
+    push_i64_arg(
+        &mut args,
+        "--limit-processes",
+        payload,
+        &["limitProcesses", "limit_processes"],
+    );
+    push_i64_arg(
+        &mut args,
+        "--max-edges",
+        payload,
+        &["maxEdges", "max_edges"],
+    );
+    push_i64_arg(
+        &mut args,
+        "--source-row-limit",
+        payload,
+        &["sourceRowLimit", "source_row_limit"],
     );
     push_i64_arg(
         &mut args,
@@ -736,8 +754,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        FLOW_TOPOLOGY_CACHE_JOB_KIND, FLOW_TOPOLOGY_CACHE_PAYLOAD_SCHEMA_VERSION,
         PACKAGE_ARTIFACT_GC_JOB_KIND, PACKAGE_ARTIFACT_GC_PAYLOAD_SCHEMA_VERSION,
+        PROCESS_FLOW_GRAPH_CACHE_JOB_KIND, PROCESS_FLOW_GRAPH_CACHE_PAYLOAD_SCHEMA_VERSION,
         RESULT_GC_JOB_KIND, RESULT_GC_PAYLOAD_SCHEMA_VERSION, SNAPSHOT_GC_JOB_KIND,
         SNAPSHOT_GC_PAYLOAD_SCHEMA_VERSION, maintenance_command_for_job, parse_summary_line,
     };
@@ -843,35 +861,44 @@ mod tests {
     }
 
     #[test]
-    fn maps_flow_topology_cache_execute_to_builder_args() {
+    fn maps_process_flow_graph_cache_execute_to_builder_args() {
         let job = worker_job(
-            FLOW_TOPOLOGY_CACHE_JOB_KIND,
-            FLOW_TOPOLOGY_CACHE_PAYLOAD_SCHEMA_VERSION,
+            PROCESS_FLOW_GRAPH_CACHE_JOB_KIND,
+            PROCESS_FLOW_GRAPH_CACHE_PAYLOAD_SCHEMA_VERSION,
             json!({
                 "execute": true,
-                "buildId": "flow-topology-test",
+                "buildId": "process-flow-graph-test",
                 "limitFlows": 12,
+                "limitProcesses": 20,
+                "maxEdges": 100,
+                "sourceRowLimit": 300,
                 "pageSize": 250,
-                "cachePrefix": "national-carbon/flow-topology/v1",
+                "cachePrefix": "national-carbon/process-flow-graph/v1",
                 "cacheBucket": "lca_results"
             }),
         );
 
         let command = maintenance_command_for_job(&job).expect("command");
 
-        assert_eq!(command.binary_name, "flow_topology_cache_builder");
+        assert_eq!(command.binary_name, "process_flow_graph_cache_builder");
         assert!(command.execute);
         assert_eq!(
             command.args,
             vec![
                 "--build-id",
-                "flow-topology-test",
+                "process-flow-graph-test",
                 "--limit-flows",
                 "12",
+                "--limit-processes",
+                "20",
+                "--max-edges",
+                "100",
+                "--source-row-limit",
+                "300",
                 "--page-size",
                 "250",
                 "--cache-prefix",
-                "national-carbon/flow-topology/v1",
+                "national-carbon/process-flow-graph/v1",
                 "--cache-bucket",
                 "lca_results",
                 "--execute"

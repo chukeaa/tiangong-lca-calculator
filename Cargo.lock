@@ -2135,6 +2135,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "flate2",
  "hdf5",
  "hdf5-sys",
  "hex",
