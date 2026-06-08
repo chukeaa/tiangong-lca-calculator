@@ -415,7 +415,7 @@ async fn main() -> anyhow::Result<()> {
 fn default_build_id() -> String {
     format!(
         "process-flow-graph-{}",
-        Utc::now().to_rfc3339().replace([':', '.'], "-")
+        Utc::now().to_rfc3339().replace(['+', ':', '.'], "-")
     )
 }
 
