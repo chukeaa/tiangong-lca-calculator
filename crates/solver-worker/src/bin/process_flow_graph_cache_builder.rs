@@ -38,6 +38,12 @@ const BINARY_FORMAT_VERSION: u32 = 1;
 const U32_NONE: u32 = u32::MAX;
 const SPHERE_RADIUS: f32 = 310.0;
 const GOLDEN_ANGLE: f32 = 2.399_963_1;
+const EXPANDED_TOPOLOGY_ANCHOR_LIMIT: usize = 96;
+const EXPANDED_TOPOLOGY_ITERATIONS: usize = 72;
+const EXPANDED_TOPOLOGY_TARGET_WIDTH: f32 = 1900.0;
+const EXPANDED_TOPOLOGY_TARGET_HEIGHT: f32 = 1250.0;
+const EXPANDED_UNIFORM_OUTLINE_BINS: usize = 144;
+const EXPANDED_UNIFORM_OUTLINE_QUANTILE: f32 = 0.985;
 
 #[derive(Debug, Parser)]
 #[command(name = "process-flow-graph-cache-builder")]
@@ -329,6 +335,16 @@ struct EncodedObject {
     path: String,
     sha256: String,
     bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LayoutBounds {
+    height: f32,
+    max_x: f32,
+    max_y: f32,
+    min_x: f32,
+    min_y: f32,
+    width: f32,
 }
 
 #[tokio::main]
@@ -841,7 +857,7 @@ impl GraphBuilder {
         };
         let (adjacency_offsets, adjacency_edge_indices) = build_csr(adjacency)?;
         let sphere_layout = create_sphere_layout(&self.nodes);
-        let expanded_layout = create_expanded_layout(&self.nodes);
+        let expanded_layout = create_expanded_layout(&self.nodes, &self.edges);
         let search_flows = build_search_flows(&self.nodes);
 
         Ok(ProcessFlowGraph {
@@ -1305,59 +1321,661 @@ fn create_sphere_layout(nodes: &[GraphNode]) -> Vec<[f32; 3]> {
         .collect()
 }
 
-fn create_expanded_layout(nodes: &[GraphNode]) -> Vec<[f32; 3]> {
-    let clusters = cluster_order(nodes);
-    let columns = (clusters.len() as f32).sqrt().ceil().max(1.0) as usize;
-    let spacing_x = 320.0_f32;
-    let spacing_y = 230.0_f32;
-    let mut cluster_centers = BTreeMap::<String, [f32; 2]>::new();
-    for (index, cluster_id) in clusters.iter().enumerate() {
-        let column = index % columns;
-        let row = index / columns;
-        let x = (column as f32 - (columns as f32 - 1.0) / 2.0) * spacing_x;
-        let y = (row as f32 - 0.5) * spacing_y;
-        cluster_centers.insert(cluster_id.clone(), [x, y]);
+fn create_expanded_layout(nodes: &[GraphNode], edges: &[GraphEdge]) -> Vec<[f32; 3]> {
+    let (edges_by_flow, edges_by_process) = build_layout_edge_indexes(nodes.len(), edges);
+    let topology_layout =
+        create_topology_expanded_layout(nodes, edges, &edges_by_flow, &edges_by_process);
+    let topology_bounds = summarize_layout(&topology_layout);
+    let uniform_layout = create_uniform_silhouette_layout(&topology_layout, nodes);
+
+    fit_layout_to_bounds(&uniform_layout, topology_bounds)
+}
+
+fn build_layout_edge_indexes(
+    node_count: usize,
+    edges: &[GraphEdge],
+) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
+    let mut edges_by_flow = vec![Vec::<usize>::new(); node_count];
+    let mut edges_by_process = vec![Vec::<usize>::new(); node_count];
+
+    for (edge_index, edge) in edges.iter().enumerate() {
+        if let Ok(flow_index) = usize::try_from(edge.flow_index)
+            && flow_index < node_count
+        {
+            edges_by_flow[flow_index].push(edge_index);
+        }
+        if let Ok(process_index) = usize::try_from(edge.process_index)
+            && process_index < node_count
+        {
+            edges_by_process[process_index].push(edge_index);
+        }
     }
-    let mut cluster_counts = BTreeMap::<String, usize>::new();
-    nodes
+
+    (edges_by_flow, edges_by_process)
+}
+
+fn create_topology_expanded_layout(
+    nodes: &[GraphNode],
+    edges: &[GraphEdge],
+    edges_by_flow: &[Vec<usize>],
+    edges_by_process: &[Vec<usize>],
+) -> Vec<[f32; 3]> {
+    let mut positions = vec![[0.0_f32, 0.0_f32]; nodes.len()];
+    let mut flow_indexes = Vec::<usize>::new();
+    let mut process_indexes = Vec::<usize>::new();
+
+    for (index, node) in nodes.iter().enumerate() {
+        match node.kind {
+            NodeKind::Flow => flow_indexes.push(index),
+            NodeKind::Process => process_indexes.push(index),
+        }
+    }
+
+    let anchor_indexes = create_topology_anchors(nodes, &flow_indexes);
+    let anchor_set = anchor_indexes.iter().copied().collect::<BTreeSet<_>>();
+    place_topology_anchors(&mut positions, nodes, &anchor_indexes);
+    initialize_topology_processes(
+        &anchor_set,
+        edges,
+        edges_by_process,
+        nodes,
+        &mut positions,
+        &process_indexes,
+    );
+    initialize_topology_flows(
+        &anchor_set,
+        edges,
+        edges_by_flow,
+        nodes,
+        &mut positions,
+        &flow_indexes,
+    );
+
+    let mut working_positions = positions;
+    let mut target_positions = working_positions.clone();
+
+    for iteration in 0..EXPANDED_TOPOLOGY_ITERATIONS {
+        target_positions.clone_from(&working_positions);
+        relax_topology_processes(
+            edges,
+            edges_by_process,
+            nodes,
+            &working_positions,
+            &process_indexes,
+            &mut target_positions,
+        );
+        relax_topology_flows(
+            &anchor_set,
+            edges,
+            edges_by_flow,
+            &flow_indexes,
+            nodes,
+            &working_positions,
+            &mut target_positions,
+        );
+        place_topology_anchors(&mut target_positions, nodes, &anchor_indexes);
+        std::mem::swap(&mut working_positions, &mut target_positions);
+
+        if iteration % 8 == 7 {
+            apply_density_pressure(&anchor_set, iteration, nodes, &mut working_positions);
+            place_topology_anchors(&mut working_positions, nodes, &anchor_indexes);
+        }
+    }
+
+    normalize_topology_layout(&working_positions, nodes)
+}
+
+fn create_topology_anchors(nodes: &[GraphNode], flow_indexes: &[usize]) -> Vec<usize> {
+    let mut anchor_indexes = flow_indexes.to_vec();
+    anchor_indexes.sort_by(|left, right| {
+        nodes[*right]
+            .degree
+            .cmp(&nodes[*left].degree)
+            .then_with(|| nodes[*left].id.cmp(&nodes[*right].id))
+    });
+    anchor_indexes.truncate(EXPANDED_TOPOLOGY_ANCHOR_LIMIT.min(anchor_indexes.len()));
+    anchor_indexes
+}
+
+fn place_topology_anchors(
+    positions: &mut [[f32; 2]],
+    nodes: &[GraphNode],
+    anchor_indexes: &[usize],
+) {
+    let anchor_count = anchor_indexes.len().max(1) as f32;
+
+    for (rank, node_index) in anchor_indexes.iter().copied().enumerate() {
+        let node = &nodes[node_index];
+        let rank_progress = ((rank as f32 + 0.5) / anchor_count).sqrt();
+        let angle = rank as f32 * GOLDEN_ANGLE + (hash_unit(&node.id, 709) - 0.5) * 0.22;
+        let radius_x = EXPANDED_TOPOLOGY_TARGET_WIDTH * (0.18 + rank_progress * 0.34);
+        let radius_y = EXPANDED_TOPOLOGY_TARGET_HEIGHT * (0.18 + rank_progress * 0.34);
+        positions[node_index] = [angle.cos() * radius_x, angle.sin() * radius_y];
+    }
+}
+
+fn initialize_topology_processes(
+    anchor_set: &BTreeSet<usize>,
+    edges: &[GraphEdge],
+    edges_by_process: &[Vec<usize>],
+    nodes: &[GraphNode],
+    positions: &mut [[f32; 2]],
+    process_indexes: &[usize],
+) {
+    for process_index in process_indexes {
+        let incident_edges = edges_by_process
+            .get(*process_index)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let mut total_weight = 0.0_f32;
+        let mut x = 0.0_f32;
+        let mut y = 0.0_f32;
+
+        for edge_index in incident_edges {
+            let Some(flow_index) = layout_flow_index_from_edge(edges, *edge_index) else {
+                continue;
+            };
+            if !anchor_set.contains(&flow_index) {
+                continue;
+            }
+            let [anchor_x, anchor_y] = positions[flow_index];
+            let weight = 1.2 + (get_node_degree(nodes, flow_index) as f32).ln_1p() * 0.12;
+            x += anchor_x * weight;
+            y += anchor_y * weight;
+            total_weight += weight;
+        }
+
+        if total_weight <= 0.0 {
+            positions[*process_index] = get_seed_position(&nodes[*process_index].id, 811);
+            continue;
+        }
+
+        x /= total_weight;
+        y /= total_weight;
+        let orbit_angle = hash_unit(&nodes[*process_index].id, 821) * std::f32::consts::TAU;
+        let orbit_radius = 24.0
+            + (get_node_degree(nodes, *process_index) as f32)
+                .sqrt()
+                .mul_add(13.0, 0.0)
+                .min(120.0)
+            + hash_unit(&nodes[*process_index].id, 823) * 36.0;
+        positions[*process_index] = [
+            x + orbit_angle.cos() * orbit_radius,
+            y + orbit_angle.sin() * orbit_radius * 0.72,
+        ];
+    }
+}
+
+fn initialize_topology_flows(
+    anchor_set: &BTreeSet<usize>,
+    edges: &[GraphEdge],
+    edges_by_flow: &[Vec<usize>],
+    nodes: &[GraphNode],
+    positions: &mut [[f32; 2]],
+    flow_indexes: &[usize],
+) {
+    for flow_index in flow_indexes {
+        if anchor_set.contains(flow_index) {
+            continue;
+        }
+        let incident_edges = edges_by_flow
+            .get(*flow_index)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let mut total_weight = 0.0_f32;
+        let mut x = 0.0_f32;
+        let mut y = 0.0_f32;
+
+        for edge_index in incident_edges {
+            let Some(process_index) = layout_process_index_from_edge(edges, *edge_index) else {
+                continue;
+            };
+            let [process_x, process_y] = positions[process_index];
+            let weight = 1.0 / (get_node_degree(nodes, process_index) as f32).powf(0.28);
+            x += process_x * weight;
+            y += process_y * weight;
+            total_weight += weight;
+        }
+
+        if total_weight <= 0.0 {
+            positions[*flow_index] = get_seed_position(&nodes[*flow_index].id, 829);
+            continue;
+        }
+
+        x /= total_weight;
+        y /= total_weight;
+        let orbit_angle = hash_unit(&nodes[*flow_index].id, 831) * std::f32::consts::TAU;
+        let orbit_radius = 18.0
+            + (get_node_degree(nodes, *flow_index) as f32)
+                .sqrt()
+                .mul_add(9.0, 0.0)
+                .min(95.0)
+            + hash_unit(&nodes[*flow_index].id, 833) * 26.0;
+        positions[*flow_index] = [
+            x + orbit_angle.cos() * orbit_radius,
+            y + orbit_angle.sin() * orbit_radius * 0.76,
+        ];
+    }
+}
+
+fn relax_topology_processes(
+    edges: &[GraphEdge],
+    edges_by_process: &[Vec<usize>],
+    nodes: &[GraphNode],
+    positions: &[[f32; 2]],
+    process_indexes: &[usize],
+    target_positions: &mut [[f32; 2]],
+) {
+    for process_index in process_indexes {
+        let incident_edges = edges_by_process
+            .get(*process_index)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if incident_edges.is_empty() {
+            continue;
+        }
+        let mut total_weight = 0.0_f32;
+        let mut x = 0.0_f32;
+        let mut y = 0.0_f32;
+
+        for edge_index in incident_edges {
+            let Some(flow_index) = layout_flow_index_from_edge(edges, *edge_index) else {
+                continue;
+            };
+            let [flow_x, flow_y] = positions[flow_index];
+            let weight = 1.0 / (get_node_degree(nodes, flow_index) as f32).powf(0.48);
+            x += flow_x * weight;
+            y += flow_y * weight;
+            total_weight += weight;
+        }
+
+        if total_weight <= 0.0 {
+            continue;
+        }
+        let blend = 0.34;
+        target_positions[*process_index] = [
+            positions[*process_index][0] * (1.0 - blend) + (x / total_weight) * blend,
+            positions[*process_index][1] * (1.0 - blend) + (y / total_weight) * blend,
+        ];
+    }
+}
+
+fn relax_topology_flows(
+    anchor_set: &BTreeSet<usize>,
+    edges: &[GraphEdge],
+    edges_by_flow: &[Vec<usize>],
+    flow_indexes: &[usize],
+    nodes: &[GraphNode],
+    positions: &[[f32; 2]],
+    target_positions: &mut [[f32; 2]],
+) {
+    for flow_index in flow_indexes {
+        if anchor_set.contains(flow_index) {
+            continue;
+        }
+        let incident_edges = edges_by_flow
+            .get(*flow_index)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if incident_edges.is_empty() {
+            continue;
+        }
+        let mut total_weight = 0.0_f32;
+        let mut x = 0.0_f32;
+        let mut y = 0.0_f32;
+
+        for edge_index in incident_edges {
+            let Some(process_index) = layout_process_index_from_edge(edges, *edge_index) else {
+                continue;
+            };
+            let [process_x, process_y] = positions[process_index];
+            let weight = 1.0 / (get_node_degree(nodes, process_index) as f32).powf(0.24);
+            x += process_x * weight;
+            y += process_y * weight;
+            total_weight += weight;
+        }
+
+        if total_weight <= 0.0 {
+            continue;
+        }
+        let degree = get_node_degree(nodes, *flow_index);
+        let blend = if degree > 180 {
+            0.08
+        } else if degree > 72 {
+            0.14
+        } else {
+            0.28
+        };
+        target_positions[*flow_index] = [
+            positions[*flow_index][0] * (1.0 - blend) + (x / total_weight) * blend,
+            positions[*flow_index][1] * (1.0 - blend) + (y / total_weight) * blend,
+        ];
+    }
+}
+
+fn apply_density_pressure(
+    fixed_indexes: &BTreeSet<usize>,
+    iteration: usize,
+    nodes: &[GraphNode],
+    positions: &mut [[f32; 2]],
+) {
+    let cell_size = 68.0_f32;
+    let max_comfortable_count = 18_usize;
+    let mut cells = BTreeMap::<(i32, i32), (usize, f32, f32)>::new();
+
+    for [x, y] in positions.iter().copied() {
+        let cell_x = (x / cell_size).floor() as i32;
+        let cell_y = (y / cell_size).floor() as i32;
+        let cell = cells.entry((cell_x, cell_y)).or_default();
+        cell.0 += 1;
+        cell.1 += x;
+        cell.2 += y;
+    }
+
+    for cell in cells.values_mut() {
+        let count = cell.0.max(1) as f32;
+        cell.1 /= count;
+        cell.2 /= count;
+    }
+
+    for (index, position) in positions.iter_mut().enumerate() {
+        if fixed_indexes.contains(&index) {
+            continue;
+        }
+        let cell_x = (position[0] / cell_size).floor() as i32;
+        let cell_y = (position[1] / cell_size).floor() as i32;
+        let Some((count, center_x, center_y)) = cells.get(&(cell_x, cell_y)).copied() else {
+            continue;
+        };
+        if count <= max_comfortable_count {
+            continue;
+        }
+
+        let mut dx = position[0] - center_x;
+        let mut dy = position[1] - center_y;
+        let length = dx.hypot(dy);
+        if length < 0.001 {
+            let angle =
+                hash_unit(&format!("{}:{iteration}", nodes[index].id), 839) * std::f32::consts::TAU;
+            dx = angle.cos();
+            dy = angle.sin();
+        } else {
+            dx /= length;
+            dy /= length;
+        }
+
+        let pressure =
+            ((count - max_comfortable_count) as f32 / max_comfortable_count as f32).clamp(0.0, 2.4);
+        let node_scale = if nodes[index].kind == NodeKind::Process {
+            12.0
+        } else {
+            9.0
+        };
+        position[0] += dx * pressure * node_scale;
+        position[1] += dy * pressure * node_scale;
+    }
+}
+
+fn normalize_topology_layout(positions: &[[f32; 2]], nodes: &[GraphNode]) -> Vec<[f32; 3]> {
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+
+    for [x, y] in positions {
+        min_x = min_x.min(*x);
+        max_x = max_x.max(*x);
+        min_y = min_y.min(*y);
+        max_y = max_y.max(*y);
+    }
+
+    let width = (max_x - min_x).max(1.0);
+    let height = (max_y - min_y).max(1.0);
+    let center_x = f32::midpoint(min_x, max_x);
+    let center_y = f32::midpoint(min_y, max_y);
+    let scale =
+        (EXPANDED_TOPOLOGY_TARGET_WIDTH / width).min(EXPANDED_TOPOLOGY_TARGET_HEIGHT / height);
+
+    positions
         .iter()
-        .map(|node| {
-            let count = cluster_counts.entry(node.cluster_id.clone()).or_default();
-            let local_index = *count;
-            *count += 1;
-            let center = cluster_centers
-                .get(&node.cluster_id)
-                .copied()
-                .unwrap_or([0.0, 0.0]);
-            let ring = 22.0
-                + (local_index % 11) as f32 * 11.5
-                + if node.kind == NodeKind::Process {
-                    22.0
-                } else {
-                    0.0
-                };
-            let theta = local_index as f32 * GOLDEN_ANGLE;
-            let jitter_x = (hash_unit(&node.id, 29) - 0.5) * 24.0;
-            let jitter_y = (hash_unit(&node.id, 31) - 0.5) * 24.0;
+        .zip(nodes)
+        .map(|([x, y], node)| {
             [
-                center[0] + theta.cos() * ring + jitter_x,
-                center[1] + theta.sin() * ring + jitter_y,
-                if node.kind == NodeKind::Process {
-                    24.0
-                } else {
-                    8.0
-                },
+                (*x - center_x) * scale,
+                (*y - center_y) * scale,
+                get_expanded_layout_z(node),
             ]
         })
         .collect()
 }
 
-fn cluster_order(nodes: &[GraphNode]) -> Vec<String> {
-    let mut seen = BTreeSet::<String>::new();
-    for node in nodes {
-        seen.insert(node.cluster_id.clone());
+fn create_uniform_silhouette_layout(
+    base_layout: &[[f32; 3]],
+    nodes: &[GraphNode],
+) -> Vec<[f32; 3]> {
+    let [center_x, center_y] = get_layout_center2(base_layout);
+    let outline_radii = build_smoothed_outline_radii(base_layout);
+    let mut ordered_nodes = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (index, hash_unit(&node.id, 1201)))
+        .collect::<Vec<_>>();
+    ordered_nodes.sort_by(|(left_index, left_rank), (right_index, right_rank)| {
+        left_rank
+            .total_cmp(right_rank)
+            .then_with(|| nodes[*left_index].id.cmp(&nodes[*right_index].id))
+    });
+
+    let mut layout = vec![[0.0_f32, 0.0_f32, 0.0_f32]; nodes.len()];
+    let node_count = nodes.len().max(1) as f32;
+    for (rank, (node_index, _)) in ordered_nodes.into_iter().enumerate() {
+        let node = &nodes[node_index];
+        let sample = rank as f32 + 0.5;
+        let angle = sample * GOLDEN_ANGLE + hash_unit(&node.id, 1211) * 0.08;
+        let radial_progress = (sample / node_count).sqrt();
+        let outline_radius = get_outline_radius_at(&outline_radii, angle);
+        let radius_jitter = (hash_unit(&node.id, 1217) - 0.5) * 0.012;
+        let radius = outline_radius * (radial_progress + radius_jitter).clamp(0.006, 0.996);
+
+        layout[node_index] = [
+            center_x + angle.cos() * radius,
+            center_y + angle.sin() * radius,
+            get_expanded_layout_z(node),
+        ];
     }
-    seen.into_iter().collect()
+
+    layout
+}
+
+fn build_smoothed_outline_radii(layout: &[[f32; 3]]) -> Vec<f32> {
+    let [center_x, center_y] = get_layout_center2(layout);
+    let mut bins = vec![Vec::<f32>::new(); EXPANDED_UNIFORM_OUTLINE_BINS];
+    let mut max_radius = 1.0_f32;
+
+    for [x, y, _] in layout {
+        let dx = *x - center_x;
+        let dy = *y - center_y;
+        let radius = dx.hypot(dy);
+        let angle = dy.atan2(dx);
+        let bin_index = ((((angle + std::f32::consts::TAU) % std::f32::consts::TAU)
+            / std::f32::consts::TAU)
+            * EXPANDED_UNIFORM_OUTLINE_BINS as f32)
+            .floor() as usize
+            % EXPANDED_UNIFORM_OUTLINE_BINS;
+        bins[bin_index].push(radius);
+        max_radius = max_radius.max(radius);
+    }
+
+    let mut raw_radii = bins
+        .iter()
+        .map(|values| quantile(values, EXPANDED_UNIFORM_OUTLINE_QUANTILE))
+        .collect::<Vec<_>>();
+
+    for index in 0..raw_radii.len() {
+        if raw_radii[index] > 0.0 {
+            continue;
+        }
+        let mut radius = 0.0_f32;
+        for distance in 1..raw_radii.len() {
+            let left = raw_radii[(index + raw_radii.len() - distance) % raw_radii.len()];
+            let right = raw_radii[(index + distance) % raw_radii.len()];
+            if left > 0.0 || right > 0.0 {
+                radius = left.max(right);
+                break;
+            }
+        }
+        raw_radii[index] = if radius > 0.0 { radius } else { max_radius };
+    }
+
+    (0..raw_radii.len())
+        .map(|index| {
+            let mut weighted_radius = 0.0_f32;
+            let mut total_weight = 0.0_f32;
+            for delta in [-3_i8, -2, -1, 0, 1, 2, 3] {
+                let neighbor_index = circular_index(index, raw_radii.len(), delta);
+                let weight = match delta.abs() {
+                    0 => 4.0,
+                    1 => 3.0,
+                    2 => 2.0,
+                    _ => 1.0,
+                };
+                weighted_radius += raw_radii[neighbor_index] * weight;
+                total_weight += weight;
+            }
+            weighted_radius / total_weight
+        })
+        .collect()
+}
+
+fn fit_layout_to_bounds(layout: &[[f32; 3]], target_bounds: LayoutBounds) -> Vec<[f32; 3]> {
+    let source_bounds = summarize_layout(layout);
+    let source_center_x = f32::midpoint(source_bounds.min_x, source_bounds.max_x);
+    let source_center_y = f32::midpoint(source_bounds.min_y, source_bounds.max_y);
+    let target_center_x = f32::midpoint(target_bounds.min_x, target_bounds.max_x);
+    let target_center_y = f32::midpoint(target_bounds.min_y, target_bounds.max_y);
+    let scale_x = target_bounds.width / source_bounds.width.max(1.0);
+    let scale_y = target_bounds.height / source_bounds.height.max(1.0);
+
+    layout
+        .iter()
+        .map(|[x, y, z]| {
+            [
+                target_center_x + (*x - source_center_x) * scale_x,
+                target_center_y + (*y - source_center_y) * scale_y,
+                *z,
+            ]
+        })
+        .collect()
+}
+
+fn summarize_layout(layout: &[[f32; 3]]) -> LayoutBounds {
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+
+    for [x, y, _] in layout {
+        min_x = min_x.min(*x);
+        max_x = max_x.max(*x);
+        min_y = min_y.min(*y);
+        max_y = max_y.max(*y);
+    }
+
+    LayoutBounds {
+        height: (max_y - min_y).max(1.0),
+        max_x,
+        max_y,
+        min_x,
+        min_y,
+        width: (max_x - min_x).max(1.0),
+    }
+}
+
+fn get_layout_center2(layout: &[[f32; 3]]) -> [f32; 2] {
+    if layout.is_empty() {
+        return [0.0, 0.0];
+    }
+
+    let mut x = 0.0_f32;
+    let mut y = 0.0_f32;
+    for [node_x, node_y, _] in layout {
+        x += *node_x;
+        y += *node_y;
+    }
+
+    [x / layout.len() as f32, y / layout.len() as f32]
+}
+
+fn get_outline_radius_at(outline_radii: &[f32], angle: f32) -> f32 {
+    let bin_count = outline_radii.len().max(1);
+    let normalized_angle = (angle + std::f32::consts::TAU) % std::f32::consts::TAU;
+    let position = (normalized_angle / std::f32::consts::TAU) * bin_count as f32;
+    let left_index = position.floor() as usize % bin_count;
+    let right_index = (left_index + 1) % bin_count;
+    let progress = position - position.floor();
+
+    outline_radii[left_index] * (1.0 - progress) + outline_radii[right_index] * progress
+}
+
+fn quantile(values: &[f32], ratio: f32) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f32::total_cmp);
+    let index = (((sorted.len() - 1) as f32) * ratio).floor() as usize;
+
+    sorted[index.min(sorted.len() - 1)]
+}
+
+fn circular_index(index: usize, len: usize, delta: i8) -> usize {
+    debug_assert!(len > 0);
+    match delta {
+        -3 => (index + len - (3 % len)) % len,
+        -2 => (index + len - (2 % len)) % len,
+        -1 => (index + len - 1) % len,
+        0 => index % len,
+        1 => (index + 1) % len,
+        2 => (index + 2) % len,
+        3 => (index + 3) % len,
+        _ => unreachable!("outline smoothing only requests neighbors from -3 to 3"),
+    }
+}
+
+fn get_seed_position(id: &str, salt: u64) -> [f32; 2] {
+    let angle = hash_unit(id, salt) * std::f32::consts::TAU;
+    let radius = hash_unit(id, salt + 1).sqrt();
+
+    [
+        angle.cos() * radius * EXPANDED_TOPOLOGY_TARGET_WIDTH * 0.36,
+        angle.sin() * radius * EXPANDED_TOPOLOGY_TARGET_HEIGHT * 0.36,
+    ]
+}
+
+fn get_node_degree(nodes: &[GraphNode], index: usize) -> u32 {
+    nodes.get(index).map_or(1, |node| node.degree.max(1))
+}
+
+fn get_expanded_layout_z(node: &GraphNode) -> f32 {
+    let degree = node.degree.max(1) as f32;
+    if node.kind == NodeKind::Process {
+        26.0 + (degree.ln_1p() * 1.6).clamp(0.0, 14.0)
+    } else {
+        9.0 + (degree.ln_1p() * 1.1).clamp(0.0, 10.0)
+    }
+}
+
+fn layout_flow_index_from_edge(edges: &[GraphEdge], edge_index: usize) -> Option<usize> {
+    edges
+        .get(edge_index)
+        .and_then(|edge| usize::try_from(edge.flow_index).ok())
+}
+
+fn layout_process_index_from_edge(edges: &[GraphEdge], edge_index: usize) -> Option<usize> {
+    edges
+        .get(edge_index)
+        .and_then(|edge| usize::try_from(edge.process_index).ok())
 }
 
 fn hash_unit(value: &str, salt: u64) -> f32 {
@@ -1860,6 +2478,30 @@ mod tests {
         assert_eq!(
             normalize_exchange_direction(None, false),
             ExchangeDirection::Input
+        );
+    }
+
+    #[test]
+    fn expanded_layout_is_finite_and_fitted_to_overview_bounds() {
+        let flows = vec![
+            flow_row("flow-a", "Flow A", "Product flow"),
+            flow_row("flow-b", "Flow B", "Waste flow"),
+            flow_row("elementary", "Elementary", "Elementary flow"),
+        ];
+        let processes = vec![process_row()];
+        let graph = build_graph(&flows, &processes, &test_cli()).expect("graph");
+        let bounds = super::summarize_layout(&graph.expanded_layout);
+
+        assert_eq!(graph.expanded_layout.len(), graph.nodes.len());
+        assert!(bounds.width > 0.0);
+        assert!(bounds.height > 0.0);
+        assert!(bounds.width <= super::EXPANDED_TOPOLOGY_TARGET_WIDTH + 0.01);
+        assert!(bounds.height <= super::EXPANDED_TOPOLOGY_TARGET_HEIGHT + 0.01);
+        assert!(
+            graph
+                .expanded_layout
+                .iter()
+                .all(|position| position.iter().all(|value| value.is_finite()))
         );
     }
 

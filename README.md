@@ -752,7 +752,7 @@ destructive execute 必须显式传 `--execute`。`maintenance_enqueue` 会为 d
 - 生成对象前缀默认 `national-carbon/process-flow-graph/v1`
 - 输出 active `manifest.json`、`builds/{buildId}/manifest.json`、`graph/*.gz`、`layout/*.gz`、`indexes/*.gz`
 - worker 在构建阶段剔除基础流 `Elementary flow`，生成全量非基础 flow / process / exchange edge 图
-- worker 预计算全局 3D 球面与 2D 展开布局坐标，前端按节点定位、高亮、拖拽和缩放渲染
+- worker 预计算全局 3D 球面与 2D 展开布局坐标；`expanded2d` 使用关系优先拓扑布局再按轮廓均匀分布，前端只按坐标定位、高亮、拖拽和缩放渲染
 
 正式执行示例：
 
