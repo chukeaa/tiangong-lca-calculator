@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::pgbouncer_sqlx::{self as sqlx, PgPool, postgres::PgPoolOptions};
+use crate::pgbouncer_sqlx::{Executor, PgPool, postgres::PgPoolOptions};
 
 pub const APP_SOLVER_WORKER: &str = "solver-worker";
 pub const APP_SOLVER_WORKER_QUEUE: &str = "solver-worker-queue";
@@ -124,15 +124,17 @@ impl WorkerDbPoolOptions {
                 let application_name = application_name.clone();
                 let statement_timeout_ms = statement_timeout_ms.clone();
                 Box::pin(async move {
-                    sqlx::query("SELECT set_config('application_name', $1, false)")
-                        .bind(application_name.as_str())
-                        .execute(&mut *conn)
-                        .await?;
+                    let application_name_sql = format!(
+                        "SELECT set_config('application_name', {}, false)",
+                        sql_string_literal(application_name.as_str())
+                    );
+                    conn.execute(application_name_sql.as_str()).await?;
                     if let Some(statement_timeout_ms) = statement_timeout_ms.as_deref() {
-                        sqlx::query("SELECT set_config('statement_timeout', $1, false)")
-                            .bind(statement_timeout_ms)
-                            .execute(&mut *conn)
-                            .await?;
+                        let statement_timeout_sql = format!(
+                            "SELECT set_config('statement_timeout', {}, false)",
+                            sql_string_literal(statement_timeout_ms)
+                        );
+                        conn.execute(statement_timeout_sql.as_str()).await?;
                     }
                     Ok(())
                 })
@@ -159,6 +161,11 @@ pub fn duration_millis_text(duration: Duration) -> String {
     duration.as_millis().to_string()
 }
 
+#[must_use]
+pub fn sql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 fn truncate_to_bytes(value: &str, max_bytes: usize) -> String {
     if value.len() <= max_bytes {
         return value.to_owned();
@@ -178,7 +185,7 @@ fn truncate_to_bytes(value: &str, max_bytes: usize) -> String {
 mod tests {
     use std::time::Duration;
 
-    use super::{duration_millis_text, normalize_application_name};
+    use super::{duration_millis_text, normalize_application_name, sql_string_literal};
 
     #[test]
     fn normalize_application_name_uses_fallback_for_blank_values() {
@@ -202,5 +209,11 @@ mod tests {
     fn duration_millis_text_formats_postgres_statement_timeout_value() {
         assert_eq!(duration_millis_text(Duration::from_secs(900)), "900000");
         assert_eq!(duration_millis_text(Duration::from_millis(250)), "250");
+    }
+
+    #[test]
+    fn sql_string_literal_escapes_quotes_for_raw_after_connect_sql() {
+        assert_eq!(sql_string_literal("solver-worker"), "'solver-worker'");
+        assert_eq!(sql_string_literal("worker 'quoted'"), "'worker ''quoted'''");
     }
 }
