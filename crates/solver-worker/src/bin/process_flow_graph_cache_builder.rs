@@ -11,12 +11,14 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::Write,
+    fs,
+    io::{Read, Write},
+    path::{Path, PathBuf},
 };
 
 use chrono::Utc;
 use clap::Parser;
-use flate2::{Compression, write::GzEncoder};
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -119,6 +121,9 @@ struct Cli {
     /// Optional source row limit per source table for local canary runs.
     #[arg(long)]
     source_row_limit: Option<usize>,
+    /// Optional directory with classification dictionary `*.json.gz` files.
+    #[arg(long, env = "PROCESS_FLOW_GRAPH_CLASSIFICATION_DIR")]
+    classification_dir: Option<PathBuf>,
     /// Execute uploads. Omit for dry-run only.
     #[arg(long)]
     execute: bool,
@@ -136,6 +141,11 @@ struct DatasetRow {
 #[serde(rename_all = "camelCase")]
 struct GraphNode {
     category: String,
+    category_display_path: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    category_path: Vec<CategoryPathItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    category_system: Option<String>,
     cluster_id_level1: String,
     cluster_id_level3: String,
     cluster_label_level1: String,
@@ -154,6 +164,15 @@ struct GraphNode {
     reference_year: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     type_of_data_set: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CategoryPathItem {
+    id: String,
+    level: u32,
+    name: String,
+    zh_name: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -199,6 +218,9 @@ impl ExchangeDirection {
 #[derive(Debug, Clone)]
 struct FlowMetadata {
     category: String,
+    category_display_path: String,
+    category_path: Vec<CategoryPathItem>,
+    category_system: Option<String>,
     cluster_id_level1: String,
     cluster_id_level3: String,
     cluster_label_level1: String,
@@ -213,6 +235,9 @@ struct FlowMetadata {
 #[derive(Debug, Clone)]
 struct ProcessMetadata {
     category: String,
+    category_display_path: String,
+    category_path: Vec<CategoryPathItem>,
+    category_system: Option<String>,
     cluster_id_level1: String,
     cluster_id_level3: String,
     cluster_label_level1: String,
@@ -239,6 +264,470 @@ struct ProcessExchange {
     quantitative_reference: bool,
     resulting_amount: Option<f64>,
     unit: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ClassificationMetadata {
+    category: String,
+    category_display_path: String,
+    category_path: Vec<CategoryPathItem>,
+    category_system: Option<String>,
+}
+
+impl ClassificationMetadata {
+    fn fallback(label: &str) -> Self {
+        let trimmed_label = label.trim();
+        let name = if trimmed_label.is_empty() {
+            "uncategorized"
+        } else {
+            trimmed_label
+        };
+        Self {
+            category: name.to_owned(),
+            category_display_path: name.to_owned(),
+            category_path: vec![CategoryPathItem {
+                id: slug_from_text(name),
+                level: 1,
+                name: name.to_owned(),
+                zh_name: name.to_owned(),
+            }],
+            category_system: None,
+        }
+    }
+
+    fn from_category_path(
+        category_system: Option<String>,
+        category_path: Vec<CategoryPathItem>,
+    ) -> Self {
+        let category = category_path
+            .iter()
+            .map(|item| item.name.clone())
+            .collect::<Vec<_>>()
+            .join(" / ");
+        let category_display_path = category_path
+            .iter()
+            .map(|item| item.zh_name.clone())
+            .collect::<Vec<_>>()
+            .join(" / ");
+
+        Self {
+            category,
+            category_display_path,
+            category_path,
+            category_system,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RawClassification {
+    category_path: Vec<RawClassificationItem>,
+    category_system: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RawClassificationItem {
+    id: Option<String>,
+    level: u32,
+    name: String,
+    zh_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CatalogClassificationPath {
+    category_path: Vec<CategoryPathItem>,
+    category_system: String,
+}
+
+#[derive(Debug, Default)]
+struct ClassificationCatalog {
+    by_leaf_id: BTreeMap<String, CatalogClassificationPath>,
+    by_name_path: BTreeMap<String, CatalogClassificationPath>,
+}
+
+#[derive(Debug, Default)]
+struct ClassificationCatalogBuilder {
+    entries: BTreeMap<String, ClassificationCatalogEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct ClassificationCatalogEntry {
+    category_system: String,
+    data_type: String,
+    ids: Vec<String>,
+    names: Option<Vec<String>>,
+    zh_names: Option<Vec<String>>,
+}
+
+impl ClassificationCatalog {
+    fn load(classification_dir: Option<&Path>) -> anyhow::Result<Self> {
+        let Some(classification_dir) = classification_dir else {
+            return Ok(Self::default());
+        };
+        if !classification_dir.exists() {
+            return Err(anyhow::anyhow!(
+                "classification directory does not exist: {}",
+                classification_dir.display()
+            ));
+        }
+
+        let mut builder = ClassificationCatalogBuilder::default();
+        for entry in fs::read_dir(classification_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !file_name.ends_with(".json.gz") {
+                continue;
+            }
+
+            let Some(category_system) = category_system_from_file_name(file_name) else {
+                continue;
+            };
+            let is_zh = file_name.contains("_zh.");
+            load_classification_catalog_file(&path, category_system, is_zh, &mut builder)?;
+        }
+
+        Ok(builder.finish())
+    }
+
+    fn entry_count(&self) -> usize {
+        self.by_name_path.len()
+    }
+
+    fn resolve(
+        &self,
+        raw: &RawClassification,
+        expected_data_type: &str,
+    ) -> Option<ClassificationMetadata> {
+        let expected_data_type = canonical_data_type(expected_data_type);
+        let category_system = raw
+            .category_system
+            .as_deref()
+            .and_then(canonical_category_system);
+        let leaf_id = raw.category_path.last().and_then(|item| item.id.as_deref());
+        let names = raw
+            .category_path
+            .iter()
+            .map(|item| item.name.clone())
+            .collect::<Vec<_>>();
+        let resolve_name_path = || {
+            if names.is_empty() {
+                return None;
+            }
+            let normalized_path = normalized_category_path(&names);
+            [
+                classification_lookup_key(category_system, &expected_data_type, &normalized_path),
+                classification_lookup_key(None, &expected_data_type, &normalized_path),
+                classification_lookup_key(category_system, "", &normalized_path),
+                classification_lookup_key(None, "", &normalized_path),
+            ]
+            .into_iter()
+            .find_map(|key| {
+                self.by_name_path.get(&key).map(|path| {
+                    ClassificationMetadata::from_category_path(
+                        Some(path.category_system.clone()),
+                        path.category_path.clone(),
+                    )
+                })
+            })
+        };
+
+        if category_system.is_none()
+            && let Some(classification) = resolve_name_path()
+        {
+            return Some(classification);
+        }
+
+        if let Some(leaf_id) = leaf_id {
+            let id_keys = [
+                classification_lookup_key(category_system, &expected_data_type, leaf_id),
+                classification_lookup_key(category_system, "", leaf_id),
+                classification_lookup_key(None, &expected_data_type, leaf_id),
+                classification_lookup_key(None, "", leaf_id),
+            ];
+            for key in id_keys {
+                if let Some(path) = self.by_leaf_id.get(&key) {
+                    return Some(ClassificationMetadata::from_category_path(
+                        Some(path.category_system.clone()),
+                        path.category_path.clone(),
+                    ));
+                }
+            }
+        }
+
+        resolve_name_path()
+    }
+}
+
+impl ClassificationCatalogBuilder {
+    fn add_path(
+        &mut self,
+        category_system: &str,
+        data_type: &str,
+        is_zh: bool,
+        category_path: &[CategoryPathItem],
+    ) {
+        if category_path.is_empty() {
+            return;
+        }
+
+        let ids = category_path
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+        let key = classification_entry_key(category_system, data_type, &ids);
+        let entry = self
+            .entries
+            .entry(key)
+            .or_insert_with(|| ClassificationCatalogEntry {
+                category_system: category_system.to_owned(),
+                data_type: data_type.to_owned(),
+                ids: ids.clone(),
+                names: None,
+                zh_names: None,
+            });
+        let names = category_path
+            .iter()
+            .map(|item| item.name.clone())
+            .collect::<Vec<_>>();
+        if is_zh {
+            entry.zh_names = Some(names);
+        } else {
+            entry.names = Some(names);
+        }
+    }
+
+    fn finish(self) -> ClassificationCatalog {
+        let mut catalog = ClassificationCatalog::default();
+
+        for entry in self.entries.into_values() {
+            let Some(names) = entry.names.as_ref().or(entry.zh_names.as_ref()) else {
+                continue;
+            };
+            let zh_names = entry.zh_names.as_ref().unwrap_or(names);
+            let category_path = entry
+                .ids
+                .iter()
+                .enumerate()
+                .map(|(index, id)| CategoryPathItem {
+                    id: id.clone(),
+                    level: u32::try_from(index + 1).unwrap_or(u32::MAX),
+                    name: names.get(index).cloned().unwrap_or_else(|| id.clone()),
+                    zh_name: zh_names
+                        .get(index)
+                        .or_else(|| names.get(index))
+                        .cloned()
+                        .unwrap_or_else(|| id.clone()),
+                })
+                .collect::<Vec<_>>();
+            let catalog_path = CatalogClassificationPath {
+                category_path,
+                category_system: entry.category_system.clone(),
+            };
+            let Some(leaf_id) = entry.ids.last() else {
+                continue;
+            };
+
+            insert_catalog_path(
+                &mut catalog.by_leaf_id,
+                classification_lookup_key(Some(&entry.category_system), &entry.data_type, leaf_id),
+                catalog_path.clone(),
+            );
+            insert_catalog_path(
+                &mut catalog.by_leaf_id,
+                classification_lookup_key(None, &entry.data_type, leaf_id),
+                catalog_path.clone(),
+            );
+
+            let normalized_path = normalized_category_path(names);
+            insert_catalog_path(
+                &mut catalog.by_name_path,
+                classification_lookup_key(
+                    Some(&entry.category_system),
+                    &entry.data_type,
+                    &normalized_path,
+                ),
+                catalog_path.clone(),
+            );
+            insert_catalog_path(
+                &mut catalog.by_name_path,
+                classification_lookup_key(None, &entry.data_type, &normalized_path),
+                catalog_path,
+            );
+        }
+
+        catalog
+    }
+}
+
+fn load_classification_catalog_file(
+    path: &Path,
+    category_system: &str,
+    is_zh: bool,
+    builder: &mut ClassificationCatalogBuilder,
+) -> anyhow::Result<()> {
+    let file = fs::File::open(path)?;
+    let mut decoder = GzDecoder::new(file);
+    let mut text = String::new();
+    decoder.read_to_string(&mut text)?;
+    let root: Value = serde_json::from_str(&text)?;
+    let Some(category_system_root) = root.get("CategorySystem") else {
+        return Ok(());
+    };
+    let Some(categories) = category_system_root.get("categories") else {
+        return Ok(());
+    };
+
+    for category_group in as_array(categories) {
+        let data_type = category_group
+            .get("@dataType")
+            .and_then(normalize_value)
+            .map_or_else(|| "Flow".to_owned(), |value| canonical_data_type(&value));
+        let Some(category_nodes) = category_group.get("category") else {
+            continue;
+        };
+        for category_node in as_array(category_nodes) {
+            collect_classification_catalog_path(
+                category_node,
+                category_system,
+                &data_type,
+                is_zh,
+                &[],
+                builder,
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_classification_catalog_path(
+    node: &Value,
+    category_system: &str,
+    data_type: &str,
+    is_zh: bool,
+    parent_path: &[CategoryPathItem],
+    builder: &mut ClassificationCatalogBuilder,
+) {
+    let Some(name) = node
+        .get("@name")
+        .and_then(normalize_value)
+        .or_else(|| localized_text(node))
+    else {
+        return;
+    };
+    let id = node
+        .get("@id")
+        .and_then(normalize_value)
+        .unwrap_or_else(|| slug_from_text(&name));
+    let mut category_path = parent_path.to_vec();
+    category_path.push(CategoryPathItem {
+        id,
+        level: u32::try_from(category_path.len() + 1).unwrap_or(u32::MAX),
+        name,
+        zh_name: String::new(),
+    });
+    builder.add_path(category_system, data_type, is_zh, &category_path);
+
+    if let Some(children) = node.get("category") {
+        for child in as_array(children) {
+            collect_classification_catalog_path(
+                child,
+                category_system,
+                data_type,
+                is_zh,
+                &category_path,
+                builder,
+            );
+        }
+    }
+}
+
+fn insert_catalog_path(
+    map: &mut BTreeMap<String, CatalogClassificationPath>,
+    key: String,
+    path: CatalogClassificationPath,
+) {
+    map.entry(key).or_insert(path);
+}
+
+fn category_system_from_file_name(file_name: &str) -> Option<&'static str> {
+    if file_name.starts_with("CPCClassification") {
+        Some("CPC")
+    } else if file_name.starts_with("ISICClassification") {
+        Some("ISIC")
+    } else if file_name.starts_with("ILCD") {
+        Some("ILCD")
+    } else {
+        None
+    }
+}
+
+fn canonical_category_system(value: &str) -> Option<&'static str> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.contains("cpc") {
+        Some("CPC")
+    } else if normalized.contains("isic") {
+        Some("ISIC")
+    } else if normalized.contains("ilcd") {
+        Some("ILCD")
+    } else {
+        None
+    }
+}
+
+fn canonical_data_type(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "flow" | "流" => "Flow".to_owned(),
+        "process" | "过程" | "生命周期模型" => "Process".to_owned(),
+        "lciamethod" | "生命周期影响评估方法" => "LCIAMethod".to_owned(),
+        "flowproperty" | "流属性" => "FlowProperty".to_owned(),
+        "unitgroup" | "单位组" => "UnitGroup".to_owned(),
+        "contact" | "联系信息" => "Contact".to_owned(),
+        "source" | "来源" => "Source".to_owned(),
+        "" => "Unspecified".to_owned(),
+        _ => value.trim().to_owned(),
+    }
+}
+
+fn classification_entry_key(category_system: &str, data_type: &str, ids: &[String]) -> String {
+    format!(
+        "{}\u{1e}{}\u{1e}{}",
+        category_system,
+        data_type,
+        ids.join("\u{1f}")
+    )
+}
+
+fn classification_lookup_key(
+    category_system: Option<&str>,
+    data_type: &str,
+    lookup_value: &str,
+) -> String {
+    format!(
+        "{}\u{1e}{}\u{1e}{}",
+        category_system.unwrap_or(""),
+        data_type,
+        lookup_value
+    )
+}
+
+fn normalized_category_path(parts: &[String]) -> String {
+    parts
+        .iter()
+        .map(|part| normalized_category_lookup_part(part))
+        .collect::<Vec<_>>()
+        .join("\u{1f}")
+}
+
+fn normalized_category_lookup_part(part: &str) -> String {
+    part.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_lowercase()
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -497,7 +986,15 @@ async fn main() -> anyhow::Result<()> {
         process_rows.len()
     );
 
-    let graph = build_graph(&flow_rows, &process_rows, &cli)?;
+    let classification_catalog = ClassificationCatalog::load(cli.classification_dir.as_deref())?;
+    if classification_catalog.entry_count() > 0 {
+        eprintln!(
+            "[process-flow-graph] classification catalog loaded: entries={}",
+            classification_catalog.entry_count()
+        );
+    }
+
+    let graph = build_graph(&flow_rows, &process_rows, &cli, &classification_catalog)?;
     eprintln!(
         "[process-flow-graph] graph built: flows={} processes={} edges={}",
         graph.stats.flow_count, graph.stats.process_count, graph.stats.edge_count
@@ -746,12 +1243,13 @@ fn build_graph(
     flow_rows: &[DatasetRow],
     process_rows: &[DatasetRow],
     cli: &Cli,
+    classification_catalog: &ClassificationCatalog,
 ) -> anyhow::Result<ProcessFlowGraph> {
     let mut flow_by_version = BTreeMap::<String, FlowMetadata>::new();
     let mut latest_flow_by_id = BTreeMap::<String, FlowMetadata>::new();
 
     for row in flow_rows {
-        let Some(flow_meta) = parse_flow_row(row) else {
+        let Some(flow_meta) = parse_flow_row(row, classification_catalog) else {
             continue;
         };
         if cli.limit_flows.is_some_and(|limit| {
@@ -807,7 +1305,7 @@ fn build_graph(
         {
             break;
         }
-        let Some(process_meta) = parse_process_metadata(row) else {
+        let Some(process_meta) = parse_process_metadata(row, classification_catalog) else {
             continue;
         };
         let mut process_index: Option<u32> = None;
@@ -871,6 +1369,9 @@ impl GraphBuilder {
             .map_err(|_| anyhow::anyhow!("node count exceeds u32"))?;
         self.nodes.push(GraphNode {
             category: flow.category.clone(),
+            category_display_path: flow.category_display_path.clone(),
+            category_path: flow.category_path.clone(),
+            category_system: flow.category_system.clone(),
             cluster_id_level1: flow.cluster_id_level1.clone(),
             cluster_id_level3: flow.cluster_id_level3.clone(),
             cluster_label_level1: flow.cluster_label_level1.clone(),
@@ -900,6 +1401,9 @@ impl GraphBuilder {
             .map_err(|_| anyhow::anyhow!("node count exceeds u32"))?;
         self.nodes.push(GraphNode {
             category: process.category.clone(),
+            category_display_path: process.category_display_path.clone(),
+            category_path: process.category_path.clone(),
+            category_system: process.category_system.clone(),
             cluster_id_level1: process.cluster_id_level1.clone(),
             cluster_id_level3: process.cluster_id_level3.clone(),
             cluster_label_level1: process.cluster_label_level1.clone(),
@@ -2923,7 +3427,10 @@ fn process_node_id(process: &ProcessMetadata) -> String {
     format!("process:{}@{}", process.id, process.version)
 }
 
-fn parse_flow_row(row: &DatasetRow) -> Option<FlowMetadata> {
+fn parse_flow_row(
+    row: &DatasetRow,
+    classification_catalog: &ClassificationCatalog,
+) -> Option<FlowMetadata> {
     let root = preferred_json(row);
     let data_set =
         pick_record(root, &["flowDataSet"]).or_else(|| pick_record(root, &["flow_data_set"]))?;
@@ -2948,17 +3455,20 @@ fn parse_flow_row(row: &DatasetRow) -> Option<FlowMetadata> {
         return None;
     }
 
-    let category = data_set_info
-        .and_then(extract_classification)
-        .unwrap_or_else(|| flow_type.clone());
-    let classification = classification_levels(&category);
+    let classification = data_set_info
+        .and_then(|info| extract_classification(info, "Flow", classification_catalog))
+        .unwrap_or_else(|| ClassificationMetadata::fallback(&flow_type));
+    let classification_levels = classification_levels(&classification);
 
     Some(FlowMetadata {
-        category: category.clone(),
-        cluster_id_level1: cluster_id_from_category_level(&classification, 1),
-        cluster_id_level3: cluster_id_from_category_level(&classification, 3),
-        cluster_label_level1: cluster_label_from_category_level(&classification, 1),
-        cluster_label_level3: cluster_label_from_category_level(&classification, 3),
+        category: classification.category.clone(),
+        category_display_path: classification.category_display_path.clone(),
+        category_path: classification.category_path.clone(),
+        category_system: classification.category_system.clone(),
+        cluster_id_level1: cluster_id_from_category_level(&classification_levels, 1),
+        cluster_id_level3: cluster_id_from_category_level(&classification_levels, 3),
+        cluster_label_level1: cluster_label_from_category_level(&classification_levels, 1),
+        cluster_label_level3: cluster_label_from_category_level(&classification_levels, 3),
         flow_type,
         id: row.id.clone(),
         location: None,
@@ -2970,7 +3480,10 @@ fn parse_flow_row(row: &DatasetRow) -> Option<FlowMetadata> {
     })
 }
 
-fn parse_process_metadata(row: &DatasetRow) -> Option<ProcessMetadata> {
+fn parse_process_metadata(
+    row: &DatasetRow,
+    classification_catalog: &ClassificationCatalog,
+) -> Option<ProcessMetadata> {
     let root = preferred_json(row);
     let data_set = pick_record(root, &["processDataSet"])
         .or_else(|| pick_record(root, &["process_data_set"]))?;
@@ -2978,17 +3491,20 @@ fn parse_process_metadata(row: &DatasetRow) -> Option<ProcessMetadata> {
     let data_set_info = process_info.and_then(|info| pick_record(info, &["dataSetInformation"]));
     let reference_flow = process_info
         .and_then(|info| pick_record(info, &["quantitativeReference", "referenceToReferenceFlow"]));
-    let category = data_set_info
-        .and_then(extract_classification)
-        .unwrap_or_else(|| "process".to_owned());
-    let classification = classification_levels(&category);
+    let classification = data_set_info
+        .and_then(|info| extract_classification(info, "Process", classification_catalog))
+        .unwrap_or_else(|| ClassificationMetadata::fallback("process"));
+    let classification_levels = classification_levels(&classification);
 
     Some(ProcessMetadata {
-        category: category.clone(),
-        cluster_id_level1: cluster_id_from_category_level(&classification, 1),
-        cluster_id_level3: cluster_id_from_category_level(&classification, 3),
-        cluster_label_level1: cluster_label_from_category_level(&classification, 1),
-        cluster_label_level3: cluster_label_from_category_level(&classification, 3),
+        category: classification.category.clone(),
+        category_display_path: classification.category_display_path.clone(),
+        category_path: classification.category_path.clone(),
+        category_system: classification.category_system.clone(),
+        cluster_id_level1: cluster_id_from_category_level(&classification_levels, 1),
+        cluster_id_level3: cluster_id_from_category_level(&classification_levels, 3),
+        cluster_label_level1: cluster_label_from_category_level(&classification_levels, 1),
+        cluster_label_level3: cluster_label_from_category_level(&classification_levels, 3),
         id: row.id.clone(),
         location: process_info
             .and_then(|info| {
@@ -3171,24 +3687,155 @@ fn localized_text(value: &Value) -> Option<String> {
         .and_then(normalize_value)
 }
 
-fn extract_classification(info: &Value) -> Option<String> {
+fn localized_text_for_lang(value: &Value, lang: &str) -> Option<String> {
+    if value
+        .get("@xml:lang")
+        .and_then(normalize_value)
+        .is_some_and(|value_lang| value_lang.eq_ignore_ascii_case(lang))
+    {
+        return value
+            .get("#text")
+            .and_then(normalize_value)
+            .or_else(|| normalize_value(value));
+    }
+
+    let items = match value {
+        Value::Array(items) => items.as_slice(),
+        _ => return None,
+    };
+    items
+        .iter()
+        .find(|item| {
+            item.get("@xml:lang")
+                .and_then(normalize_value)
+                .is_some_and(|value_lang| value_lang.eq_ignore_ascii_case(lang))
+        })
+        .and_then(|item| {
+            item.get("#text")
+                .and_then(normalize_value)
+                .or_else(|| normalize_value(item))
+        })
+}
+
+fn extract_classification(
+    info: &Value,
+    expected_data_type: &str,
+    classification_catalog: &ClassificationCatalog,
+) -> Option<ClassificationMetadata> {
+    let raw_classification = extract_raw_classification(info)?;
+    classification_catalog
+        .resolve(&raw_classification, expected_data_type)
+        .or_else(|| {
+            let category_path = raw_classification
+                .category_path
+                .iter()
+                .enumerate()
+                .map(|(index, item)| CategoryPathItem {
+                    id: item
+                        .id
+                        .clone()
+                        .unwrap_or_else(|| slug_from_text(&item.name)),
+                    level: if item.level == 0 {
+                        u32::try_from(index + 1).unwrap_or(u32::MAX)
+                    } else {
+                        item.level
+                    },
+                    name: item.name.clone(),
+                    zh_name: item.zh_name.clone().unwrap_or_else(|| item.name.clone()),
+                })
+                .collect::<Vec<_>>();
+            (!category_path.is_empty()).then(|| {
+                ClassificationMetadata::from_category_path(
+                    raw_classification
+                        .category_system
+                        .as_deref()
+                        .and_then(canonical_category_system)
+                        .map(str::to_owned),
+                    category_path,
+                )
+            })
+        })
+}
+
+fn extract_raw_classification(info: &Value) -> Option<RawClassification> {
     let classification_info = info.get("classificationInformation")?;
-    let classification = pick_value(
-        classification_info,
-        &["common:classification", "common:class"],
-    )
-    .or_else(|| pick_value(classification_info, &["classification", "class"]))
-    .or_else(|| {
-        pick_value(
-            classification_info,
-            &["common:elementaryFlowCategorization", "common:category"],
-        )
-    })?;
-    let labels = as_array(classification)
-        .filter_map(localized_text)
+    let (classification_container, classification_items) =
+        pick_classification_items(classification_info)?;
+    let category_path = as_array(classification_items)
+        .enumerate()
+        .filter_map(|(index, item)| extract_raw_classification_item(item, index))
         .collect::<Vec<_>>();
 
-    (!labels.is_empty()).then(|| labels.join(" / "))
+    (!category_path.is_empty()).then(|| RawClassification {
+        category_path,
+        category_system: extract_classification_system(classification_container),
+    })
+}
+
+fn pick_classification_items(classification_info: &Value) -> Option<(&Value, &Value)> {
+    let classification_container = pick_record(classification_info, &["common:classification"])
+        .or_else(|| pick_record(classification_info, &["classification"]));
+    if let Some(classification_container) = classification_container
+        && let Some(classification_items) = classification_container
+            .get("common:class")
+            .or_else(|| classification_container.get("class"))
+    {
+        return Some((classification_container, classification_items));
+    }
+
+    let elementary_container = pick_record(
+        classification_info,
+        &["common:elementaryFlowCategorization"],
+    )
+    .or_else(|| pick_record(classification_info, &["elementaryFlowCategorization"]));
+    if let Some(elementary_container) = elementary_container
+        && let Some(classification_items) = elementary_container
+            .get("common:category")
+            .or_else(|| elementary_container.get("category"))
+    {
+        return Some((elementary_container, classification_items));
+    }
+
+    None
+}
+
+fn extract_classification_system(classification_container: &Value) -> Option<String> {
+    [
+        "@name",
+        "@classes",
+        "@classificationSystem",
+        "classificationSystem",
+        "common:classificationSystem",
+    ]
+    .into_iter()
+    .find_map(|key| classification_container.get(key).and_then(normalize_value))
+}
+
+fn extract_raw_classification_item(value: &Value, index: usize) -> Option<RawClassificationItem> {
+    let name = localized_text_for_lang(value, "en").or_else(|| localized_text(value))?;
+    let zh_name = localized_text_for_lang(value, "zh");
+    let id = [
+        "@classId",
+        "@id",
+        "@categoryId",
+        "@catId",
+        "@code",
+        "classId",
+        "id",
+    ]
+    .into_iter()
+    .find_map(|key| value.get(key).and_then(normalize_value));
+    let level = ["@level", "level", "@categoryLevel", "categoryLevel"]
+        .into_iter()
+        .find_map(|key| value.get(key).and_then(normalize_u32))
+        .unwrap_or_else(|| u32::try_from(index + 1).unwrap_or(u32::MAX));
+
+    Some(RawClassificationItem {
+        id,
+        level,
+        name,
+        zh_name,
+    })
 }
 
 fn extract_data_set_version(data_set: &Value, fallback: &str) -> String {
@@ -3221,13 +3868,24 @@ fn normalize_exchange_direction(
     }
 }
 
-fn classification_levels(category: &str) -> Vec<String> {
-    let levels = category
-        .split('/')
-        .map(str::trim)
+fn classification_levels(classification: &ClassificationMetadata) -> Vec<String> {
+    let mut levels = classification
+        .category_path
+        .iter()
+        .map(|item| item.name.trim())
         .filter(|part| !part.is_empty())
         .map(str::to_owned)
         .collect::<Vec<_>>();
+
+    if levels.is_empty() {
+        levels = classification
+            .category
+            .split(" / ")
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+    }
 
     if levels.is_empty() {
         vec!["uncategorized".to_owned()]
@@ -3282,16 +3940,21 @@ fn extract_unit_hint(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use flate2::read::GzDecoder;
+    use flate2::{Compression, read::GzDecoder, write::GzEncoder};
     use serde_json::json;
-    use std::collections::BTreeSet;
-    use std::io::Read;
+    use std::{
+        collections::BTreeSet,
+        fs,
+        io::{Read, Write},
+        path::Path,
+    };
 
     use super::DatasetRow;
     use super::{
-        CHINA_REGION_SHAPES, Cli, ExchangeDirection, GEO_LOCATION_RULE_VERSION, GeoMapScope,
-        WORLD_REGION_SHAPES, build_graph, cluster_payload, encoded_gzip_json,
-        find_geo_region_shape, normalize_exchange_direction, resolve_china_province_code,
+        CHINA_REGION_SHAPES, CategoryPathItem, ClassificationCatalog, ClassificationCatalogBuilder,
+        Cli, ExchangeDirection, GEO_LOCATION_RULE_VERSION, GeoMapScope, WORLD_REGION_SHAPES,
+        build_graph, cluster_payload, encoded_gzip_json, find_geo_region_shape,
+        normalize_exchange_direction, parse_flow_row, resolve_china_province_code,
         resolve_world_region_key,
     };
 
@@ -3315,6 +3978,7 @@ mod tests {
             max_edges: None,
             page_size: 500,
             source_row_limit: None,
+            classification_dir: None,
             execute: false,
         }
     }
@@ -3358,6 +4022,66 @@ mod tests {
             }
         });
         row
+    }
+
+    fn test_classification_catalog() -> ClassificationCatalog {
+        let mut builder = ClassificationCatalogBuilder::default();
+        let english_path = vec![
+            CategoryPathItem {
+                id: "0".to_owned(),
+                level: 1,
+                name: "Ores and minerals".to_owned(),
+                zh_name: String::new(),
+            },
+            CategoryPathItem {
+                id: "04".to_owned(),
+                level: 2,
+                name: "Stone, sand and clay".to_owned(),
+                zh_name: String::new(),
+            },
+            CategoryPathItem {
+                id: "041".to_owned(),
+                level: 3,
+                name: "Limestone".to_owned(),
+                zh_name: String::new(),
+            },
+        ];
+        let chinese_path = vec![
+            CategoryPathItem {
+                id: "0".to_owned(),
+                level: 1,
+                name: "矿石与矿物".to_owned(),
+                zh_name: String::new(),
+            },
+            CategoryPathItem {
+                id: "04".to_owned(),
+                level: 2,
+                name: "石料、砂和黏土".to_owned(),
+                zh_name: String::new(),
+            },
+            CategoryPathItem {
+                id: "041".to_owned(),
+                level: 3,
+                name: "石灰石".to_owned(),
+                zh_name: String::new(),
+            },
+        ];
+        builder.add_path("CPC", "Flow", false, &english_path);
+        builder.add_path("CPC", "Flow", true, &chinese_path);
+        builder.finish()
+    }
+
+    fn write_gzip_json(path: &Path, value: &serde_json::Value) {
+        let file = fs::File::create(path).expect("create gz json");
+        let mut encoder = GzEncoder::new(file, Compression::default());
+        encoder
+            .write_all(
+                serde_json::to_string(value)
+                    .expect("serialize json")
+                    .as_bytes(),
+            )
+            .expect("write gz json");
+        encoder.finish().expect("finish gz json");
     }
 
     fn process_row() -> DatasetRow {
@@ -3481,7 +4205,13 @@ mod tests {
             flow_row("elementary", "Elementary", "Elementary flow"),
         ];
         let processes = vec![process_row()];
-        let graph = build_graph(&flows, &processes, &test_cli()).expect("graph");
+        let graph = build_graph(
+            &flows,
+            &processes,
+            &test_cli(),
+            &ClassificationCatalog::default(),
+        )
+        .expect("graph");
 
         assert_eq!(graph.stats.process_count, 1);
         assert_eq!(graph.stats.edge_count, 2);
@@ -3526,7 +4256,13 @@ mod tests {
             "flow-a",
             "Input",
         )];
-        let graph = build_graph(&flows, &processes, &test_cli()).expect("graph");
+        let graph = build_graph(
+            &flows,
+            &processes,
+            &test_cli(),
+            &ClassificationCatalog::default(),
+        )
+        .expect("graph");
         let flow_node = graph
             .nodes
             .iter()
@@ -3548,13 +4284,150 @@ mod tests {
     }
 
     #[test]
+    fn structured_category_path_preserves_slashes_inside_names() {
+        let flows = vec![flow_row_with_category(
+            "flow-a",
+            "Flow A",
+            "Product flow",
+            &["Agriculture", "Swine / pigs", "Swine / pigs"],
+        )];
+        let processes = vec![process_row_for_flow(
+            "process-a",
+            "CN-GD",
+            "flow-a",
+            "Input",
+        )];
+        let graph = build_graph(
+            &flows,
+            &processes,
+            &test_cli(),
+            &ClassificationCatalog::default(),
+        )
+        .expect("graph");
+        let flow_node = graph
+            .nodes
+            .iter()
+            .find(|node| node.id == "flow:flow-a@01.00.000")
+            .expect("flow node");
+
+        assert_eq!(
+            flow_node
+                .category_path
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Agriculture", "Swine / pigs", "Swine / pigs"]
+        );
+        assert_eq!(flow_node.category_path.len(), 3);
+        assert_eq!(
+            flow_node.cluster_label_level3,
+            "Agriculture / Swine / pigs / Swine / pigs"
+        );
+    }
+
+    #[test]
+    fn classification_catalog_localizes_actual_node_paths() {
+        let catalog = test_classification_catalog();
+        let row = flow_row_with_category(
+            "flow-a",
+            "Flow A",
+            "Product flow",
+            &["Ores and minerals", "Stone, sand and clay", "Limestone"],
+        );
+        let flow = parse_flow_row(&row, &catalog).expect("flow");
+
+        assert_eq!(flow.category_system.as_deref(), Some("CPC"));
+        assert_eq!(
+            flow.category,
+            "Ores and minerals / Stone, sand and clay / Limestone"
+        );
+        assert_eq!(
+            flow.category_display_path,
+            "矿石与矿物 / 石料、砂和黏土 / 石灰石"
+        );
+        assert_eq!(
+            flow.category_path
+                .iter()
+                .map(|item| item.zh_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["矿石与矿物", "石料、砂和黏土", "石灰石"]
+        );
+    }
+
+    #[test]
+    fn classification_catalog_loads_gzip_dictionary_files() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "process-flow-classification-catalog-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).expect("temp dir");
+        write_gzip_json(
+            &temp_dir.join("CPCClassification.min.json.gz"),
+            &json!({
+                "CategorySystem": {
+                    "categories": {
+                        "@dataType": "Flow",
+                        "category": [{
+                            "@id": "0",
+                            "@name": "Ores and minerals",
+                            "category": [{
+                                "@id": "04",
+                                "@name": "Stone, sand and clay"
+                            }]
+                        }]
+                    }
+                }
+            }),
+        );
+        write_gzip_json(
+            &temp_dir.join("CPCClassification_zh.min.json.gz"),
+            &json!({
+                "CategorySystem": {
+                    "categories": {
+                        "@dataType": "Flow",
+                        "category": [{
+                            "@id": "0",
+                            "@name": "矿石与矿物",
+                            "category": [{
+                                "@id": "04",
+                                "@name": "石料、砂和黏土"
+                            }]
+                        }]
+                    }
+                }
+            }),
+        );
+
+        let catalog = ClassificationCatalog::load(Some(&temp_dir)).expect("catalog");
+        let row = flow_row_with_category(
+            "flow-a",
+            "Flow A",
+            "Product flow",
+            &["Ores and minerals", "Stone, sand and clay"],
+        );
+        let flow = parse_flow_row(&row, &catalog).expect("flow");
+
+        assert_eq!(flow.category_system.as_deref(), Some("CPC"));
+        assert_eq!(flow.category_display_path, "矿石与矿物 / 石料、砂和黏土");
+
+        fs::remove_dir_all(&temp_dir).expect("cleanup temp dir");
+    }
+
+    #[test]
     fn geo_map_cache_builds_china_scope_with_process_links() {
         let flows = vec![flow_row("flow-a", "Flow A", "Product flow")];
         let processes = vec![
             process_row_for_flow("provider", "CN-GD", "flow-a", "Output"),
             process_row_for_flow("consumer", "CN-GD", "flow-a", "Input"),
         ];
-        let graph = build_graph(&flows, &processes, &test_cli()).expect("graph");
+        let graph = build_graph(
+            &flows,
+            &processes,
+            &test_cli(),
+            &ClassificationCatalog::default(),
+        )
+        .expect("graph");
         let china = graph
             .geo_maps
             .iter()
@@ -3635,7 +4508,13 @@ mod tests {
             process_row_for_flow("null-location", "NULL", "flow-a", "Output"),
             process_row_for_flow("unknown", "ZZ", "flow-a", "Output"),
         ];
-        let graph = build_graph(&flows, &processes, &test_cli()).expect("graph");
+        let graph = build_graph(
+            &flows,
+            &processes,
+            &test_cli(),
+            &ClassificationCatalog::default(),
+        )
+        .expect("graph");
         let world = graph
             .geo_maps
             .iter()
@@ -3696,7 +4575,13 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let graph = build_graph(&flows, &processes, &test_cli()).expect("graph");
+        let graph = build_graph(
+            &flows,
+            &processes,
+            &test_cli(),
+            &ClassificationCatalog::default(),
+        )
+        .expect("graph");
         let china = graph
             .geo_maps
             .iter()
@@ -3742,7 +4627,13 @@ mod tests {
             flow_row("elementary", "Elementary", "Elementary flow"),
         ];
         let processes = vec![process_row()];
-        let graph = build_graph(&flows, &processes, &test_cli()).expect("graph");
+        let graph = build_graph(
+            &flows,
+            &processes,
+            &test_cli(),
+            &ClassificationCatalog::default(),
+        )
+        .expect("graph");
         let bounds = super::summarize_layout(&graph.expanded_layout);
 
         assert_eq!(graph.expanded_layout.len(), graph.nodes.len());
