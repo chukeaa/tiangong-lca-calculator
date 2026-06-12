@@ -32,8 +32,8 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-06-04
-lastReviewedCommit: d49e96f7c6fdf6c2d83531bebe68236a5d9919c1
+lastReviewedAt: 2026-06-08
+lastReviewedCommit: b3ea058f0cda4824c65976aac7a64d005028039d
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -117,8 +117,9 @@ The modeling basis for implicit regional supply mix, exchange-location supply-re
 - `lca.snapshot_gc`
 - `lca.result_gc`
 - `tidas.package_artifact_gc`
+- `national_carbon.process_flow_graph_cache_build`
 
-The maintenance worker is intentionally a thin orchestrator over the existing `snapshot_gc`, `result_gc`, and `package_gc` binaries. Those binaries keep their deletion safety rules, object-first metadata updates, active snapshot/package protections, and PostgreSQL advisory locks. The `worker_jobs` layer records dry-run/execute intent, phase/heartbeat, exit status, stdout/stderr tails, parsed `[summary]` metrics, and an operator-only `maintenance_gc_report` artifact metadata row for operator visibility.
+The maintenance worker is intentionally a thin orchestrator over the existing `snapshot_gc`, `result_gc`, `package_gc`, and `process_flow_graph_cache_builder` binaries. Those binaries keep their own safety rules, object-first behavior, active snapshot/package protections, cache-prefix contracts, and PostgreSQL advisory locks where applicable. The process-flow graph builder emits the national-carbon global non-elementary process/flow graph, binary adjacency/edge payloads, worker-computed layouts, geo-map views, and browser lookup indexes; its `expanded2d` layout is grouped by level-3 classification before being fitted to a relation-first topology and uniform overview silhouette so the frontend does not derive layout coordinates at runtime. Cache v2 nodes and metadata expose separate level-1 and level-3 cluster ids/labels, while geo-map views include worker-derived process links, scoped graph indexes, and world/china projected layouts. The `worker_jobs` layer records dry-run/execute intent, phase/heartbeat, exit status, stdout/stderr tails, parsed `[summary]` metrics, and an operator-only `maintenance_gc_report` artifact metadata row for operator visibility.
 
 ### Package worker
 

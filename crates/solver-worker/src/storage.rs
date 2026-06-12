@@ -197,6 +197,16 @@ impl ObjectStoreClient {
             .map(|result| result.object_url)
     }
 
+    /// Uploads bytes to an explicit bucket-relative object key.
+    pub async fn upload_object_key(
+        &self,
+        key: &str,
+        content_type: &str,
+        bytes: Vec<u8>,
+    ) -> anyhow::Result<ObjectUploadResult> {
+        self.upload_object(key, content_type, bytes, None).await
+    }
+
     /// Uploads one package artifact from a local file and returns upload metadata.
     pub async fn upload_package_artifact_file(
         &self,
