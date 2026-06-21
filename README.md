@@ -254,9 +254,11 @@ psql "$CONN" -v ON_ERROR_STOP=1 -f supabase/migrations/20260309042000_lca_latest
 
 - `split_by_process_volume`
 - 单 provider case 仍然直接按唯一 provider 写入 `A`
-- multi-provider case 先按 local-first geography tier 选择最优非空 provider 层级，再在该层级内按 process annual volume 归一化分配
+- multi-provider case 如果存在同 `model_id` provider 子集，会先收窄到同 model 子集
+- 然后按 supply-region anchor 和 geography tier 选择最优非空 provider 层级，再在该层级内按 process annual volume 归一化分配
 - annual volume 缺失、非法或非正时，该 provider 的 raw weight 使用 `1.0`
 - 如需强制唯一 provider 模式，可显式传 `--provider-rule strict_unique_provider`
+- 当前 provider-link runtime contract 见 `docs/provider-linking.md`
 
 ### 4.1.1 导出 provider link 问题 process 诊断 Excel
 

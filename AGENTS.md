@@ -25,6 +25,7 @@ checkPaths:
   - docs/review-submit-fast-gate-contract.md
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
+  - docs/provider-linking.md
   - docs/implicit-regional-supply-mix-modeling.md
   - docs/implicit-regional-supply-mix-modeling.en.md
   - docs/tidas-package-contract.md
@@ -73,6 +74,7 @@ Start here when the task may change what the compute stack does.
 | `docs/review-submit-fast-gate-contract.md` | worker-owned review-submit fast gate schema, passed/blocked semantics, blocker codes, policy defaults, targeted probe contract, and DB runner result-recorder behavior | Edge HTTP API, persistence schema, or Next submit-review UX |
 | `docs/edge-function-integration.md` | edge-facing enqueue, polling, and service-role integration contract | solver internals or frontend UX rules |
 | `docs/frontend-integration.md` | frontend-facing solve/result interaction contract | edge auth implementation or solver internals |
+| `docs/provider-linking.md` | current provider-link runtime decision order, default provider rule, candidate eligibility, and diagnostics contract | modeling rationale for regional supply mix |
 | `docs/implicit-regional-supply-mix-modeling.md` / `docs/implicit-regional-supply-mix-modeling.en.md` | Chinese and English modeling basis for implicit regional supply mix, exchange-location supply-region anchors, and annual-volume provider share semantics | implementation checklist or consumer API contract |
 | `docs/tidas-package-contract.md` | package-worker async import/export contract | generic solver runtime or branch policy truth |
 
@@ -89,6 +91,7 @@ Read in this order:
    - `docs/review-submit-fast-gate-contract.md`
    - `docs/edge-function-integration.md`
    - `docs/frontend-integration.md`
+   - `docs/provider-linking.md`
    - `docs/implicit-regional-supply-mix-modeling.md`
    - `docs/implicit-regional-supply-mix-modeling.en.md`
    - `docs/tidas-package-contract.md`
@@ -131,7 +134,7 @@ At a human-readable level, this repo owns:
 - `Cargo.toml`, `Makefile`, and `crates/**` for solver topology, sparse-runtime behavior, queue workers, snapshot builder flows, and package workers
 - `scripts/**` and `tools/bw25-validator/**` for manual validation, parity, debug, snapshot, and diagnostics helpers
 - `supabase/migrations/**` for runtime SQL expectations still referenced by the worker runtime
-- `README.md`, `docs/agents/**`, `docs/lca-api-contract.md`, `docs/matrix-readiness-report-contract.md`, `docs/review-submit-fast-gate-contract.md`, `docs/edge-function-integration.md`, `docs/frontend-integration.md`, `docs/implicit-regional-supply-mix-modeling.md`, `docs/implicit-regional-supply-mix-modeling.en.md`, `docs/tidas-package-contract.md`, and repo-local governed docs
+- `README.md`, `docs/agents/**`, `docs/lca-api-contract.md`, `docs/matrix-readiness-report-contract.md`, `docs/review-submit-fast-gate-contract.md`, `docs/edge-function-integration.md`, `docs/frontend-integration.md`, `docs/provider-linking.md`, `docs/implicit-regional-supply-mix-modeling.md`, `docs/implicit-regional-supply-mix-modeling.en.md`, `docs/tidas-package-contract.md`, and repo-local governed docs
 
 This repo does not own:
 
@@ -173,6 +176,7 @@ Route those tasks to:
 - if review-submit fast gate schema, blocker codes, policy defaults, targeted probe semantics, or DB runner result-recorder behavior changes, update `docs/review-submit-fast-gate-contract.md`
 - if edge-facing enqueue, polling, or service-role integration guidance changes, update `docs/edge-function-integration.md`
 - if frontend-facing solve/result interaction guidance changes, update `docs/frontend-integration.md`
+- if provider-link runtime decision order, default provider rule, candidate eligibility, or provider diagnostics change, update `docs/provider-linking.md`
 - if implicit regional supply mix theory, exchange-location supply-region semantics, or annual-volume provider share semantics change, update both `docs/implicit-regional-supply-mix-modeling.md` and `docs/implicit-regional-supply-mix-modeling.en.md`
 - if package-worker import/export contract changes, update `docs/tidas-package-contract.md`
 - if landing context or operator setup changes, update `README.md`

@@ -17,17 +17,19 @@ whenToUpdate:
   - when annual supply or production volume parsing semantics change
   - when calculator starts materializing explicit market processes instead of implicit direct links
 checkPaths:
+  - docs/provider-linking.md
   - docs/implicit-regional-supply-mix-modeling.md
   - docs/implicit-regional-supply-mix-modeling.en.md
   - crates/solver-worker/src/bin/snapshot_builder.rs
   - crates/solver-worker/src/compiled_graph.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
-lastReviewedAt: 2026-06-10
-lastReviewedCommit: 4546fb8fff034c84cd1b699cb049345b70eabe16
+lastReviewedAt: 2026-06-21
+lastReviewedCommit: 661b626c87e312ebb7f42f71b48f1bc25710223f
 related:
   - AGENTS.md
   - docs/agents/repo-architecture.md
   - docs/agents/repo-validation.md
+  - docs/provider-linking.md
   - docs/lca-api-contract.md
   - docs/implicit-regional-supply-mix-modeling.en.md
 ---
@@ -40,6 +42,7 @@ Implicit Regional Supply Mix Modeling 是 calculator 在 provider linking 阶段
 
 ```text
 product input demand
+  -> model-consistent provider scope
   -> supply-region anchor
   -> geography tier
   -> provider set
@@ -64,7 +67,17 @@ product input demand
 
 在这个范围内，`annualSupplyOrProductionVolume` 可以作为 provider 间相对供应规模的结构化信号。它表达的是 share weight，不是额外的技术投入。
 
-### 2. input exchange 可以显式声明供应区域
+### 2. 同一 model 内的 provider 表示模型已显式给出内部供应关系
+
+`model_id` 表示一组 process 属于同一个 lifecycle model 或同一次数据建模上下文。处在同一 model 内的 consumer 与 provider 通常共享更一致的系统边界、数据来源、建模假设、技术口径和版本语境。
+
+更直白地说：当 consumer process 的 input exchange 需求某个 product/reference flow，且同一 model 内另一个 process 的 quantitative reference output 正是这个 flow 时，数据作者已经在同一个 model 里同时放置了需求侧和供给侧。calculator 将这种结构解释为该 model 对内部供应关系的显式声明：这个 input demand 在模型边界内已有指定的供应来源候选。
+
+这个优先级不是地理距离、市场份额或真实交易关系的直接证据，也不是说 input exchange 在数据结构上明文指向了某一个 provider process。它表达的是 product-flow 层面的 in-model supply relationship：在同一个产品系统或数据包内部，供给侧 process 已经被显式建模出来，因此应优先保持这条内部技术链条闭合，减少跨模型拼接带来的系统边界漂移。
+
+如果同一 model 内没有可用 provider，则 calculator 回到 regional supply mix 假定：在更宽的 provider universe 中，根据 supply-region anchor、geography tier 和 annual volume 构造代表性供应组合。这样可以在保留模型内部闭合优先级的同时，避免因 model metadata 不完整而把本可链接的 input demand 误判为 no-provider。
+
+### 3. input exchange 可以显式声明供应区域
 
 `processDataSet.exchanges.exchange[].location` 在 product input exchange 上表示 supply-region anchor。它说明该 input demand 希望从哪个地理区域的供应组合中取得。
 
@@ -84,7 +97,7 @@ exchange.location = "GLO"
 
 该字段是普通 location string，推荐使用 TIDAS/ILCD location category code，例如 `CN`、`CN-BJ`、`RER`、`GLO`。它不是 localized text，也不是 exchange amount、单位或 LCIA 地理语义。
 
-### 3. 未显式声明供应区域时使用 local-first 默认假定
+### 4. 未显式声明供应区域时使用 local-first 默认假定
 
 如果 input exchange 没有提供可用的 `location`，calculator 使用 consumer process 的 `locationOfOperationSupplyOrProduction` 作为默认 supply-region anchor。
 
@@ -100,7 +113,7 @@ other
 
 这表示供应链默认优先来自 consumer 所在地；如果本地没有可用 provider，再逐级扩大到全国、区域或 global provider。
 
-### 4. geography tier selection 先于 volume weighting
+### 5. geography tier selection 先于 volume weighting
 
 calculator 先选择 geography tier，再在该 tier 内按 annual volume 计算 provider share。
 
@@ -113,7 +126,7 @@ same product/reference flow
 same selected geography tier
 ```
 
-### 5. annual volume 决定 provider share，不决定 demand amount
+### 6. annual volume 决定 provider share，不决定 demand amount
 
 exchange amount 表示 consumer process 每 reference unit 对某个 product input 的技术需求量。annual supply / production volume 表示 provider process 的年供应或年产出规模。
 
@@ -136,7 +149,15 @@ calculator 对每条 product input exchange 执行以下 link 决策。
 
 如果没有可用 reference-output provider，calculator 不应构造虚拟 provider，也不应回退到任意非 reference output。该 exchange 应进入 provider-link diagnostics，由数据修复、补充 provider，或显式 market/co-product process 建模解决。
 
-### Step 2: 确定 supply-region anchor
+### Step 2: 确定 model-consistent provider scope
+
+在同一 product/reference flow 的 reference-output providers 中，calculator 先判断是否存在与 consumer 同 `model_id` 的 provider。
+
+如果存在，同 model providers 构成后续 regional supply mix 选择的 provider scope。这个 scope 表示当前 lifecycle model 已经显式给出该 input demand 的内部供应来源候选。
+
+如果不存在，则 provider scope 保持为全部 eligible providers，后续由 regional supply mix 规则选择供应区域和 provider shares。
+
+### Step 3: 确定 supply-region anchor
 
 supply-region anchor 的优先级是：
 
@@ -150,7 +171,7 @@ unspecified
 
 重要的是，`exchange.location` 一旦有效，就不应被 consumer process location 覆盖。consumer location 只提供默认供应区域。
 
-### Step 3: 选择 geography tier
+### Step 4: 选择 geography tier
 
 给定 supply-region anchor `g_jf` 后，calculator 在候选 providers 中选择最合适的 geography tier。
 
@@ -168,13 +189,13 @@ other
 
 calculator 选择第一个非空 tier。
 
-### Step 4: 在已选 tier 内计算 provider shares
+### Step 5: 在已选 tier 内计算 provider shares
 
 在已选 geography tier 内，对同一 product/reference flow 的 providers 使用 annual volume 计算 raw weight 与 normalized share。
 
 这一步只发生在已选 tier 内，不跨 tier 比较 annual volume。
 
-### Step 5: 写入 technosphere matrix
+### Step 6: 写入 technosphere matrix
 
 将 consumer 的 input demand 按 provider shares 拆分，写入 `A[p_i, j]`。写入后，同一 input demand 的总量必须保持不变。
 
@@ -193,7 +214,7 @@ g_jf = exchange.location, if present and usable
 g_jf = consumer process location, otherwise
 ```
 
-在 `g_jf` 对应的 geography tier 选择后，provider 集合为：
+在应用 reference-output eligibility、可用 same-model scope 和 `g_jf` 对应的 geography tier 选择后，provider 集合为：
 
 ```text
 P_{f,g} = { p_1, p_2, ..., p_n }

@@ -16,6 +16,7 @@ whenToUpdate:
   - 当 snapshot_builder 暴露 matrix-readiness artifact 的方式变化时
 checkPaths:
   - docs/matrix-readiness-report-contract.md
+  - docs/provider-linking.md
   - crates/solver-worker/src/readiness.rs
   - crates/solver-worker/src/bin/matrix_readiness.rs
   - crates/solver-worker/src/bin/snapshot_builder.rs
@@ -28,6 +29,7 @@ lastReviewedCommit: 4546fb8fff034c84cd1b699cb049345b70eabe16
 related:
   - AGENTS.md
   - .docpact/config.yaml
+  - docs/provider-linking.md
   - docs/lca-api-contract.md
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
@@ -43,6 +45,8 @@ related:
 - fresh `snapshot_builder` run 在 `report_dir` 下写出的 `matrix-readiness-<snapshot_id>.json`
 
 Edge、Foundry、CLI 或其他调用方可以消费 report 字段，但不应在外部复制 calculator 的 provider resolution、singular-risk、LCIA 或 UMFPACK readiness 判断逻辑。
+
+Provider-link 的运行时决策顺序由 `docs/provider-linking.md` 维护。本文档只定义 matrix-readiness 如何消费 snapshot coverage、compiled graph 和 provider decisions；provider rule 顺序变化本身不改变 report schema，除非新增或删除 report 字段、blocker、finding 或 policy。
 
 ## 输入
 

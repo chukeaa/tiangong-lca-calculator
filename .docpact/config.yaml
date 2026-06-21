@@ -32,6 +32,7 @@ ownership:
           - docs/review-submit-fast-gate-contract.md
           - docs/edge-function-integration.md
           - docs/frontend-integration.md
+          - docs/provider-linking.md
           - docs/implicit-regional-supply-mix-modeling.md
           - docs/implicit-regional-supply-mix-modeling.en.md
           - docs/tidas-package-contract.md
@@ -83,6 +84,7 @@ coverage:
     - docs/review-submit-fast-gate-contract.md
     - docs/edge-function-integration.md
     - docs/frontend-integration.md
+    - docs/provider-linking.md
     - docs/implicit-regional-supply-mix-modeling.md
     - docs/implicit-regional-supply-mix-modeling.en.md
     - docs/tidas-package-contract.md
@@ -149,6 +151,7 @@ routing:
         - scripts/export_provider_link_diagnostics.sh
         - scripts/export_unmatched_no_provider_diagnostics.sh
         - docs/agents/repo-architecture.md
+        - docs/provider-linking.md
         - docs/implicit-regional-supply-mix-modeling.md
         - docs/implicit-regional-supply-mix-modeling.en.md
     package-worker:
@@ -195,6 +198,7 @@ routing:
         - docs/review-submit-fast-gate-contract.md
         - docs/edge-function-integration.md
         - docs/frontend-integration.md
+        - docs/provider-linking.md
         - docs/implicit-regional-supply-mix-modeling.md
         - docs/implicit-regional-supply-mix-modeling.en.md
         - docs/tidas-package-contract.md
@@ -214,6 +218,7 @@ docInventory:
     - docs/review-submit-fast-gate-contract.md
     - docs/edge-function-integration.md
     - docs/frontend-integration.md
+    - docs/provider-linking.md
     - docs/implicit-regional-supply-mix-modeling.md
     - docs/implicit-regional-supply-mix-modeling.en.md
     - docs/tidas-package-contract.md
@@ -293,6 +298,8 @@ rules:
         kind: theory-doc
       - path: docs/implicit-regional-supply-mix-modeling.en.md
         kind: theory-doc
+      - path: docs/provider-linking.md
+        kind: runtime-contract
       - path: crates/solver-worker/src/bin/snapshot_builder.rs
         kind: runtime-code
       - path: crates/solver-worker/src/compiled_graph.rs
@@ -306,11 +313,13 @@ rules:
         mode: review_or_update
       - path: docs/agents/repo-validation.md
         mode: review_or_update
+      - path: docs/provider-linking.md
+        mode: review_or_update
       - path: docs/implicit-regional-supply-mix-modeling.md
         mode: review_or_update
       - path: docs/implicit-regional-supply-mix-modeling.en.md
         mode: review_or_update
-    reason: Provider allocation code and implicit regional supply mix theory must stay aligned when annual-volume weighting semantics change.
+    reason: Provider-link runtime behavior, provider allocation code, and implicit regional supply mix theory must stay aligned when candidate filtering or annual-volume weighting semantics change.
   - id: worker-debug-and-tooling-contract
     scope: repo
     repo: worker

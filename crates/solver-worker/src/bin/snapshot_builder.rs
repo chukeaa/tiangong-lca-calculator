@@ -3315,8 +3315,10 @@ fn split_by_process_volume(
     process_meta: &[ProcessMeta],
 ) -> anyhow::Result<MultiProviderResolution> {
     let supply_region_anchor = supply_region_anchor_for_exchange(exchange, process_meta)?;
+    let providers =
+        same_model_preferred_provider_indices(exchange.process_idx, providers, process_meta)?;
     let mut tiered_providers = Vec::<(i32, CompiledProviderGeographyTier)>::new();
-    for provider_idx in providers {
+    for provider_idx in &providers {
         let provider = process_meta_for_idx(process_meta, *provider_idx)
             .ok_or_else(|| anyhow::anyhow!("missing provider process meta idx={provider_idx}"))?;
         tiered_providers.push((
@@ -3380,6 +3382,33 @@ fn provider_volume_raw_weight(provider: &ProcessMeta) -> (f64, bool) {
     }
 }
 
+fn same_model_preferred_provider_indices(
+    consumer_idx: i32,
+    providers: &[i32],
+    process_meta: &[ProcessMeta],
+) -> anyhow::Result<Vec<i32>> {
+    let consumer = process_meta_for_idx(process_meta, consumer_idx)
+        .ok_or_else(|| anyhow::anyhow!("missing consumer process meta idx={consumer_idx}"))?;
+    let Some(consumer_model_id) = consumer.model_id else {
+        return Ok(providers.to_vec());
+    };
+
+    let mut same_model = Vec::<i32>::new();
+    for provider_idx in providers {
+        let provider = process_meta_for_idx(process_meta, *provider_idx)
+            .ok_or_else(|| anyhow::anyhow!("missing provider process meta idx={provider_idx}"))?;
+        if provider.model_id == Some(consumer_model_id) {
+            same_model.push(*provider_idx);
+        }
+    }
+
+    if same_model.is_empty() {
+        Ok(providers.to_vec())
+    } else {
+        Ok(same_model)
+    }
+}
+
 fn score_provider_candidates(
     consumer_idx: i32,
     exchange_location: Option<&str>,
@@ -3390,19 +3419,8 @@ fn score_provider_candidates(
         .ok_or_else(|| anyhow::anyhow!("missing consumer process meta idx={consumer_idx}"))?;
     let supply_region_anchor =
         resolve_supply_region_anchor(exchange_location, consumer.location.as_deref());
-    let mut candidate_indices = Vec::<i32>::new();
-    if let Some(consumer_model_id) = consumer.model_id {
-        for provider_idx in providers {
-            if process_meta_for_idx(process_meta, *provider_idx)
-                .is_some_and(|provider| provider.model_id == Some(consumer_model_id))
-            {
-                candidate_indices.push(*provider_idx);
-            }
-        }
-    }
-    if candidate_indices.is_empty() {
-        candidate_indices.extend_from_slice(providers);
-    }
+    let candidate_indices =
+        same_model_preferred_provider_indices(consumer_idx, providers, process_meta)?;
 
     let mut scored = Vec::with_capacity(providers.len());
     for provider_idx in &candidate_indices {
@@ -6615,6 +6633,17 @@ mod tests {
         }
     }
 
+    fn test_process_meta_with_model(
+        process_idx: i32,
+        model_id: Option<Uuid>,
+        location: Option<&str>,
+        annual_volume: Option<f64>,
+    ) -> ProcessMeta {
+        let mut meta = test_process_meta(process_idx, location, annual_volume);
+        meta.model_id = model_id;
+        meta
+    }
+
     #[test]
     fn annual_supply_or_production_volume_parses_string_multilang_shapes() {
         let object_process = process_json_with_metadata(
@@ -6798,6 +6827,44 @@ mod tests {
             amount: Some(1.0),
             allocation_state: AllocationFractionState::Present,
             location: Some("GLO".to_owned()),
+        };
+
+        let resolution = resolve_multi_provider(
+            ProviderRule::SplitByProcessVolume,
+            &exchange,
+            &[1, 2],
+            &process_meta,
+        )
+        .expect("resolve");
+        let MultiProviderDecision::Resolved(resolution) = resolution else {
+            panic!("expected resolved decision");
+        };
+
+        assert_eq!(
+            resolution.geography_tier,
+            Some(CompiledProviderGeographyTier::Global)
+        );
+        assert_eq!(resolution.allocations, vec![(2, 1.0)]);
+    }
+
+    #[test]
+    fn split_by_process_volume_prefers_same_model_candidates_before_geography_tier() {
+        let consumer_model = Uuid::new_v4();
+        let other_model = Uuid::new_v4();
+        let process_meta = vec![
+            test_process_meta_with_model(0, Some(consumer_model), Some("CN-BJ"), None),
+            test_process_meta_with_model(1, Some(other_model), Some("CN-BJ"), Some(1_000.0)),
+            test_process_meta_with_model(2, Some(consumer_model), Some("GLO"), Some(1.0)),
+        ];
+        let exchange = ParsedExchange {
+            process_idx: 0,
+            flow_id: Uuid::new_v4(),
+            direction: ExchangeDirection::Input,
+            internal_id: None,
+            is_reference_exchange: false,
+            amount: Some(1.0),
+            allocation_state: AllocationFractionState::Present,
+            location: None,
         };
 
         let resolution = resolve_multi_provider(

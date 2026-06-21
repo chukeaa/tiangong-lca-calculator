@@ -13,6 +13,7 @@ whenToUpdate:
   - 当 job payload、状态机、结果 artifact、幂等规则或服务端权限边界变化时
 checkPaths:
   - docs/lca-api-contract.md
+  - docs/provider-linking.md
   - AGENTS.md
   - .docpact/config.yaml
   - crates/**
@@ -26,6 +27,7 @@ lastReviewedCommit: 4546fb8fff034c84cd1b699cb049345b70eabe16
 related:
   - AGENTS.md
   - .docpact/config.yaml
+  - docs/provider-linking.md
   - docs/matrix-readiness-report-contract.md
   - docs/review-submit-fast-gate-contract.md
   - docs/edge-function-integration.md
@@ -202,6 +204,8 @@ legacy pgmq/debug 路径语义：
 `snapshot` artifact 当前格式：`snapshot-hdf5:v1`。
 
 snapshot coverage diagnostics 会暴露 snapshot 构建阶段的 provider linking 和矩阵写入质量统计，用于解释供应链连接完整性。当前 coverage schema 为 `snapshot_coverage.v2`，在保留 `provider_decision_diagnostics` 兼容字段的同时，新增按用途分组的 summary：
+
+Provider-link 的运行时决策顺序、默认 provider rule、candidate eligibility 和 provider diagnostics 维护在 `docs/provider-linking.md`。本文档只定义 worker/API 消费这些 coverage 与 artifact 字段的契约边界。
 
 - `candidate_summary`：eligible provider candidate 数量分布。自动 provider linking 默认只把 reference output 计入 eligible candidate；同 flow 的非 reference output 通过 `provider_decision_diagnostics.candidate_eligibility_counts` 和逐条 candidate evidence 解释为 rejected diagnostics。
 - `resolution_summary`：resolved strategy 与 unresolved reason 分布。
