@@ -19,6 +19,7 @@ pub mod db;
 pub mod db_pool;
 pub mod graph_types;
 pub mod http;
+pub mod local_reports;
 pub mod package_artifacts;
 pub mod package_db;
 pub mod package_execution;

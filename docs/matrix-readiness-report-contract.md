@@ -42,7 +42,9 @@ related:
 当前暴露方式只有两类：
 
 - CLI: `cargo run -p solver-worker --bin matrix_readiness -- --input <input.json> --out <report.json>`
-- fresh `snapshot_builder` run 在 `report_dir` 下写出的 `matrix-readiness-<snapshot_id>.json`
+- fresh `snapshot_builder` run 在 `report_dir` 下尝试写出的 `matrix-readiness-<snapshot_id>.json`
+
+`snapshot_builder` 的本地 report 写入是 guarded optional artifact：默认会按 `SNAPSHOT_REPORT_RETENTION_DAYS` / `SNAPSHOT_REPORT_MAX_FILES` 清理 `reports/snapshot-coverage`，并在 `SNAPSHOT_REPORT_MODE=guarded` 且可用磁盘空间低于 `SNAPSHOT_REPORT_MIN_FREE_BYTES` 时跳过本地 report 写入。跳过本地文件不改变 matrix-readiness report schema，也不代表 snapshot artifact 或对象存储写入失败。
 
 Edge、Foundry、CLI 或其他调用方可以消费 report 字段，但不应在外部复制 calculator 的 provider resolution、singular-risk、LCIA 或 UMFPACK readiness 判断逻辑。
 

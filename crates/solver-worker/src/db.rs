@@ -591,6 +591,7 @@ pub async fn fetch_snapshot_sparse_data(
     state: &AppState,
     snapshot_id: Uuid,
 ) -> anyhow::Result<ModelSparseData> {
+    let mut artifact_error = None;
     if let Some(meta) = fetch_snapshot_artifact_meta(&state.pool, snapshot_id).await? {
         match fetch_snapshot_payload_from_artifact(state, snapshot_id, &meta).await {
             Ok(payload) => return Ok(payload),
@@ -601,6 +602,7 @@ pub async fn fetch_snapshot_sparse_data(
                     error = %err,
                     "failed to load snapshot artifact, falling back to table-backed sparse data"
                 );
+                artifact_error = Some(err);
             }
         }
     }
@@ -611,12 +613,28 @@ pub async fn fetch_snapshot_sparse_data(
             if let Some(sqlx_err) = err.downcast_ref::<sqlx::Error>()
                 && is_undefined_table(sqlx_err)
             {
-                return Err(anyhow::anyhow!(
-                    "snapshot {snapshot_id} has no readable artifact and legacy lca_* matrix tables are missing"
+                return Err(missing_legacy_tables_sparse_data_error(
+                    snapshot_id,
+                    artifact_error.as_ref(),
                 ));
             }
             Err(err)
         }
+    }
+}
+
+fn missing_legacy_tables_sparse_data_error(
+    snapshot_id: Uuid,
+    artifact_error: Option<&anyhow::Error>,
+) -> anyhow::Error {
+    if let Some(artifact_error) = artifact_error {
+        anyhow::anyhow!(
+            "snapshot {snapshot_id} has no readable artifact and legacy lca_* matrix tables are missing; original artifact read/decode error: {artifact_error:#}"
+        )
+    } else {
+        anyhow::anyhow!(
+            "snapshot {snapshot_id} has no readable artifact and legacy lca_* matrix tables are missing"
+        )
     }
 }
 
@@ -2159,9 +2177,9 @@ fn _assert_result_types(_a: SolveResult, _b: SolveBatchResult) {}
 #[cfg(test)]
 mod tests {
     use super::{
-        SolveOptionsPayload, build_all_unit_rhs_batch, normalize_all_unit_batch_size,
-        parse_snapshot_builder_build_timing, parse_snapshot_builder_resolved_snapshot_id,
-        resolve_solve_all_unit_options,
+        SolveOptionsPayload, build_all_unit_rhs_batch, missing_legacy_tables_sparse_data_error,
+        normalize_all_unit_batch_size, parse_snapshot_builder_build_timing,
+        parse_snapshot_builder_resolved_snapshot_id, resolve_solve_all_unit_options,
     };
     use serde_json::json;
     use uuid::Uuid;
@@ -2232,5 +2250,21 @@ mod tests {
             parse_snapshot_builder_build_timing(stdout),
             Some(json!({"total_sec": 1.25, "reused_snapshot": false}))
         );
+    }
+
+    #[test]
+    fn missing_legacy_tables_error_preserves_artifact_failure_context() {
+        let snapshot_id =
+            Uuid::parse_str("3d620e54-2b83-47f6-9809-0b65ab00bfd9").expect("valid uuid");
+        let artifact_error = anyhow::anyhow!(
+            "decode snapshot artifact failed: No space left on device (os error 28)"
+        );
+
+        let err = missing_legacy_tables_sparse_data_error(snapshot_id, Some(&artifact_error));
+        let message = err.to_string();
+
+        assert!(message.contains("no readable artifact"));
+        assert!(message.contains("legacy lca_* matrix tables are missing"));
+        assert!(message.contains("No space left on device"));
     }
 }

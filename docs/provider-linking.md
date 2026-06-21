@@ -23,7 +23,7 @@ checkPaths:
   - crates/solver-worker/src/compiled_graph.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
 lastReviewedAt: 2026-06-21
-lastReviewedCommit: 661b626c87e312ebb7f42f71b48f1bc25710223f
+lastReviewedCommit: 20d18a12916cfe1929140493377445aced21eb35
 related:
   - AGENTS.md
   - docs/implicit-regional-supply-mix-modeling.md

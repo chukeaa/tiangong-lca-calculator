@@ -312,6 +312,10 @@ psql "$CONN" -v ON_ERROR_STOP=1 -f supabase/migrations/20260309042000_lca_latest
 - `SNAPSHOT_BUILDER_DB_MAX_CONNECTIONS`（`snapshot_builder` 子进程连接池上限，默认 `4`）
 - `SNAPSHOT_BUILDER_DB_ACQUIRE_TIMEOUT_SECONDS`（`snapshot_builder` 获取连接超时，默认 `30`）
 - `SNAPSHOT_DB_STATEMENT_TIMEOUT_SECONDS`（`snapshot_builder` 单条 SQL statement timeout，默认 `900`；设置为 `0` 表示关闭，仅建议用于人工恢复或排障）
+- `SNAPSHOT_REPORT_MODE`（本地 snapshot coverage / matrix-readiness report 写入模式，默认 `guarded`；`disabled` 跳过本地报告写入，`force` 忽略低磁盘 guard）
+- `SNAPSHOT_REPORT_RETENTION_DAYS`（`reports/snapshot-coverage` 下已知本地报告的保留天数，默认 `14`）
+- `SNAPSHOT_REPORT_MAX_FILES`（`reports/snapshot-coverage` 下已知本地报告最多保留文件数，默认 `100`，超过后删除最旧文件）
+- `SNAPSHOT_REPORT_MIN_FREE_BYTES`（`guarded` 模式下写本地报告后必须保留的最小可用磁盘空间，默认 `1073741824`，即 1 GiB）
 - `REVIEW_SUBMIT_GATE_POLL_MS`（review-submit gate runner 轮询间隔，默认 `1000`）
 - `REVIEW_SUBMIT_GATE_MAX_RUNS`（可选；设置后 runner 处理指定条数后退出）
 - `REVIEW_SUBMIT_GATE_STALE_RUNNING_SECONDS`（runner 重新领取 stale `running` gate run 的阈值，默认 `21600`）
@@ -953,8 +957,17 @@ journalctl -u snapshot-gc.service -n 100 --no-pager
 当前建议只保留“可复现代码 + 核心文档”，本地运行产物都视为临时文件：
 
 - `logs/`：运行日志（临时）
-- `reports/`：调试/验证报告（临时）
+- `reports/`：调试/验证报告（临时）；`snapshot_builder` 会按 `SNAPSHOT_REPORT_*` 配置清理 `reports/snapshot-coverage` 下已知的 coverage / matrix-readiness 本地报告，并在低磁盘空间时跳过可选报告写入
 - `tools/bw25-validator/.venv/`：本地 Python 环境（临时）
+
+生产主机已有积压报告时，先预览再删除最容易膨胀的 readiness 报告：
+
+```bash
+find reports/snapshot-coverage -maxdepth 1 -type f -name 'matrix-readiness-*.json' -mtime +14 -print
+find reports/snapshot-coverage -maxdepth 1 -type f -name 'matrix-readiness-*.json' -mtime +14 -delete
+```
+
+不要把该目录里的非报告文件或未知 operator artifact 一并删除；`snapshot_builder` 的自动 retention 只处理它自己生成的 UUID coverage report 和 `matrix-readiness-*.json` 文件。
 
 一键清理：
 

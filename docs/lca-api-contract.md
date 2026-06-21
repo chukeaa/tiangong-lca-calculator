@@ -244,7 +244,7 @@ cargo run -p solver-worker --bin matrix_readiness -- \
   --out matrix-readiness-report.json
 ```
 
-fresh `snapshot_builder` run 也会在 `report_dir` 下写出 `matrix-readiness-<snapshot_id>.json`。输入 `matrix_readiness_input.v1` 包含：
+fresh `snapshot_builder` run 也会在 `report_dir` 下尝试写出 `matrix-readiness-<snapshot_id>.json`；该本地文件受 `SNAPSHOT_REPORT_*` retention 和低磁盘 guard 保护，跳过本地写入不改变 snapshot artifact 或 report schema。输入 `matrix_readiness_input.v1` 包含：
 
 - `coverage`: snapshot coverage report。
 - `payload`: `ModelSparseData` sparse payload。

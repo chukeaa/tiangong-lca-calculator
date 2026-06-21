@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeDelta, Utc};
@@ -35,6 +35,12 @@ use solver_worker::compiled_graph::{
 use solver_worker::db_pool::{APP_SNAPSHOT_BUILDER, WorkerDbPoolOptions};
 use solver_worker::graph_types::{
     RequestRootProcess, ResolvedScopeProcess, ScopeProcessPartition, SnapshotSelectionMode,
+};
+use solver_worker::local_reports::{
+    DEFAULT_LOCAL_SNAPSHOT_REPORT_MAX_FILES, DEFAULT_LOCAL_SNAPSHOT_REPORT_MIN_FREE_BYTES,
+    DEFAULT_LOCAL_SNAPSHOT_REPORT_RETENTION_DAYS, LocalReportWriteOutcome, LocalSnapshotReportMode,
+    LocalSnapshotReportPolicy, validate_local_snapshot_report_policy,
+    write_optional_local_report_files,
 };
 use solver_worker::pgbouncer_sqlx::{self as sqlx, PgPool, Row};
 use solver_worker::readiness::{
@@ -144,6 +150,26 @@ struct Cli {
     review_submit_revision_checksum: Option<String>,
     #[arg(long, default_value = "reports/snapshot-coverage")]
     report_dir: PathBuf,
+    #[arg(long, env = "SNAPSHOT_REPORT_MODE", default_value = "guarded")]
+    snapshot_report_mode: String,
+    #[arg(
+        long,
+        env = "SNAPSHOT_REPORT_RETENTION_DAYS",
+        default_value_t = DEFAULT_LOCAL_SNAPSHOT_REPORT_RETENTION_DAYS
+    )]
+    snapshot_report_retention_days: u64,
+    #[arg(
+        long,
+        env = "SNAPSHOT_REPORT_MAX_FILES",
+        default_value_t = DEFAULT_LOCAL_SNAPSHOT_REPORT_MAX_FILES
+    )]
+    snapshot_report_max_files: usize,
+    #[arg(
+        long,
+        env = "SNAPSHOT_REPORT_MIN_FREE_BYTES",
+        default_value_t = DEFAULT_LOCAL_SNAPSHOT_REPORT_MIN_FREE_BYTES
+    )]
+    snapshot_report_min_free_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -438,6 +464,15 @@ fn snapshot_db_statement_timeout(seconds: u64) -> Option<Duration> {
     }
 }
 
+fn snapshot_report_policy(cli: &Cli) -> anyhow::Result<LocalSnapshotReportPolicy> {
+    validate_local_snapshot_report_policy(LocalSnapshotReportPolicy {
+        retention_days: cli.snapshot_report_retention_days,
+        max_files: cli.snapshot_report_max_files,
+        min_free_bytes: cli.snapshot_report_min_free_bytes,
+        mode: LocalSnapshotReportMode::parse(&cli.snapshot_report_mode)?,
+    })
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let total_started = Instant::now();
@@ -445,6 +480,7 @@ async fn main() -> anyhow::Result<()> {
     let provider_rule = ProviderRule::parse(&cli.provider_rule)?;
     let reference_normalization_mode = NormalizationMode::parse(&cli.reference_normalization_mode)?;
     let allocation_mode = AllocationMode::parse(&cli.allocation_fraction_mode)?;
+    let report_policy = snapshot_report_policy(&cli)?;
 
     let db_url = cli
         .database_url
@@ -662,6 +698,7 @@ async fn main() -> anyhow::Result<()> {
             allocation_mode,
             artifact_expires_in_seconds,
             reuse_max_age_seconds,
+            report_policy,
         )
         .await;
     }
@@ -689,6 +726,7 @@ async fn main() -> anyhow::Result<()> {
                     &source_summary,
                     &source_fingerprint,
                     &build_timing,
+                    report_policy,
                 )?;
                 println!(
                     "[reuse] matched existing ready snapshot={}",
@@ -814,9 +852,14 @@ async fn main() -> anyhow::Result<()> {
         &source_summary,
         &source_fingerprint,
         &build_timing,
+        report_policy,
     )?;
-    let readiness_path =
-        write_matrix_readiness_report_file(&cli.report_dir, snapshot_id, &built.readiness)?;
+    let readiness_path = write_matrix_readiness_report_file(
+        &cli.report_dir,
+        snapshot_id,
+        &built.readiness,
+        report_policy,
+    )?;
 
     println!(
         "[build_timing_sec] {}",
@@ -840,7 +883,11 @@ async fn main() -> anyhow::Result<()> {
         built.coverage.matching.any_provider_match_pct,
         built.coverage.singular_risk.risk_level
     );
-    println!("[matrix_readiness_report] {}", readiness_path.display());
+    if let Some(readiness_path) = readiness_path {
+        println!("[matrix_readiness_report] {}", readiness_path.display());
+    } else {
+        println!("[matrix_readiness_report] skipped_local_report");
+    }
     println!(
         "[matrix_readiness] status={:?} next_action={} blockers={} findings={}",
         built.readiness.status,
@@ -988,6 +1035,7 @@ async fn run_review_submit_overlay_build(
     allocation_mode: AllocationMode,
     artifact_expires_in_seconds: Option<i64>,
     reuse_max_age_seconds: Option<i64>,
+    report_policy: LocalSnapshotReportPolicy,
 ) -> anyhow::Result<()> {
     if method.has_lcia {
         return Err(anyhow::anyhow!(
@@ -1065,6 +1113,7 @@ async fn run_review_submit_overlay_build(
                 &baseline_source_summary,
                 &overlay_source_hash,
                 &build_timing,
+                report_policy,
             )?;
             println!(
                 "[reuse] matched existing review-submit overlay snapshot={}",
@@ -1111,6 +1160,7 @@ async fn run_review_submit_overlay_build(
         allocation_mode,
         reuse_max_age_seconds,
         &mut build_timing,
+        report_policy,
     )
     .await?;
     build_timing.build_sparse_payload_sec += baseline_started.elapsed().as_secs_f64();
@@ -1168,11 +1218,13 @@ async fn run_review_submit_overlay_build(
         &baseline_source_summary,
         &overlay_source_hash,
         &build_timing,
+        report_policy,
     )?;
     let readiness_path = write_matrix_readiness_report_file(
         &cli.report_dir,
         requested_snapshot_id,
         &built.readiness,
+        report_policy,
     )?;
 
     println!(
@@ -1197,7 +1249,11 @@ async fn run_review_submit_overlay_build(
         built.coverage.matching.any_provider_match_pct,
         built.coverage.singular_risk.risk_level
     );
-    println!("[matrix_readiness_report] {}", readiness_path.display());
+    if let Some(readiness_path) = readiness_path {
+        println!("[matrix_readiness_report] {}", readiness_path.display());
+    } else {
+        println!("[matrix_readiness_report] skipped_local_report");
+    }
     Ok(())
 }
 
@@ -1220,6 +1276,7 @@ async fn load_or_build_review_submit_baseline(
     allocation_mode: AllocationMode,
     reuse_max_age_seconds: Option<i64>,
     build_timing: &mut BuildTimingSec,
+    report_policy: LocalSnapshotReportPolicy,
 ) -> anyhow::Result<CompiledGraph> {
     if let Some(reused) = find_reusable_snapshot_with_age_basis(
         pool,
@@ -1310,6 +1367,7 @@ async fn load_or_build_review_submit_baseline(
         baseline_source_summary,
         baseline_source_hash,
         build_timing,
+        report_policy,
     )?;
     println!("[review_submit] baseline_snapshot_id={baseline_snapshot_id} reused=false");
     Ok(built.compiled_graph)
@@ -5142,7 +5200,7 @@ fn append_process_gap_top(md: &mut String, entries: &[SnapshotProcessGapEntry]) 
 }
 
 fn write_report_files(
-    report_dir: &PathBuf,
+    report_dir: &Path,
     snapshot_id: Uuid,
     config: &SnapshotBuildConfig,
     scope_summary: &ResolvedRequestScopeSummary,
@@ -5151,8 +5209,8 @@ fn write_report_files(
     source_summary: &SourceSnapshotSummary,
     source_fingerprint: &str,
     build_timing: &BuildTimingSec,
+    report_policy: LocalSnapshotReportPolicy,
 ) -> anyhow::Result<()> {
-    fs::create_dir_all(report_dir)?;
     let json_path = report_dir.join(format!("{snapshot_id}.json"));
     let md_path = report_dir.join(format!("{snapshot_id}.md"));
     let generated_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
@@ -5172,7 +5230,7 @@ fn write_report_files(
             "url": artifact_url,
         }
     });
-    fs::write(&json_path, serde_json::to_vec_pretty(&doc)?)?;
+    let json_bytes = serde_json::to_vec_pretty(&doc)?;
 
     let resolved_strategy_counts = if coverage
         .matching
@@ -5605,19 +5663,57 @@ fn write_report_files(
         coverage.matrix_scale.m_sparsity_estimated
     ));
 
-    fs::write(md_path, md)?;
+    let outcome = write_optional_local_report_files(
+        report_dir,
+        vec![(json_path, json_bytes), (md_path, md.into_bytes())],
+        report_policy,
+    )?;
+    log_local_report_write_outcome("snapshot coverage", &outcome);
     Ok(())
 }
 
 fn write_matrix_readiness_report_file(
-    report_dir: &PathBuf,
+    report_dir: &Path,
     snapshot_id: Uuid,
     readiness: &MatrixReadinessReport,
-) -> anyhow::Result<PathBuf> {
-    fs::create_dir_all(report_dir)?;
+    report_policy: LocalSnapshotReportPolicy,
+) -> anyhow::Result<Option<PathBuf>> {
     let path = report_dir.join(format!("matrix-readiness-{snapshot_id}.json"));
-    fs::write(&path, serde_json::to_vec_pretty(readiness)?)?;
-    Ok(path)
+    let outcome = write_optional_local_report_files(
+        report_dir,
+        vec![(path.clone(), serde_json::to_vec_pretty(readiness)?)],
+        report_policy,
+    )?;
+    log_local_report_write_outcome("matrix readiness", &outcome);
+    match outcome {
+        LocalReportWriteOutcome::Written { .. } => Ok(Some(path)),
+        LocalReportWriteOutcome::Skipped { .. } => Ok(None),
+    }
+}
+
+fn log_local_report_write_outcome(label: &str, outcome: &LocalReportWriteOutcome) {
+    match outcome {
+        LocalReportWriteOutcome::Written { deleted_paths, .. } => {
+            if !deleted_paths.is_empty() {
+                eprintln!(
+                    "[report_retention] label=\"{label}\" deleted_local_report_count={}",
+                    deleted_paths.len()
+                );
+            }
+        }
+        LocalReportWriteOutcome::Skipped {
+            reason,
+            deleted_paths,
+        } => {
+            if !deleted_paths.is_empty() {
+                eprintln!(
+                    "[report_retention] label=\"{label}\" deleted_local_report_count={}",
+                    deleted_paths.len()
+                );
+            }
+            eprintln!("[report] skipped {label} local report write: {reason}");
+        }
+    }
 }
 
 fn parse_provider_rule_list(input: &str) -> anyhow::Result<Vec<ProviderRule>> {

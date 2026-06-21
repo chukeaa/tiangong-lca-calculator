@@ -11,6 +11,7 @@ axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
 flate2.workspace = true
+fs2.workspace = true
 hdf5.workspace = true
 hdf5-sys.workspace = true
 hex.workspace = true
