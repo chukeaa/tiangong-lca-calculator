@@ -25,6 +25,7 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/matrix-readiness-report-contract.md
   - docs/review-submit-fast-gate-contract.md
+  - docs/provider-linking.md
   - docs/implicit-regional-supply-mix-modeling.md
   - docs/implicit-regional-supply-mix-modeling.en.md
   - docs/tidas-package-contract.md
@@ -77,6 +78,7 @@ Keep these constraints in mind before editing `crates/solver-core/**` or worker 
 | `docs/review-submit-fast-gate-contract.md` | worker-owned review-submit fast gate schema, blocker codes, and targeted probe contract |
 | `docs/edge-function-integration.md` | edge-facing enqueue, polling, and service-role integration contract |
 | `docs/frontend-integration.md` | frontend-side solve/result interaction contract |
+| `docs/provider-linking.md` | current provider-link runtime decision order, default rule, candidate eligibility, and diagnostics contract |
 | `docs/implicit-regional-supply-mix-modeling.md` / `docs/implicit-regional-supply-mix-modeling.en.md` | Chinese and English modeling notes for implicit regional supply mix, exchange-location supply-region anchors, and annual-volume provider share semantics |
 | `docs/tidas-package-contract.md` | package-worker async import/export contract |
 
@@ -102,7 +104,7 @@ The main solver worker has two queue backends. The default `SOLVER_QUEUE_BACKEND
 ### Snapshot builder and provider matching
 
 The snapshot builder path owns sparse payload generation, provider matching, and snapshot artifact metadata.
-The modeling basis for implicit regional supply mix, exchange-location supply-region anchors, and annual-volume provider shares lives in `docs/implicit-regional-supply-mix-modeling.md` and `docs/implicit-regional-supply-mix-modeling.en.md`.
+The current provider-link runtime contract lives in `docs/provider-linking.md`. The modeling basis for implicit regional supply mix, exchange-location supply-region anchors, and annual-volume provider shares lives in `docs/implicit-regional-supply-mix-modeling.md` and `docs/implicit-regional-supply-mix-modeling.en.md`.
 
 `crates/solver-worker/src/readiness.rs` owns the worker-side verification gate for automated data production. It turns snapshot coverage, sparse payloads, and optional compiled provider decisions into a machine-readable matrix-readiness report. Foundry and CLI callers should consume that report instead of reimplementing provider closure, singular-risk, LCIA, or factorization checks outside the worker. The stable report schema, blocker/finding codes, and next-action semantics live in `docs/matrix-readiness-report-contract.md`.
 

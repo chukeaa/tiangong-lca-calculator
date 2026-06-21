@@ -17,17 +17,19 @@ whenToUpdate:
   - when annual supply or production volume parsing semantics change
   - when calculator starts materializing explicit market processes instead of implicit direct links
 checkPaths:
+  - docs/provider-linking.md
   - docs/implicit-regional-supply-mix-modeling.md
   - docs/implicit-regional-supply-mix-modeling.en.md
   - crates/solver-worker/src/bin/snapshot_builder.rs
   - crates/solver-worker/src/compiled_graph.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
-lastReviewedAt: 2026-06-10
-lastReviewedCommit: 4546fb8fff034c84cd1b699cb049345b70eabe16
+lastReviewedAt: 2026-06-21
+lastReviewedCommit: 661b626c87e312ebb7f42f71b48f1bc25710223f
 related:
   - AGENTS.md
   - docs/agents/repo-architecture.md
   - docs/agents/repo-validation.md
+  - docs/provider-linking.md
   - docs/lca-api-contract.md
 ---
 
@@ -39,6 +41,7 @@ The method is defined by this sequence:
 
 ```text
 product input demand
+  -> model-consistent provider scope
   -> supply-region anchor
   -> geography tier
   -> provider set
@@ -63,7 +66,17 @@ Automatic provider linking treats only a process's quantitative reference output
 
 Within that scope, `annualSupplyOrProductionVolume` can be used as a structured signal for relative provider supply scale. It is a share weight, not an additional technical input.
 
-### 2. An Input Exchange Can Explicitly Declare the Supply Region
+### 2. Providers in the Same Model Mean the Model Explicitly Declares an Internal Supply Relationship
+
+A `model_id` means that a group of processes belongs to the same lifecycle model or data-modeling context. A consumer and provider inside the same model usually share a more consistent system boundary, data source, modeling assumption set, technology scope, and version context.
+
+More directly: when a consumer process input exchange demands a product/reference flow and another process inside the same model has that same flow as its quantitative reference output, the data author has placed both the demand side and the supply side inside one model. The calculator interprets that structure as the model's explicit declaration of an internal supply relationship: this input demand already has an intended supplier candidate inside the model boundary.
+
+This priority is not direct evidence of physical distance, market share, or real transaction relationships, and it does not mean that the input exchange structurally points to one provider process. It expresses an in-model supply relationship at the product-flow level: inside the same product system or data package, the supply-side process has already been explicitly modeled, so the internal technical chain should stay closed before the calculator stitches in providers from external models.
+
+If no provider is available inside the same model, the calculator returns to the regional supply mix assumption: it constructs a representative supply mix from the wider provider universe using the supply-region anchor, geography tier, and annual volume. This preserves the model-internal closure priority without turning an otherwise linkable input demand into a no-provider case only because model metadata is incomplete.
+
+### 3. An Input Exchange Can Explicitly Declare the Supply Region
 
 On a product input exchange, `processDataSet.exchanges.exchange[].location` is the supply-region anchor. It declares the geographic supply mix from which the input demand should be supplied.
 
@@ -83,7 +96,7 @@ means that the input demand uses a global supply mix.
 
 The field is a plain location string. Recommended values are TIDAS/ILCD location category codes such as `CN`, `CN-BJ`, `RER`, and `GLO`. It is not localized text, not an exchange amount or unit, and not a biosphere LCIA geography.
 
-### 3. Missing Exchange Location Uses the Local-First Default
+### 4. Missing Exchange Location Uses the Local-First Default
 
 If the input exchange does not provide a usable `location`, the calculator uses the consumer process's `locationOfOperationSupplyOrProduction` as the default supply-region anchor.
 
@@ -99,7 +112,7 @@ other
 
 This means supply is assumed to come first from the consumer's location. If no local provider is available, the search expands to national, regional, or global providers.
 
-### 4. Geography Tier Selection Comes Before Volume Weighting
+### 5. Geography Tier Selection Comes Before Volume Weighting
 
 The calculator first selects the geography tier and only then computes provider shares from annual volume within that tier.
 
@@ -112,7 +125,7 @@ same product/reference flow
 same selected geography tier
 ```
 
-### 5. Annual Volume Determines Provider Share, Not Demand Amount
+### 6. Annual Volume Determines Provider Share, Not Demand Amount
 
 Exchange amount represents the consumer process's technical input demand per reference unit. Annual supply or production volume represents the provider process's annual supply scale.
 
@@ -135,7 +148,15 @@ The calculator identifies the demanded product/reference flow `f` from the input
 
 If no reference-output provider is available, the calculator should not fabricate one and should not fall back to arbitrary non-reference outputs. The exchange should be reported through provider-link diagnostics and resolved through data repair, additional provider data, or explicit market/co-product process modeling.
 
-### Step 2: Determine the Supply-Region Anchor
+### Step 2: Determine the Model-Consistent Provider Scope
+
+Among same-product/reference-flow reference-output providers, the calculator first checks whether any provider belongs to the same `model_id` as the consumer.
+
+If such providers exist, they form the provider scope for the later regional supply mix decision. That scope means the current lifecycle model has explicitly provided internal supplier candidates for this input demand.
+
+If no such provider exists, the provider scope remains all eligible providers, and the later regional supply mix rules select the supply region and provider shares.
+
+### Step 3: Determine the Supply-Region Anchor
 
 The supply-region anchor priority is:
 
@@ -149,7 +170,7 @@ If `exchange.location` is present and can be parsed into a usable location descr
 
 An effective `exchange.location` must not be overridden by the consumer process location. Consumer location only supplies the default region.
 
-### Step 3: Select the Geography Tier
+### Step 4: Select the Geography Tier
 
 Given the supply-region anchor `g_jf`, the calculator selects the most appropriate geography tier among provider candidates.
 
@@ -167,13 +188,13 @@ other
 
 The calculator selects the first non-empty tier.
 
-### Step 4: Compute Provider Shares Within the Selected Tier
+### Step 5: Compute Provider Shares Within the Selected Tier
 
 Within the selected geography tier, providers of the same product/reference flow are weighted by annual volume.
 
 Annual volume is not compared across tiers.
 
-### Step 5: Write Technosphere Matrix Links
+### Step 6: Write Technosphere Matrix Links
 
 The consumer input demand is split by provider shares and written to `A[p_i, j]`. After writing, the total demand for that input must be conserved.
 
@@ -192,7 +213,7 @@ g_jf = exchange.location, if present and usable
 g_jf = consumer process location, otherwise
 ```
 
-After geography tier selection for `g_jf`, the provider set is:
+After reference-output eligibility, optional same-model scope, and geography tier selection for `g_jf`, the provider set is:
 
 ```text
 P_{f,g} = { p_1, p_2, ..., p_n }
