@@ -96,10 +96,11 @@ The worker currently covers families such as:
 - `rebuild_factorization`
 - `analyze_contribution_path`
 - `build_snapshot`
+- `lcia_result_package_build`
 
 These flows belong to the worker runtime, not to the API repo.
 
-The main solver worker has two queue backends. The default `SOLVER_QUEUE_BACKEND=worker-jobs` path claims `public.worker_jobs` rows from `worker_queue=solver`, maps `job_kind=lca.*` payloads back to the same internal `JobPayload` variants, heartbeats `phase/progress`, records terminal results through `worker_record_job_result`, and links `lca_results` / cache / latest / factorization rows back to the canonical `worker_jobs` id. Optional `lca_jobs` rows are best-effort compatibility only; production worker_jobs paths must run when `public.lca_jobs` is absent. The `SOLVER_QUEUE_BACKEND=pgmq` path is legacy compatibility/debug only, consumes `pgmq` messages from `PGMQ_QUEUE`, and requires the explicit `ALLOW_LEGACY_JOB_TABLE_BACKEND=true` / `--allow-legacy-job-table-backend` guard.
+The main solver worker has two queue backends. The default `SOLVER_QUEUE_BACKEND=worker-jobs` path claims `public.worker_jobs` rows from `worker_queue=solver`, maps `job_kind=lca.*` and `job_kind=lcia_result.package_build` payloads back to internal `JobPayload` variants, heartbeats `phase/progress`, records terminal results through `worker_record_job_result`, and links LCA domain rows back to the canonical `worker_jobs` id where applicable. Ordinary solve jobs link `lca_results` / cache / latest / factorization rows; LCIA result package builds use `lca_results` plus `lca_latest_all_unit_results` as the worker-produced artifacts and then mark `lcia_result_packages` preview-ready through the database service-role command. Optional `lca_jobs` rows are best-effort compatibility only for ordinary LCA jobs; production worker_jobs paths must run when `public.lca_jobs` is absent. The `SOLVER_QUEUE_BACKEND=pgmq` path is legacy compatibility/debug only, consumes `pgmq` messages from `PGMQ_QUEUE`, and requires the explicit `ALLOW_LEGACY_JOB_TABLE_BACKEND=true` / `--allow-legacy-job-table-backend` guard.
 
 ### Snapshot builder and provider matching
 

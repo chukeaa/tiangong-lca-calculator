@@ -23,6 +23,7 @@ use crate::{
     config::AppConfig,
     contribution_path::{ContributionPathArtifact, analyze_contribution_path},
     db_pool::{APP_SOLVER_WORKER, APP_SOLVER_WORKER_QUEUE, WorkerDbPoolOptions},
+    graph_types::RequestRootProcess,
     snapshot_artifacts::{DecodedSnapshotArtifact, decode_snapshot_artifact},
     snapshot_index::{SnapshotIndexDocument, derive_snapshot_index_url},
     storage::ObjectStoreClient,
@@ -1324,6 +1325,11 @@ pub async fn handle_job_payload(state: &AppState, payload: JobPayload) -> anyhow
                 merge_job_status_update_timing(completed_payload, "running", running_db_write_sec);
             let _ = update_job_status(&state.pool, job_id, "completed", completed_diag).await?;
         }
+        JobPayload::LciaResultPackageBuild { .. } => {
+            return Err(anyhow::anyhow!(
+                "lcia_result package build execution requires worker_jobs context"
+            ));
+        }
     }
 
     Ok(())
@@ -1455,8 +1461,8 @@ async fn upsert_latest_all_unit_result(
     job_id: Uuid,
     result_id: Uuid,
     query_artifact: &QueryArtifactMeta,
-) -> anyhow::Result<()> {
-    sqlx::query(
+) -> anyhow::Result<Uuid> {
+    let row = sqlx::query(
         r"
         INSERT INTO public.lca_latest_all_unit_results (
             snapshot_id,
@@ -1482,6 +1488,7 @@ async fn upsert_latest_all_unit_result(
             status = EXCLUDED.status,
             computed_at = EXCLUDED.computed_at,
             updated_at = NOW()
+        RETURNING id
         ",
     )
     .bind(snapshot_id)
@@ -1491,9 +1498,9 @@ async fn upsert_latest_all_unit_result(
     .bind(query_artifact.sha256.as_str())
     .bind(query_artifact.byte_size)
     .bind(query_artifact.format.as_str())
-    .execute(pool)
+    .fetch_one(pool)
     .await?;
-    Ok(())
+    Ok(row.try_get::<Uuid, _>("id")?)
 }
 
 struct PersistArtifactInput {
@@ -1516,6 +1523,30 @@ struct QueryArtifactMeta {
     sha256: String,
     byte_size: i64,
     format: String,
+}
+
+#[derive(Debug, Clone)]
+struct LciaResultPackageReadyInput {
+    build_worker_job_id: Uuid,
+    package_version: String,
+    snapshot_id: Uuid,
+    result_id: Uuid,
+    latest_all_unit_result_id: Option<Uuid>,
+    result_artifact_ref: Value,
+    query_artifact_ref: Value,
+    artifact_manifest: Value,
+    available_impact_categories: Value,
+    default_impact_category: Option<String>,
+    package_result_hash: Option<String>,
+    audit: Value,
+}
+
+#[derive(Debug, Clone)]
+struct LciaResultPackageArtifacts {
+    result_id: Uuid,
+    latest_all_unit_result_id: Uuid,
+    result_diag: Value,
+    query_artifact_meta: QueryArtifactMeta,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1600,6 +1631,222 @@ pub(crate) async fn run_review_submit_gate_snapshot_builder(
     }
 }
 
+pub(crate) async fn handle_lcia_result_package_build_worker_job(
+    state: &AppState,
+    build_worker_job_id: Uuid,
+    payload: &JobPayload,
+) -> anyhow::Result<Value> {
+    let JobPayload::LciaResultPackageBuild {
+        build_id,
+        input_manifest,
+        input_manifest_hash,
+        default_impact_category,
+        ..
+    } = payload
+    else {
+        return Err(anyhow::anyhow!(
+            "expected lcia_result_package_build payload"
+        ));
+    };
+
+    let requested_snapshot_id = *build_id;
+    let result_job_id = *build_id;
+    let request_roots = lcia_result_package_request_roots(input_manifest)?;
+    let (executed, build_snapshot_lock) = run_lcia_result_package_snapshot_builder(
+        state,
+        requested_snapshot_id,
+        request_roots.as_slice(),
+    )
+    .await?;
+    let snapshot_id = executed.resolved_snapshot_id;
+    let artifacts =
+        persist_lcia_result_package_all_unit_artifacts(state, result_job_id, snapshot_id).await?;
+    link_lcia_result_package_worker_job_domain_refs(
+        &state.pool,
+        build_worker_job_id,
+        result_job_id,
+    )
+    .await?;
+
+    let artifact_manifest = serde_json::json!({
+        "artifactManifestVersion": "lcia-result-package-worker.v1",
+        "inputManifestHash": input_manifest_hash,
+        "snapshotBuilder": executed,
+        "buildSnapshotLock": build_snapshot_lock,
+        "resultDiagnostics": artifacts.result_diag.clone(),
+        "queryArtifact": {
+            "artifactUrl": artifacts.query_artifact_meta.url.clone(),
+            "artifactSha256": artifacts.query_artifact_meta.sha256.clone(),
+            "artifactByteSize": artifacts.query_artifact_meta.byte_size,
+            "artifactFormat": artifacts.query_artifact_meta.format.clone(),
+        }
+    });
+
+    let mark_ready = mark_lcia_result_package_ready(
+        &state.pool,
+        LciaResultPackageReadyInput {
+            build_worker_job_id,
+            package_version: lcia_result_package_version(*build_id),
+            snapshot_id,
+            result_id: artifacts.result_id,
+            latest_all_unit_result_id: Some(artifacts.latest_all_unit_result_id),
+            result_artifact_ref: lcia_result_artifact_ref(&artifacts.result_diag),
+            query_artifact_ref: lcia_result_query_artifact_ref(&artifacts.query_artifact_meta),
+            artifact_manifest,
+            available_impact_categories: serde_json::json!([]),
+            default_impact_category: default_impact_category.clone(),
+            package_result_hash: artifacts
+                .result_diag
+                .get("artifact_sha256")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            audit: serde_json::json!({
+                "command": "worker_lcia_result_package_build",
+                "buildId": build_id,
+                "buildWorkerJobId": build_worker_job_id,
+                "snapshotId": snapshot_id,
+                "resultId": artifacts.result_id,
+                "latestAllUnitResultId": artifacts.latest_all_unit_result_id,
+            }),
+        },
+    )
+    .await?;
+
+    Ok(mark_ready)
+}
+
+async fn run_lcia_result_package_snapshot_builder(
+    state: &AppState,
+    requested_snapshot_id: Uuid,
+    request_roots: &[RequestRootProcess],
+) -> anyhow::Result<(SnapshotBuilderExecution, Value)> {
+    let process_states = crate::default_snapshot_process_states_arg();
+    let lock_guard = acquire_build_snapshot_lock(
+        &state.pool,
+        state.build_snapshot_max_concurrency,
+        state.build_snapshot_lock_poll_interval,
+    )
+    .await?;
+    let build_snapshot_lock = lock_guard.diagnostics();
+    let executed_result = run_snapshot_builder_job(
+        requested_snapshot_id,
+        Some(process_states.as_str()),
+        None,
+        Some(request_roots),
+        Some("split_by_process_volume"),
+        Some("lenient"),
+        Some("lenient"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("lcia_result_package"),
+        None,
+        None,
+        None,
+        false,
+    )
+    .await;
+    let release_result = lock_guard.release().await;
+
+    match executed_result {
+        Ok(executed) => {
+            if let Err(err) = release_result {
+                return Err(anyhow::anyhow!(
+                    "failed to release build_snapshot advisory lock: {err}"
+                ));
+            }
+            Ok((executed, build_snapshot_lock))
+        }
+        Err(err) => {
+            if let Err(release_err) = release_result {
+                warn!(
+                    error = %release_err,
+                    "failed to release build_snapshot advisory lock after lcia result package snapshot failure"
+                );
+            }
+            Err(err)
+        }
+    }
+}
+
+async fn persist_lcia_result_package_all_unit_artifacts(
+    state: &AppState,
+    result_job_id: Uuid,
+    snapshot_id: Uuid,
+) -> anyhow::Result<LciaResultPackageArtifacts> {
+    ensure_prepared(state, snapshot_id, 0.0).await?;
+    let process_count = fetch_snapshot_process_count(&state.pool, snapshot_id).await?;
+    let n = usize::try_from(process_count)
+        .map_err(|_| anyhow::anyhow!("process count overflow: {process_count}"))?;
+    if n == 0 {
+        return Err(anyhow::anyhow!(
+            "lcia_result package build requires non-zero process count"
+        ));
+    }
+
+    let mut items = Vec::with_capacity(n);
+    let batch_size = normalize_all_unit_batch_size(None, n);
+    let solve_options = resolve_solve_all_unit_options(None)?;
+    for start in (0..n).step_by(batch_size) {
+        let end = (start + batch_size).min(n);
+        let rhs_batch = build_all_unit_rhs_batch(n, start, end);
+        let partial = state.solver.solve_batch(
+            snapshot_id,
+            NumericOptions { print_level: 0.0 },
+            rhs_batch.as_slice(),
+            solve_options,
+        )?;
+        items.extend(partial.items);
+    }
+
+    let solved = SolveBatchResult { items };
+    let query_artifact_meta =
+        persist_solve_all_unit_query_artifact(state, result_job_id, snapshot_id, &solved).await?;
+    let result_diag =
+        persist_solve_batch_result(state, result_job_id, snapshot_id, &solved, "solve_all_unit")
+            .await?;
+    let result_id = latest_result_id_for_job(&state.pool, result_job_id)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!("lcia_result package build did not persist an lca_results row")
+        })?;
+    let latest_all_unit_result_id = upsert_latest_all_unit_result(
+        &state.pool,
+        snapshot_id,
+        result_job_id,
+        result_id,
+        &query_artifact_meta,
+    )
+    .await?;
+
+    Ok(LciaResultPackageArtifacts {
+        result_id,
+        latest_all_unit_result_id,
+        result_diag,
+        query_artifact_meta,
+    })
+}
+
+fn lcia_result_artifact_ref(result_diag: &Value) -> Value {
+    serde_json::json!({
+        "artifactUrl": result_diag.get("artifact_url").cloned().unwrap_or(Value::Null),
+        "artifactSha256": result_diag.get("artifact_sha256").cloned().unwrap_or(Value::Null),
+        "artifactByteSize": result_diag.get("artifact_bytes").cloned().unwrap_or(Value::Null),
+        "artifactFormat": result_diag.get("artifact_format").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn lcia_result_query_artifact_ref(query_artifact: &QueryArtifactMeta) -> Value {
+    serde_json::json!({
+        "artifactUrl": query_artifact.url.clone(),
+        "artifactSha256": query_artifact.sha256.clone(),
+        "artifactByteSize": query_artifact.byte_size,
+        "artifactFormat": query_artifact.format.clone(),
+    })
+}
+
 async fn persist_result_artifact(
     state: &AppState,
     job_id: Uuid,
@@ -1646,6 +1893,105 @@ async fn persist_result_artifact(
         &artifact_url,
     )
     .await
+}
+
+async fn mark_lcia_result_package_ready(
+    pool: &PgPool,
+    input: LciaResultPackageReadyInput,
+) -> anyhow::Result<Value> {
+    let row = sqlx::query(
+        r"
+        WITH _service_role AS (
+            SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
+        SELECT public.cmd_lcia_result_package_mark_ready(
+            $1,
+            $2,
+            $3,
+            $4,
+            $5,
+            $6::jsonb,
+            $7::jsonb,
+            $8::jsonb,
+            $9::jsonb,
+            $10,
+            $11,
+            $12::jsonb
+        ) AS result
+        FROM _service_role
+        ",
+    )
+    .bind(input.build_worker_job_id)
+    .bind(input.package_version)
+    .bind(input.snapshot_id)
+    .bind(input.result_id)
+    .bind(input.latest_all_unit_result_id)
+    .bind(input.result_artifact_ref)
+    .bind(input.query_artifact_ref)
+    .bind(input.artifact_manifest)
+    .bind(input.available_impact_categories)
+    .bind(input.default_impact_category)
+    .bind(input.package_result_hash)
+    .bind(input.audit)
+    .fetch_one(pool)
+    .await?;
+    let result = row.try_get::<Value, _>("result")?;
+    if result.get("ok").and_then(Value::as_bool) == Some(true) {
+        Ok(result)
+    } else {
+        Err(anyhow::anyhow!(
+            "cmd_lcia_result_package_mark_ready returned non-ok result: {result}"
+        ))
+    }
+}
+
+async fn link_lcia_result_package_worker_job_domain_refs(
+    pool: &PgPool,
+    worker_job_id: Uuid,
+    build_id: Uuid,
+) -> anyhow::Result<()> {
+    execute_optional_lcia_result_package_worker_job_ref_update(
+        pool,
+        r"
+        UPDATE public.lca_results
+           SET worker_job_id = $1
+         WHERE job_id = $2
+        ",
+        worker_job_id,
+        build_id,
+    )
+    .await?;
+    execute_optional_lcia_result_package_worker_job_ref_update(
+        pool,
+        r"
+        UPDATE public.lca_latest_all_unit_results
+           SET worker_job_id = $1
+         WHERE job_id = $2
+        ",
+        worker_job_id,
+        build_id,
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn execute_optional_lcia_result_package_worker_job_ref_update(
+    pool: &PgPool,
+    statement: &str,
+    worker_job_id: Uuid,
+    build_id: Uuid,
+) -> anyhow::Result<()> {
+    let result = sqlx::query(statement)
+        .bind(worker_job_id)
+        .bind(build_id)
+        .execute(pool)
+        .await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(err) if is_undefined_table(&err) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2084,6 +2430,61 @@ fn build_single_rhs(process_count: usize, process_index: usize, amount: f64) -> 
     rhs
 }
 
+fn lcia_result_package_request_roots(
+    input_manifest: &Value,
+) -> anyhow::Result<Vec<RequestRootProcess>> {
+    let processes = input_manifest
+        .get("processes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            anyhow::anyhow!("LCIA result package input_manifest.processes must be an array")
+        })?;
+    if processes.is_empty() {
+        return Err(anyhow::anyhow!(
+            "LCIA result package input_manifest.processes must not be empty"
+        ));
+    }
+
+    let mut roots = Vec::with_capacity(processes.len());
+    for (idx, process) in processes.iter().enumerate() {
+        let process_id = process
+            .get("id")
+            .or_else(|| process.get("processId"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("LCIA result package process[{idx}] is missing id"))?
+            .parse::<Uuid>()?;
+        let process_version = process
+            .get("version")
+            .or_else(|| process.get("processVersion"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|version| !version.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("LCIA result package process[{idx}] is missing version")
+            })?;
+        let state_code = process
+            .get("stateCode")
+            .or_else(|| process.get("state_code"))
+            .and_then(Value::as_i64)
+            .ok_or_else(|| {
+                anyhow::anyhow!("LCIA result package process[{idx}] is missing stateCode")
+            })?;
+        if !(100..=199).contains(&state_code) {
+            return Err(anyhow::anyhow!(
+                "LCIA result package process[{idx}] must use a published process state, got {state_code}"
+            ));
+        }
+
+        roots.push(RequestRootProcess::new(process_id, process_version));
+    }
+
+    Ok(roots)
+}
+
+fn lcia_result_package_version(build_id: Uuid) -> String {
+    format!("lcia-result-{build_id}")
+}
+
 async fn fetch_snapshot_process_count(pool: &PgPool, snapshot_id: Uuid) -> anyhow::Result<i32> {
     let row = sqlx::query(
         r"
@@ -2177,7 +2578,8 @@ fn _assert_result_types(_a: SolveResult, _b: SolveBatchResult) {}
 #[cfg(test)]
 mod tests {
     use super::{
-        SolveOptionsPayload, build_all_unit_rhs_batch, missing_legacy_tables_sparse_data_error,
+        SolveOptionsPayload, build_all_unit_rhs_batch, lcia_result_package_request_roots,
+        lcia_result_package_version, missing_legacy_tables_sparse_data_error,
         normalize_all_unit_batch_size, parse_snapshot_builder_build_timing,
         parse_snapshot_builder_resolved_snapshot_id, resolve_solve_all_unit_options,
     };
@@ -2266,5 +2668,53 @@ mod tests {
         assert!(message.contains("no readable artifact"));
         assert!(message.contains("legacy lca_* matrix tables are missing"));
         assert!(message.contains("No space left on device"));
+    }
+
+    #[test]
+    fn lcia_result_package_manifest_roots_use_published_processes() {
+        let process_id = Uuid::new_v4();
+        let manifest = json!({
+            "predicateVersion": "published-state-code-100-199:v1",
+            "processes": [
+                {
+                    "id": process_id,
+                    "version": "01.00.000",
+                    "stateCode": 150
+                }
+            ]
+        });
+
+        let roots = lcia_result_package_request_roots(&manifest).expect("roots");
+
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].process_id, process_id);
+        assert_eq!(roots[0].process_version, "01.00.000");
+    }
+
+    #[test]
+    fn lcia_result_package_manifest_rejects_draft_inputs() {
+        let manifest = json!({
+            "processes": [
+                {
+                    "id": Uuid::new_v4(),
+                    "version": "01.00.000",
+                    "stateCode": 0
+                }
+            ]
+        });
+
+        let err = lcia_result_package_request_roots(&manifest).expect_err("draft rejected");
+
+        assert!(err.to_string().contains("published process state"));
+    }
+
+    #[test]
+    fn lcia_result_package_version_is_stable_and_namespaced() {
+        let build_id = Uuid::parse_str("3d620e54-2b83-47f6-9809-0b65ab00bfd9").expect("valid uuid");
+
+        assert_eq!(
+            lcia_result_package_version(build_id),
+            "lcia-result-3d620e54-2b83-47f6-9809-0b65ab00bfd9"
+        );
     }
 }

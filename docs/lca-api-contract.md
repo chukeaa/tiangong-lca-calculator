@@ -158,8 +158,11 @@ solver worker 默认使用 `SOLVER_QUEUE_BACKEND=worker-jobs` / `--queue-backend
 | `lca.build_snapshot` | `lca.build_snapshot.request.v1` | `build_snapshot` | `lca.snapshot.result.v1` |
 | `lca.contribution_path` | `lca.contribution_path.request.v1` | `analyze_contribution_path` | `lca.contribution_path.result.v1` |
 | `lca.factorization_prepare` | `lca.factorization_prepare.request.v1` | `prepare_factorization` | `lca.factorization_prepare.result.v1` |
+| `lcia_result.package_build` | `lcia_result.package_build.request.v1` | `lcia_result_package_build` | `lcia_result.package_build.result.v1` |
 
-`worker_jobs.payload_json` may use the legacy snake_case fields above, or Edge-friendly camelCase aliases such as `lcaJobId`, `snapshotId`, `rhsBatch`, `unitBatchSize`, `processId`, `impactId`, `requestRoots`, and `noLcia`. Payloads must still carry a valid `lcaJobId` / `job_id` compatibility UUID when the task writes `lca_results`、`lca_result_cache`、`lca_latest_all_unit_results` 或 `lca_factorization_registry` rows keyed by historical `job_id` columns. 这些 columns 不再要求 `public.lca_jobs` FK 或 parent row。
+`worker_jobs.payload_json` may use the legacy snake_case fields above, or Edge-friendly camelCase aliases such as `lcaJobId`, `snapshotId`, `rhsBatch`, `unitBatchSize`, `processId`, `impactId`, `requestRoots`, `noLcia`, `buildId`, `requestedBy`, `inputManifest`, `inputManifestHash`, `lciaMethodSet`, and `defaultImpactCategory`. Payloads must still carry a valid `lcaJobId` / `job_id` compatibility UUID when the task writes `lca_results`、`lca_result_cache`、`lca_latest_all_unit_results` 或 `lca_factorization_registry` rows keyed by historical `job_id` columns. 这些 columns 不再要求 `public.lca_jobs` FK 或 parent row。
+
+`lcia_result.package_build` 不是普通求解 API 的用户请求类型，而是 data product manager command 创建的后台构建任务。payload 必须来自数据库/Edge 的 service-role command 边界，包含 `buildId`、`requestedBy`、published-only `inputManifest`、`inputManifestHash`、`coverageMode`、`eligibleInputCount`、`includedInputCount`、`lciaMethodSet` 和可选 `defaultImpactCategory`。worker 只接受 `inputManifest.processes` 中 `stateCode/state_code` 为 `100..199` 的已发布过程；不会纳入 draft data。
 
 On success, the worker records a terminal `worker_jobs` result with:
 
@@ -171,6 +174,8 @@ On success, the worker records a terminal `worker_jobs` result with:
 - `diagnostics.lcaJob` as an optional legacy `lca_jobs` projection; if the table is absent, the projection reports `legacyTableMissing=true`
 
 On success or failure, the worker links `lca_results`, `lca_result_cache`, `lca_latest_all_unit_results`, and `lca_factorization_registry` rows back to the canonical `worker_jobs.id` where those rows exist. If optional `lca_jobs` exists, the worker also backfills `lca_jobs.worker_job_id`; if it does not exist, the compatibility write is skipped. On failure, the worker records `worker_jobs.status=failed` with `error_code=solver_worker_job_failed` and updates `lca_result_cache` failed state where a cache row exists; retained `lca_jobs.status/diagnostics` are best-effort compatibility only.
+
+For `lcia_result.package_build`, worker builds a published-only snapshot using the package `buildId` as the requested snapshot/result compatibility key, computes and persists the all-unit LCIA result artifact plus query artifact, then calls service-role RPC `public.cmd_lcia_result_package_mark_ready(...)`. Success `result_ref` uses `{"domainSource":"worker_jobs","workerJobId":"<uuid>","buildId":"<uuid>","package":{"table":"lcia_result_packages","id":"<uuid>"}}`; failures use package-specific error codes and do not update `lca_result_cache` or optional legacy `lca_jobs`.
 
 ## 4. 作业状态机
 
@@ -190,7 +195,7 @@ legacy pgmq/debug 路径语义：
 - `invalidate_factorization`: 通常直接 `completed`。
 - 失败路径统一落 `failed`，错误详情在 `lca_jobs.diagnostics`。
 
-`worker_jobs` 路径的外层生命周期是 `queued/stale -> running -> completed|failed|cancelled`。`phase` 使用 `solve_one`、`solve_batch`、`solve_all_unit`、`build_snapshot`、`analyze_contribution_path` 或 `prepare_factorization`，`progress` 仅作为任务中心提示，不替代 domain artifact 状态。
+`worker_jobs` 路径的外层生命周期是 `queued/stale -> running -> completed|failed|cancelled`。`phase` 使用 `solve_one`、`solve_batch`、`solve_all_unit`、`build_snapshot`、`analyze_contribution_path`、`prepare_factorization` 或 `lcia_result_package_build`，`progress` 仅作为任务中心提示，不替代 domain artifact 状态。
 
 ## 5. 结果契约
 
