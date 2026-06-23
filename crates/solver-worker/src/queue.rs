@@ -8,7 +8,8 @@ use uuid::Uuid;
 
 use crate::{
     db::{
-        AppState, archive_queue_message, handle_job_payload, latest_result_id_for_job,
+        AppState, archive_queue_message, handle_job_payload,
+        handle_lcia_result_package_build_worker_job, latest_result_id_for_job,
         mark_result_cache_failed, read_one_queue_message, update_job_status,
     },
     types::JobPayload,
@@ -26,7 +27,7 @@ fn extract_snapshot_id(payload: &JobPayload) -> Option<Uuid> {
         | JobPayload::AnalyzeContributionPath { snapshot_id, .. }
         | JobPayload::InvalidateFactorization { snapshot_id, .. }
         | JobPayload::RebuildFactorization { snapshot_id, .. } => Some(*snapshot_id),
-        JobPayload::BuildSnapshot { .. } => None,
+        JobPayload::BuildSnapshot { .. } | JobPayload::LciaResultPackageBuild { .. } => None,
     }
 }
 
@@ -273,16 +274,23 @@ async fn process_solver_worker_job(state: &AppState, job: WorkerJob, lease_secon
 
     let lca_job_id = extract_job_id(&payload);
     let phase = solver_worker_phase(&payload);
+    let heartbeat_details = match &payload {
+        JobPayload::LciaResultPackageBuild { build_id, .. } => json!({
+            "buildId": build_id,
+            "payloadType": payload_type_name(&payload),
+        }),
+        _ => json!({
+            "lcaJobId": lca_job_id,
+            "payloadType": payload_type_name(&payload),
+        }),
+    };
     if let Err(err) = crate::worker_jobs::heartbeat_worker_job(
         &state.pool,
         job.id,
         job.lease_token,
         phase,
         0.05,
-        Some(json!({
-            "lcaJobId": lca_job_id,
-            "payloadType": payload_type_name(&payload),
-        })),
+        Some(heartbeat_details),
         lease_seconds,
     )
     .await
@@ -296,7 +304,16 @@ async fn process_solver_worker_job(state: &AppState, job: WorkerJob, lease_secon
         return;
     }
 
-    match handle_job_payload(state, payload.clone()).await {
+    let execution_result = match &payload {
+        JobPayload::LciaResultPackageBuild { .. } => {
+            handle_lcia_result_package_build_worker_job(state, job.id, &payload)
+                .await
+                .map(|_| ())
+        }
+        _ => handle_job_payload(state, payload.clone()).await,
+    };
+
+    match execution_result {
         Ok(()) => {
             record_solver_worker_job_success(state, &job, &payload, lca_job_id).await;
         }
@@ -349,6 +366,37 @@ async fn record_solver_worker_job_failure(
         lca_job_id = %lca_job_id,
         "solver worker_jobs execution failed"
     );
+    if let JobPayload::LciaResultPackageBuild { build_id, .. } = payload {
+        let diagnostics = json!({
+            "error": err_message,
+            "buildId": build_id,
+        });
+        let mut result = WorkerJobResult::failed(
+            "lcia_result_package_build_failed",
+            err_message.to_owned(),
+            json!({
+                "workerJobId": job.id,
+                "buildId": build_id,
+                "payloadType": payload_type_name(payload),
+            }),
+            Some(diagnostics),
+            Some(json!({
+                "workerJobId": job.id,
+                "buildId": build_id,
+                "payloadType": payload_type_name(payload),
+            })),
+        );
+        result.result_ref = Some(lcia_result_package_worker_result_ref(
+            job.id, *build_id, None,
+        ));
+        if let Err(record_err) =
+            record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
+        {
+            error!(error = %record_err, worker_job_id = %job.id, "failed to record lcia result package worker_jobs failure");
+        }
+        return;
+    }
+
     let diagnostics = build_failure_diagnostics(&state.pool, payload, err_message).await;
     let _ = update_job_status(&state.pool, lca_job_id, "failed", diagnostics.clone()).await;
     let _ = mark_result_cache_failed(&state.pool, lca_job_id, "job_execution_failed", err_message)
@@ -404,6 +452,33 @@ async fn record_solver_worker_job_success(
                 lca_job_id = %lca_job_id,
                 "solver worker_jobs execution completed but result projection failed"
             );
+            if let JobPayload::LciaResultPackageBuild { build_id, .. } = payload {
+                let mut result = WorkerJobResult::failed(
+                    "lcia_result_package_projection_failed",
+                    err_message.clone(),
+                    json!({
+                        "workerJobId": job.id,
+                        "buildId": build_id,
+                        "payloadType": payload_type_name(payload),
+                    }),
+                    Some(json!({"error": err_message})),
+                    Some(json!({
+                        "workerJobId": job.id,
+                        "buildId": build_id,
+                        "payloadType": payload_type_name(payload),
+                    })),
+                );
+                result.result_ref = Some(lcia_result_package_worker_result_ref(
+                    job.id, *build_id, None,
+                ));
+                if let Err(record_err) =
+                    record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
+                {
+                    error!(error = %record_err, worker_job_id = %job.id, "failed to record lcia result package worker_jobs projection failure");
+                }
+                return;
+            }
+
             let mut result = WorkerJobResult::failed(
                 "solver_worker_job_projection_failed",
                 err_message.clone(),
@@ -430,6 +505,39 @@ async fn build_solver_worker_job_result(
     worker_job_id: Uuid,
     payload: &JobPayload,
 ) -> anyhow::Result<WorkerJobResult> {
+    if let JobPayload::LciaResultPackageBuild { build_id, .. } = payload {
+        let package_projection =
+            fetch_lcia_result_package_projection(&state.pool, worker_job_id).await?;
+        let package_id = package_projection
+            .get("packageId")
+            .and_then(Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok());
+        return Ok(WorkerJobResult {
+            status: "completed".to_owned(),
+            result_json: Some(json!({
+                "workerJobId": worker_job_id,
+                "buildId": build_id,
+                "payloadType": payload_type_name(payload),
+                "package": package_projection,
+            })),
+            result_schema_version: Some(result_schema_version_for_payload(payload).to_owned()),
+            result_ref: Some(lcia_result_package_worker_result_ref(
+                worker_job_id,
+                *build_id,
+                package_id,
+            )),
+            diagnostics: Some(json!({
+                "lciaResultPackage": package_projection,
+            })),
+            error_code: None,
+            error_message: None,
+            error_details: None,
+            blocker_codes: Vec::new(),
+            resolution_scope: None,
+            retryable: None,
+        });
+    }
+
     let lca_job_id = extract_job_id(payload);
     link_lca_worker_job_domain_refs(&state.pool, worker_job_id, lca_job_id).await?;
     let job_projection = fetch_lca_job_projection(&state.pool, lca_job_id).await?;
@@ -464,6 +572,66 @@ async fn build_solver_worker_job_result(
         blocker_codes: Vec::new(),
         resolution_scope: None,
         retryable: None,
+    })
+}
+
+async fn fetch_lcia_result_package_projection(
+    pool: &sqlx::PgPool,
+    worker_job_id: Uuid,
+) -> anyhow::Result<Value> {
+    let row = sqlx::query(
+        r"
+        SELECT id, package_version, status, build_id, snapshot_id, result_id,
+               latest_all_unit_result_id, included_input_count, created_at
+        FROM public.lcia_result_packages
+        WHERE build_worker_job_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+        ",
+    )
+    .bind(worker_job_id)
+    .fetch_optional(pool)
+    .await;
+
+    let Some(row) = (match row {
+        Ok(row) => row,
+        Err(err) if is_undefined_table(&err) => {
+            return Err(anyhow::anyhow!(
+                "lcia_result_packages table is missing for package worker result projection"
+            ));
+        }
+        Err(err) => return Err(err.into()),
+    }) else {
+        return Err(anyhow::anyhow!(
+            "lcia_result package not found for worker_job_id={worker_job_id}"
+        ));
+    };
+
+    Ok(json!({
+        "packageId": row.try_get::<Uuid, _>("id").ok(),
+        "packageVersion": row.try_get::<String, _>("package_version").ok(),
+        "status": row.try_get::<String, _>("status").ok(),
+        "buildId": row.try_get::<Uuid, _>("build_id").ok(),
+        "snapshotId": row.try_get::<Uuid, _>("snapshot_id").ok(),
+        "resultId": row.try_get::<Uuid, _>("result_id").ok(),
+        "latestAllUnitResultId": row.try_get::<Option<Uuid>, _>("latest_all_unit_result_id").ok().flatten(),
+        "includedInputCount": row.try_get::<i32, _>("included_input_count").ok(),
+    }))
+}
+
+fn lcia_result_package_worker_result_ref(
+    worker_job_id: Uuid,
+    build_id: Uuid,
+    package_id: Option<Uuid>,
+) -> Value {
+    json!({
+        "domainSource": "worker_jobs",
+        "workerJobId": worker_job_id,
+        "buildId": build_id,
+        "package": package_id.map(|id| json!({
+            "table": "lcia_result_packages",
+            "id": id,
+        })),
     })
 }
 
@@ -683,6 +851,26 @@ fn normalize_worker_payload_object(value: Value) -> anyhow::Result<Map<String, V
     copy_alias(&mut payload, "methodId", "method_id");
     copy_alias(&mut payload, "methodVersion", "method_version");
     copy_alias(&mut payload, "noLcia", "no_lcia");
+    copy_alias(&mut payload, "buildId", "build_id");
+    copy_alias(&mut payload, "requestedBy", "requested_by");
+    copy_alias(&mut payload, "coverageMode", "coverage_mode");
+    copy_alias(&mut payload, "inputStatusFilter", "input_status_filter");
+    copy_alias(
+        &mut payload,
+        "eligibilityDefinition",
+        "eligibility_definition",
+    );
+    copy_alias(&mut payload, "eligibleInputCount", "eligible_input_count");
+    copy_alias(&mut payload, "includedInputCount", "included_input_count");
+    copy_alias(&mut payload, "inputManifestHash", "input_manifest_hash");
+    copy_alias(&mut payload, "inputManifest", "input_manifest");
+    copy_alias(&mut payload, "lciaMethodSet", "lcia_method_set");
+    copy_alias(
+        &mut payload,
+        "defaultImpactCategory",
+        "default_impact_category",
+    );
+    copy_alias(&mut payload, "postprocessManifest", "postprocess_manifest");
     normalize_request_roots(&mut payload);
 
     Ok(payload)
@@ -718,6 +906,7 @@ fn payload_schema_version_for_job_kind(job_kind: &str) -> Option<&'static str> {
         "lca.build_snapshot" => Some("lca.build_snapshot.request.v1"),
         "lca.contribution_path" => Some("lca.contribution_path.request.v1"),
         "lca.factorization_prepare" => Some("lca.factorization_prepare.request.v1"),
+        "lcia_result.package_build" => Some("lcia_result.package_build.request.v1"),
         _ => None,
     }
 }
@@ -730,6 +919,7 @@ fn payload_type_for_job_kind(job_kind: &str) -> Option<&'static str> {
         "lca.build_snapshot" => Some("build_snapshot"),
         "lca.contribution_path" => Some("analyze_contribution_path"),
         "lca.factorization_prepare" => Some("prepare_factorization"),
+        "lcia_result.package_build" => Some("lcia_result_package_build"),
         _ => None,
     }
 }
@@ -739,6 +929,7 @@ fn result_schema_version_for_payload(payload: &JobPayload) -> &'static str {
         JobPayload::BuildSnapshot { .. } => "lca.snapshot.result.v1",
         JobPayload::AnalyzeContributionPath { .. } => "lca.contribution_path.result.v1",
         JobPayload::PrepareFactorization { .. } => "lca.factorization_prepare.result.v1",
+        JobPayload::LciaResultPackageBuild { .. } => "lcia_result.package_build.result.v1",
         _ => "lca.solve.result.v1",
     }
 }
@@ -753,12 +944,14 @@ fn payload_type_name(payload: &JobPayload) -> &'static str {
         JobPayload::InvalidateFactorization { .. } => "invalidate_factorization",
         JobPayload::RebuildFactorization { .. } => "rebuild_factorization",
         JobPayload::BuildSnapshot { .. } => "build_snapshot",
+        JobPayload::LciaResultPackageBuild { .. } => "lcia_result_package_build",
     }
 }
 
 fn solver_worker_phase(payload: &JobPayload) -> &'static str {
     match payload {
         JobPayload::BuildSnapshot { .. } => "build_snapshot",
+        JobPayload::LciaResultPackageBuild { .. } => "lcia_result_package_build",
         JobPayload::AnalyzeContributionPath { .. } => "analyze_contribution_path",
         JobPayload::PrepareFactorization { .. } | JobPayload::RebuildFactorization { .. } => {
             "prepare_factorization"
@@ -853,6 +1046,7 @@ fn extract_job_id(payload: &JobPayload) -> uuid::Uuid {
         | JobPayload::InvalidateFactorization { job_id, .. }
         | JobPayload::RebuildFactorization { job_id, .. }
         | JobPayload::BuildSnapshot { job_id, .. } => *job_id,
+        JobPayload::LciaResultPackageBuild { build_id, .. } => *build_id,
     }
 }
 
@@ -1014,6 +1208,60 @@ mod tests {
                 assert_eq!(request_roots.expect("roots")[0].process_id, process_id);
                 assert_eq!(process_states.as_deref(), Some("100,101"));
                 assert_eq!(no_lcia, Some(true));
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_worker_jobs_lcia_result_package_build_payload() {
+        let build_id = Uuid::new_v4();
+        let process_id = Uuid::new_v4();
+        let requested_by = Uuid::new_v4();
+        let job = worker_job(
+            "lcia_result.package_build",
+            "lcia_result.package_build.request.v1",
+            json!({
+                "type": "lcia_result_package_build",
+                "buildId": build_id,
+                "requestedBy": requested_by,
+                "coverageMode": "global_eligible",
+                "eligibleInputCount": 1,
+                "includedInputCount": 1,
+                "inputManifestHash": "hash-1",
+                "inputManifest": {
+                    "predicateVersion": "published-state-code-100-199:v1",
+                    "processes": [
+                        {
+                            "id": process_id,
+                            "version": "01.00.000",
+                            "stateCode": 100
+                        }
+                    ]
+                },
+                "lciaMethodSet": [],
+                "defaultImpactCategory": "climate-change"
+            }),
+        );
+
+        let payload = solver_worker_job_payload(&job).expect("payload");
+
+        match payload {
+            JobPayload::LciaResultPackageBuild {
+                build_id: parsed_build_id,
+                requested_by: parsed_requested_by,
+                coverage_mode,
+                included_input_count,
+                input_manifest_hash,
+                default_impact_category,
+                ..
+            } => {
+                assert_eq!(parsed_build_id, build_id);
+                assert_eq!(parsed_requested_by, requested_by);
+                assert_eq!(coverage_mode, "global_eligible");
+                assert_eq!(included_input_count, 1);
+                assert_eq!(input_manifest_hash, "hash-1");
+                assert_eq!(default_impact_category.as_deref(), Some("climate-change"));
             }
             other => panic!("unexpected payload: {other:?}"),
         }

@@ -52,6 +52,8 @@ related:
 - `GET /lca/results/:resultId`
 - `POST /lca/prepare`（管理员/运维）
 - `POST /lca/invalidate`（管理员/运维）
+- `POST /data-products/lcia-result-packages/build`（data product manager）
+- `POST /data-products/lcia-result-packages/:packageId/publish`（data product manager）
 
 ## 3. `POST /lca/solve` 输入/输出
 
@@ -154,6 +156,8 @@ Header 建议：
 
 worker 侧以 `worker_jobs` 为任务生命周期事实，并继续推进 domain/cache 表：`lca_result_cache` 从 `pending -> running -> ready`（或失败时 `failed`）。终态写回时会把 `lca_results`、`lca_result_cache`、`lca_latest_all_unit_results`、`lca_factorization_registry` 中可关联的 rows 回填到同一个 `worker_job_id`；optional `lca_jobs` 存在时才做 best-effort retained row 回填。
 
+LCIA result package 构建走同一个 `worker_jobs(worker_queue=solver)` 生命周期，但不是普通 `/lca/solve` 请求。Edge 的 data product manager command 应先通过数据库 command 解析权限、published-only eligibility 和默认 impact category，再 enqueue `job_kind=lcia_result.package_build` / `payload_schema_version=lcia_result.package_build.request.v1`。payload 使用数据库返回的 `buildId`、`requestedBy`、`coverageMode`、`inputManifest`、`inputManifestHash`、`eligibleInputCount`、`includedInputCount`、`lciaMethodSet` 和可选 `defaultImpactCategory`；worker 只消费已发布 `stateCode/state_code=100..199` 的 manifest 输入。worker 完成后用 service-role DB 连接调用 `public.cmd_lcia_result_package_mark_ready(...)` 固化 `lcia_result_packages` preview package；发布仍由 Edge manager command 调用数据库 publish RPC 完成。
+
 ## 5. 与 worker 的职责边界
 
 Edge：
@@ -170,6 +174,7 @@ worker：
 - heartbeat `worker_jobs.phase/progress`
 - 用 `worker_record_job_result` 写统一任务终态、错误、`result_json` 和 `result_ref`
 - 写 domain/cache metadata（如 `lca_results` artifact、`lca_result_cache`），并在 optional `lca_jobs` 存在时 best-effort 写兼容状态；这些都不替代 `worker_jobs` 任务生命周期事实
+- 对 `lcia_result.package_build`，构建 published-only snapshot、持久化 all-unit result/query artifacts，并通过 service-role `cmd_lcia_result_package_mark_ready` 标记 package preview ready；失败只写 `worker_jobs` package-specific result，不更新 `lca_result_cache`
 
 不要让 Edge 自己更新 worker lease/result 字段。
 
