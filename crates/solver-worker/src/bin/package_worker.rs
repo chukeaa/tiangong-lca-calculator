@@ -882,6 +882,7 @@ fn build_package_job_failure_diagnostics(
             "error": err.to_string(),
             "upload_mode": upload_err.upload_mode,
             "artifact_byte_size": upload_err.object_byte_size,
+            "max_upload_bytes": upload_err.max_upload_bytes,
             "http_status": upload_err.status_code,
             "storage_error_code": upload_err.s3_error_code,
             "part_number": upload_err.part_number,
@@ -913,13 +914,18 @@ fn package_request_cache_error_message(payload: &PackageJobPayload, err: &anyhow
             PackageJobPayload::ExportPackage { .. } => "export package",
             PackageJobPayload::ImportPackage { .. } => "package artifact",
         };
+        let max_hint = upload_err
+            .max_upload_bytes
+            .map(|size| format!(" max_upload_bytes={size}."))
+            .unwrap_or_default();
         return format!(
-            "The {operation} exceeded the object storage upload size limit; upload mode={}, stage={}, artifact_byte_size={}.",
+            "The {operation} exceeded the object storage upload size limit; upload mode={}, stage={}, artifact_byte_size={}.{}",
             upload_err.upload_mode,
             upload_err.stage,
             upload_err
                 .object_byte_size
-                .map_or_else(|| "unknown".to_owned(), |size| size.to_string())
+                .map_or_else(|| "unknown".to_owned(), |size| size.to_string()),
+            max_hint
         );
     }
 
@@ -1143,6 +1149,7 @@ mod tests {
             status_code: Some(StatusCode::PAYLOAD_TOO_LARGE.as_u16()),
             s3_error_code: Some("EntityTooLarge".to_owned()),
             object_byte_size: Some(12),
+            max_upload_bytes: None,
             part_number: None,
             part_count: None,
             message: "object upload failed".to_owned(),
@@ -1165,12 +1172,15 @@ mod tests {
             status_code: Some(StatusCode::PAYLOAD_TOO_LARGE.as_u16()),
             s3_error_code: Some("EntityTooLarge".to_owned()),
             object_byte_size: Some(34),
+            max_upload_bytes: Some(128),
             part_number: None,
             part_count: None,
             message: "object upload failed".to_owned(),
         });
 
         assert_eq!(package_request_cache_error_code(&err), "artifact_too_large");
-        assert!(package_request_cache_error_message(&payload, &err).contains("upload size limit"));
+        let message = package_request_cache_error_message(&payload, &err);
+        assert!(message.contains("upload size limit"));
+        assert!(message.contains("max_upload_bytes=128"));
     }
 }

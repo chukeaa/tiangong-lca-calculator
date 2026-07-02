@@ -338,8 +338,9 @@ Supabase 连接说明：
 - `S3_SECRET_ACCESS_KEY`
 - `S3_SESSION_TOKEN`（可选，临时凭证时使用）
 - `S3_PREFIX`（默认 `lca-results`）
+- `S3_MAX_UPLOAD_BYTES`（可选，本地 preflight 上限；应与对象存储 max-file-limit 对齐）
 
-说明：结果持久化已改为 S3-only。`S3_ENDPOINT/S3_REGION/S3_BUCKET/S3_ACCESS_KEY_ID/S3_SECRET_ACCESS_KEY` 必须同时提供。上传请求使用 SigV4 签名认证。
+说明：结果持久化已改为 S3-only。`S3_ENDPOINT/S3_REGION/S3_BUCKET/S3_ACCESS_KEY_ID/S3_SECRET_ACCESS_KEY` 必须同时提供。上传请求使用 SigV4 签名认证。若对象存储平台设置了文件大小上限，生产环境应先在平台侧调高该 max-file-limit；`S3_MAX_UPLOAD_BYTES` 只是在 worker 侧提前阻断明显超限的 artifact，避免 multipart 上传到中途才返回 `EntityTooLarge`。
 
 ## 6. 启动与检查
 

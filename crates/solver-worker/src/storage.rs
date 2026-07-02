@@ -27,6 +27,7 @@ pub struct ObjectStoreClient {
     access_key_id: String,
     secret_access_key: String,
     session_token: Option<String>,
+    max_upload_bytes: Option<u64>,
     client: reqwest::Client,
 }
 
@@ -50,6 +51,7 @@ pub struct ObjectStoreUploadError {
     pub status_code: Option<u16>,
     pub s3_error_code: Option<String>,
     pub object_byte_size: Option<u64>,
+    pub max_upload_bytes: Option<u64>,
     pub part_number: Option<usize>,
     pub part_count: Option<usize>,
     pub message: String,
@@ -92,6 +94,30 @@ impl ObjectStoreClient {
         secret_access_key: &str,
         session_token: Option<String>,
     ) -> anyhow::Result<Self> {
+        Self::new_with_upload_limit(
+            endpoint,
+            region,
+            bucket,
+            prefix,
+            access_key_id,
+            secret_access_key,
+            session_token,
+            None,
+        )
+    }
+
+    /// Creates storage client from config with an optional local upload-size limit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_upload_limit(
+        endpoint: &str,
+        region: &str,
+        bucket: &str,
+        prefix: &str,
+        access_key_id: &str,
+        secret_access_key: &str,
+        session_token: Option<String>,
+        max_upload_bytes: Option<u64>,
+    ) -> anyhow::Result<Self> {
         let endpoint = endpoint.trim_end_matches('/').to_owned();
         let region = region.trim().to_owned();
         let bucket = bucket.trim().to_owned();
@@ -113,6 +139,11 @@ impl ObjectStoreClient {
         if secret_access_key.is_empty() {
             return Err(anyhow::anyhow!("S3 secret access key must not be empty"));
         }
+        if max_upload_bytes == Some(0) {
+            return Err(anyhow::anyhow!(
+                "S3 max upload bytes must be greater than 0"
+            ));
+        }
 
         Ok(Self {
             endpoint,
@@ -122,6 +153,7 @@ impl ObjectStoreClient {
             access_key_id,
             secret_access_key,
             session_token,
+            max_upload_bytes,
             client: reqwest::Client::new(),
         })
     }
@@ -218,6 +250,12 @@ impl ObjectStoreClient {
         artifact_byte_size: u64,
     ) -> anyhow::Result<ObjectUploadResult> {
         let key = self.package_object_key(job_id, suffix, extension);
+        let upload_mode = if artifact_byte_size < MULTIPART_UPLOAD_THRESHOLD_BYTES {
+            "single_put"
+        } else {
+            "multipart"
+        };
+        self.ensure_upload_size_allowed(upload_mode, Some(artifact_byte_size))?;
         if artifact_byte_size < MULTIPART_UPLOAD_THRESHOLD_BYTES {
             let bytes = std::fs::read(file_path)?;
             return self
@@ -354,6 +392,29 @@ impl ObjectStoreClient {
         }
     }
 
+    fn ensure_upload_size_allowed(
+        &self,
+        upload_mode: &'static str,
+        object_byte_size: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let Some(max_upload_bytes) = self.max_upload_bytes else {
+            return Ok(());
+        };
+        let Some(object_byte_size) = object_byte_size else {
+            return Ok(());
+        };
+        if object_byte_size <= max_upload_bytes {
+            return Ok(());
+        }
+
+        Err(object_upload_size_limit_error(
+            "preflight_upload_size",
+            upload_mode,
+            object_byte_size,
+            max_upload_bytes,
+        ))
+    }
+
     async fn upload_object(
         &self,
         key: &str,
@@ -368,6 +429,7 @@ impl ObjectStoreClient {
 
         let payload_hash = sha256_hex(bytes.as_slice());
         let payload_size = object_byte_size.or_else(|| u64::try_from(bytes.len()).ok());
+        self.ensure_upload_size_allowed("single_put", payload_size)?;
         let (amz_date, date_stamp) = sigv4_timestamps();
         let signed = self.sign_request(
             &Method::PUT,
@@ -425,6 +487,7 @@ impl ObjectStoreClient {
         file_path: &Path,
         object_byte_size: u64,
     ) -> anyhow::Result<ObjectUploadResult> {
+        self.ensure_upload_size_allowed("multipart", Some(object_byte_size))?;
         let upload_id = self
             .create_multipart_upload(key, content_type, object_byte_size)
             .await?;
@@ -881,10 +944,32 @@ fn object_upload_error(
         status_code: Some(status.as_u16()),
         s3_error_code,
         object_byte_size,
+        max_upload_bytes: None,
         part_number,
         part_count,
         message: format!(
             "object upload failed stage={stage} upload_mode={upload_mode} status={status}{code_hint}{size_hint}{part_hint}{auth_hint} body={body_preview}"
+        ),
+    })
+}
+
+fn object_upload_size_limit_error(
+    stage: &'static str,
+    upload_mode: &'static str,
+    object_byte_size: u64,
+    max_upload_bytes: u64,
+) -> anyhow::Error {
+    anyhow::Error::new(ObjectStoreUploadError {
+        stage,
+        upload_mode,
+        status_code: None,
+        s3_error_code: Some("EntityTooLarge".to_owned()),
+        object_byte_size: Some(object_byte_size),
+        max_upload_bytes: Some(max_upload_bytes),
+        part_number: None,
+        part_count: None,
+        message: format!(
+            "object upload rejected before network upload stage={stage} upload_mode={upload_mode} object_byte_size={object_byte_size} max_upload_bytes={max_upload_bytes}; raise the storage max-file-limit or set S3_MAX_UPLOAD_BYTES above the expected artifact size"
         ),
     })
 }
@@ -909,11 +994,15 @@ fn hmac_sha256_hex(key: &[u8], data: &str) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use reqwest::StatusCode;
+    use tempfile::NamedTempFile;
+    use uuid::Uuid;
 
     use super::{
-        ObjectDeleteOutcome, ObjectStoreUploadError, extract_xml_tag, object_delete_outcome,
-        object_upload_error,
+        MULTIPART_UPLOAD_THRESHOLD_BYTES, ObjectDeleteOutcome, ObjectStoreClient,
+        ObjectStoreUploadError, extract_xml_tag, object_delete_outcome, object_upload_error,
     };
 
     #[test]
@@ -964,6 +1053,53 @@ mod tests {
         let upload_err = err
             .downcast_ref::<ObjectStoreUploadError>()
             .expect("downcast upload error");
+        assert!(upload_err.is_oversize());
+        assert_eq!(upload_err.error_code(), "artifact_too_large");
+    }
+
+    #[tokio::test]
+    async fn package_file_upload_rejects_configured_oversize_before_network_upload() {
+        let mut file = NamedTempFile::new().expect("temp file");
+        file.write_all(b"header").expect("write file header");
+        let artifact_byte_size = MULTIPART_UPLOAD_THRESHOLD_BYTES + 1;
+        file.as_file()
+            .set_len(artifact_byte_size)
+            .expect("set sparse file length");
+
+        let client = ObjectStoreClient::new_with_upload_limit(
+            "https://storage.example.test",
+            "auto",
+            "lca-results",
+            "lca-results",
+            "access-key",
+            "secret-key",
+            None,
+            Some(MULTIPART_UPLOAD_THRESHOLD_BYTES),
+        )
+        .expect("client");
+
+        let err = client
+            .upload_package_artifact_file(
+                Uuid::nil(),
+                "export-package",
+                "zip",
+                "application/zip",
+                file.path(),
+                artifact_byte_size,
+            )
+            .await
+            .expect_err("configured upload limit should reject oversized package artifact");
+        let upload_err = err
+            .downcast_ref::<ObjectStoreUploadError>()
+            .expect("downcast upload error");
+
+        assert_eq!(upload_err.stage, "preflight_upload_size");
+        assert_eq!(upload_err.upload_mode, "multipart");
+        assert_eq!(upload_err.object_byte_size, Some(artifact_byte_size));
+        assert_eq!(
+            upload_err.max_upload_bytes,
+            Some(MULTIPART_UPLOAD_THRESHOLD_BYTES)
+        );
         assert!(upload_err.is_oversize());
         assert_eq!(upload_err.error_code(), "artifact_too_large");
     }

@@ -123,6 +123,9 @@ pub struct AppConfig {
     /// Object key prefix under the bucket.
     #[arg(long, env = "S3_PREFIX", default_value = "lca-results")]
     pub s3_prefix: String,
+    /// Optional local preflight upload limit matching the storage max-file-limit.
+    #[arg(long, env = "S3_MAX_UPLOAD_BYTES")]
+    pub s3_max_upload_bytes: Option<u64>,
 }
 
 impl AppConfig {
@@ -247,6 +250,12 @@ impl AppConfig {
         Duration::from_millis(self.build_snapshot_lock_poll_ms.max(100))
     }
 
+    /// Optional local upload-size guard for object-storage writes.
+    #[must_use]
+    pub fn s3_max_upload_bytes(&self) -> Option<u64> {
+        self.s3_max_upload_bytes
+    }
+
     /// Parsed http socket addr.
     pub fn http_socket_addr(&self) -> anyhow::Result<SocketAddr> {
         SocketAddr::from_str(&self.http_addr)
@@ -349,6 +358,19 @@ mod tests {
             "postgres://pooler.example.local/app"
         );
         assert!(config.has_explicit_queue_database_url());
+    }
+
+    #[test]
+    fn parses_optional_s3_max_upload_bytes() {
+        let config = AppConfig::parse_from([
+            "solver-worker",
+            "--database-url",
+            "postgres://example.local/app",
+            "--s3-max-upload-bytes",
+            "209715200",
+        ]);
+
+        assert_eq!(config.s3_max_upload_bytes(), Some(209_715_200));
     }
 
     #[test]

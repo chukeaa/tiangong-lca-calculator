@@ -183,7 +183,7 @@ impl AppState {
         let secret_access_key = config.s3_secret_access_key.as_deref().ok_or_else(|| {
             anyhow::anyhow!("missing S3_SECRET_ACCESS_KEY: result persistence is S3-only")
         })?;
-        let object_store = ObjectStoreClient::new(
+        let object_store = ObjectStoreClient::new_with_upload_limit(
             endpoint,
             region,
             bucket,
@@ -191,6 +191,7 @@ impl AppState {
             access_key_id,
             secret_access_key,
             config.s3_session_token.clone(),
+            config.s3_max_upload_bytes(),
         )?;
 
         Ok(Self {

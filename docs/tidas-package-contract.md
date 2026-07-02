@@ -164,6 +164,12 @@ payload 必须仍携带有效 `job_id` compatibility UUID，因为 `lca_package_
 - ZIP: `application/zip`
 - report: `application/json`
 
+### 7.0.1 大 artifact 上传上限
+
+package worker 通过 S3-compatible object storage 写入 export ZIP / report artifact。对象存储平台的真实 max-file-limit 必须大于预期 package artifact 体积；例如全量 `open_data` export 可能达到数百 MB。若生产后端限制低于 artifact 体积，运维应优先调高平台侧 max-file-limit。
+
+`S3_MAX_UPLOAD_BYTES` 是 worker 本地 preflight guard，应配置为与平台侧 max-file-limit 一致或略低。设置后，worker 会在 single PUT 或 multipart upload 发起前检查 artifact byte size；超限时使用 `artifact_too_large` 失败诊断，并保留 `upload_mode`、`stage=preflight_upload_size`、`artifact_byte_size`、`max_upload_bytes` 和 `storage_error_code=EntityTooLarge`，避免 multipart 上传到中途才失败。
+
 ### 7.1 Artifact retention / GC 契约
 
 package artifact 必须带或刷新 `expires_at`：
