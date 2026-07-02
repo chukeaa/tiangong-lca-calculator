@@ -26,8 +26,8 @@ use crate::{
     },
     package_db::{PackageArtifactInsert, insert_package_artifact},
     package_types::{
-        PACKAGE_ZIP_ARTIFACT_FORMAT, PackageArtifactKind, PackageExportScope, PackageRootRef,
-        PackageRootTable,
+        PACKAGE_EXPORT_WORKER_JOB_KIND, PACKAGE_WORKER_QUEUE, PACKAGE_ZIP_ARTIFACT_FORMAT,
+        PackageArtifactKind, PackageExportScope, PackageRootRef, PackageRootTable,
     },
 };
 
@@ -658,24 +658,122 @@ pub fn clear_runtime_export_traversal_cache(job_id: Uuid) {
 }
 
 async fn fetch_package_job_diagnostics(pool: &PgPool, job_id: Uuid) -> anyhow::Result<Value> {
+    let legacy_diagnostics = fetch_legacy_package_job_diagnostics(pool, job_id).await?;
+    if legacy_diagnostics
+        .as_ref()
+        .is_some_and(diagnostics_has_export_seed_scan_resume_state)
+    {
+        return Ok(legacy_diagnostics.unwrap_or_else(|| json!({})));
+    }
+
+    let worker_jobs_diagnostics = fetch_worker_package_job_diagnostics(pool, job_id).await?;
+    Ok(select_package_job_diagnostics_for_resume(
+        legacy_diagnostics,
+        worker_jobs_diagnostics,
+    ))
+}
+
+async fn fetch_legacy_package_job_diagnostics(
+    pool: &PgPool,
+    job_id: Uuid,
+) -> anyhow::Result<Option<Value>> {
     let result = sqlx::query(
         r"
         SELECT diagnostics
-        FROM lca_package_jobs
+        FROM public.lca_package_jobs
         WHERE id = $1
         ",
     )
     .bind(job_id)
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await;
     match result {
-        Ok(row) => Ok(row
-            .try_get::<Option<Value>, _>("diagnostics")?
-            .unwrap_or_else(|| json!({}))),
-        Err(sqlx::Error::RowNotFound) => Ok(json!({})),
-        Err(err) if is_undefined_table(&err) => Ok(json!({})),
+        Ok(Some(row)) => Ok(Some(
+            row.try_get::<Option<Value>, _>("diagnostics")?
+                .unwrap_or_else(|| json!({})),
+        )),
+        Ok(None) => Ok(None),
+        Err(err) if is_undefined_table(&err) => Ok(None),
         Err(err) => Err(err.into()),
     }
+}
+
+async fn fetch_worker_package_job_diagnostics(
+    pool: &PgPool,
+    job_id: Uuid,
+) -> anyhow::Result<Option<Value>> {
+    let job_id_text = job_id.to_string();
+    let result = sqlx::query(
+        r"
+        SELECT diagnostics
+        FROM public.worker_jobs
+        WHERE worker_queue = $1
+          AND job_kind = $2
+          AND (
+              subject_id = $3
+              OR payload_json->>'job_id' = $4
+              OR payload_json->>'jobId' = $4
+              OR payload_json->>'packageJobId' = $4
+          )
+        ORDER BY updated_at DESC, created_at DESC
+        LIMIT 1
+        ",
+    )
+    .bind(PACKAGE_WORKER_QUEUE)
+    .bind(PACKAGE_EXPORT_WORKER_JOB_KIND)
+    .bind(job_id)
+    .bind(job_id_text)
+    .fetch_optional(pool)
+    .await;
+
+    match result {
+        Ok(Some(row)) => Ok(Some(
+            row.try_get::<Option<Value>, _>("diagnostics")?
+                .unwrap_or_else(|| json!({})),
+        )),
+        Ok(None) => Ok(None),
+        Err(err) if is_undefined_table(&err) => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn select_package_job_diagnostics_for_resume(
+    legacy_diagnostics: Option<Value>,
+    worker_jobs_diagnostics: Option<Value>,
+) -> Value {
+    if legacy_diagnostics
+        .as_ref()
+        .is_some_and(diagnostics_has_export_seed_scan_resume_state)
+    {
+        return legacy_diagnostics.unwrap_or_else(|| json!({}));
+    }
+
+    if worker_jobs_diagnostics
+        .as_ref()
+        .is_some_and(diagnostics_has_export_seed_scan_resume_state)
+    {
+        return worker_jobs_diagnostics.unwrap_or_else(|| json!({}));
+    }
+
+    legacy_diagnostics
+        .or(worker_jobs_diagnostics)
+        .unwrap_or_else(|| json!({}))
+}
+
+fn diagnostics_has_export_seed_scan_resume_state(diagnostics: &Value) -> bool {
+    if diagnostics
+        .get("seed_scan_complete")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    diagnostics
+        .get("seed_scan")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<ExportSeedScanState>(value).ok())
+        .is_some()
 }
 
 fn load_export_seed_scan_state(diagnostics: &Value) -> ExportSeedScanState {
@@ -4289,7 +4387,8 @@ mod tests {
         parse_tidas_validation_report, partition_conflicts_from_rows, plan_reference_resolution,
         preflight_import_validation, remember_root_in_traversal_cache,
         report_from_validation_failure, resolve_exact_or_latest_roots,
-        resolve_referenced_entries_from_rows, store_runtime_export_traversal_cache,
+        resolve_referenced_entries_from_rows, select_package_job_diagnostics_for_resume,
+        store_runtime_export_traversal_cache,
     };
     use crate::package_types::{PackageExportScope, PackageRootRef, PackageRootTable};
 
@@ -4735,6 +4834,35 @@ mod tests {
 
         clear_runtime_export_traversal_cache(job_id);
         assert!(load_runtime_export_traversal_cache(job_id).is_none());
+    }
+
+    #[test]
+    fn package_diagnostics_falls_back_to_worker_jobs_seed_scan_when_legacy_missing() {
+        let last_id = Uuid::from_u128(16);
+        let worker_jobs_diagnostics = json!({
+            "phase": "export_package",
+            "stage": "scan_seed_roots",
+            "seed_scan_complete": false,
+            "seed_scan": {
+                "table_index": 2,
+                "last_id": last_id,
+                "last_version": "01.01.000",
+                "scanned_seed_count": 512,
+                "discovered_external_count": 7,
+                "complete": false
+            }
+        });
+
+        let selected =
+            select_package_job_diagnostics_for_resume(None, Some(worker_jobs_diagnostics));
+        let state = super::load_export_seed_scan_state(&selected);
+
+        assert_eq!(state.table_index, 2);
+        assert_eq!(state.last_id, Some(last_id));
+        assert_eq!(state.last_version.as_deref(), Some("01.01.000"));
+        assert_eq!(state.scanned_seed_count, 512);
+        assert_eq!(state.discovered_external_count, 7);
+        assert!(!state.complete);
     }
 
     #[test]

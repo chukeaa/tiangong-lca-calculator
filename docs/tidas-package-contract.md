@@ -255,6 +255,7 @@ legacy pgmq/debug 路径语义：
 
 - legacy `export_package` 多 pass 通过重新写入 `pgmq.lca_package_jobs` 继续执行；
 - `worker_jobs` 模式下，worker runtime 不再把 continuation 写回 legacy pgmq，而是在同一个 worker job lease 内连续执行 export pass，并在 pass 间 heartbeat；
+- `worker_jobs` 模式下，长导出的 seed-scan continuation state 以 `worker_jobs.diagnostics.seed_scan` 为 canonical resume source；当 optional `lca_package_jobs` 缺失或没有可用 seed-scan diagnostics 时，worker 必须从最新匹配 `tidas.export_package` worker job diagnostics 恢复游标；
 - 因此 `PACKAGE_WORKER_JOBS_LEASE_SECONDS` 必须大于正常单 pass 时间，长导出仍应依赖 pass 间 heartbeat 续租。
 
 ## 9. 权限边界
