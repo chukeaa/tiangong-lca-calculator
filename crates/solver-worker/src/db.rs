@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     io::ErrorKind,
     path::PathBuf,
     process::Command,
@@ -59,6 +60,45 @@ pub struct AppState {
 const DEFAULT_ALL_UNIT_BATCH_SIZE: usize = 128;
 const MAX_ALL_UNIT_BATCH_SIZE: usize = 2_048;
 const BUILD_SNAPSHOT_ADVISORY_LOCK_BASE: i64 = 0x5447_4c43_4253_4e50;
+const ACQUIRE_BUILD_SNAPSHOT_WORKER_JOBS_SLOT_SQL: &str = r"
+WITH _service_role AS (
+    SELECT set_config('request.jwt.claim.role', 'service_role', true)
+),
+_lock AS (
+    SELECT pg_advisory_xact_lock($5)
+    FROM _service_role
+),
+active_builds AS (
+    SELECT count(active.id)::integer AS active_build_count
+    FROM _lock
+    LEFT JOIN public.worker_jobs AS active
+      ON active.worker_runtime = 'calculator'
+     AND active.worker_queue = 'solver'
+     AND active.job_kind = 'lca.build_snapshot'
+     AND active.status = 'running'
+     AND active.phase = 'build_snapshot'
+     AND active.lease_expires_at >= NOW()
+     AND active.id <> $1
+),
+updated AS (
+    UPDATE public.worker_jobs AS job
+       SET phase = 'build_snapshot',
+           progress = GREATEST(COALESCE(job.progress, 0), 0.10),
+           diagnostics = COALESCE(job.diagnostics, '{}'::jsonb) || $6::jsonb,
+           heartbeat_at = NOW(),
+           lease_expires_at = NOW() + ($4::integer * interval '1 second'),
+           updated_at = NOW()
+      FROM active_builds
+     WHERE job.id = $1
+       AND job.lease_token is not distinct from $2
+       AND job.status = 'running'
+       AND job.lease_expires_at >= NOW()
+       AND active_builds.active_build_count < $3
+     RETURNING active_builds.active_build_count
+)
+SELECT active_build_count
+FROM updated
+";
 const REVIEW_SUBMIT_SNAPSHOT_ARTIFACT_PURPOSE: &str = "review_submit_overlay";
 const REVIEW_SUBMIT_SNAPSHOT_TTL_SECONDS: i64 = 14 * 24 * 60 * 60;
 
@@ -75,23 +115,54 @@ fn pgmq_queue_name_literal(queue_name: &str) -> anyhow::Result<String> {
 
 struct BuildSnapshotLockGuard {
     tx: Option<Transaction<'static, Postgres>>,
-    key: i64,
-    slot: u32,
+    key: Option<i64>,
+    slot: Option<u32>,
     wait_sec: f64,
     max_concurrency: u32,
     acquired_at: Instant,
+    strategy: &'static str,
+    worker_lease: Option<BuildSnapshotWorkerLease>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BuildSnapshotWorkerLease {
+    pub(crate) worker_job_id: Uuid,
+    pub(crate) lease_token: Uuid,
+    pub(crate) lease_seconds: i32,
 }
 
 impl BuildSnapshotLockGuard {
     fn diagnostics(&self) -> Value {
-        serde_json::json!({
+        let mut diagnostics = serde_json::json!({
             "enabled": true,
-            "strategy": "postgres_transaction_advisory_lock",
+            "strategy": self.strategy,
             "max_concurrency": self.max_concurrency,
-            "slot": self.slot,
             "wait_sec": self.wait_sec,
             "hold_sec": self.acquired_at.elapsed().as_secs_f64(),
-        })
+        });
+        if let Some(payload) = diagnostics.as_object_mut() {
+            if let Some(key) = self.key {
+                payload.insert("lock_key".to_owned(), serde_json::json!(key));
+            }
+            if let Some(slot) = self.slot {
+                payload.insert("slot".to_owned(), serde_json::json!(slot));
+            }
+            if let Some(lease) = &self.worker_lease {
+                payload.insert(
+                    "worker_job_id".to_owned(),
+                    serde_json::json!(lease.worker_job_id),
+                );
+                payload.insert(
+                    "lease_token".to_owned(),
+                    serde_json::json!(lease.lease_token),
+                );
+                payload.insert(
+                    "lease_seconds".to_owned(),
+                    serde_json::json!(lease.lease_seconds),
+                );
+            }
+        }
+        diagnostics
     }
 
     async fn release(mut self) -> anyhow::Result<()> {
@@ -102,8 +173,8 @@ impl BuildSnapshotLockGuard {
         let hold_sec = self.acquired_at.elapsed().as_secs_f64();
         tx.commit().await?;
         info!(
-            lock_key = self.key,
-            slot = self.slot,
+            lock_key = ?self.key,
+            slot = ?self.slot,
             max_concurrency = self.max_concurrency,
             wait_sec = self.wait_sec,
             hold_sec,
@@ -119,8 +190,8 @@ impl Drop for BuildSnapshotLockGuard {
         if self.tx.is_some() {
             let hold_sec = self.acquired_at.elapsed().as_secs_f64();
             warn!(
-                lock_key = self.key,
-                slot = self.slot,
+                lock_key = ?self.key,
+                slot = ?self.slot,
                 max_concurrency = self.max_concurrency,
                 wait_sec = self.wait_sec,
                 hold_sec,
@@ -129,6 +200,15 @@ impl Drop for BuildSnapshotLockGuard {
             );
         }
     }
+}
+
+fn build_snapshot_heartbeat_interval(lease_seconds: i32) -> Duration {
+    let lease_seconds = lease_seconds.clamp(1, 86_400);
+    Duration::from_secs(u64::from((lease_seconds / 3).clamp(1, 60).cast_unsigned()))
+}
+
+fn acquire_build_snapshot_worker_jobs_slot_sql() -> &'static str {
+    ACQUIRE_BUILD_SNAPSHOT_WORKER_JOBS_SLOT_SQL
 }
 
 impl AppState {
@@ -248,16 +328,93 @@ async fn acquire_build_snapshot_lock(
                 );
                 return Ok(BuildSnapshotLockGuard {
                     tx: Some(tx),
-                    key,
-                    slot,
+                    key: Some(key),
+                    slot: Some(slot),
                     wait_sec,
                     max_concurrency,
                     acquired_at: Instant::now(),
+                    strategy: "postgres_transaction_advisory_lock",
+                    worker_lease: None,
                 });
             }
             tx.rollback().await?;
         }
 
+        sleep(poll_interval).await;
+    }
+}
+
+async fn acquire_build_snapshot_worker_jobs_slot(
+    pool: &PgPool,
+    max_concurrency: u32,
+    poll_interval: Duration,
+    lease: BuildSnapshotWorkerLease,
+) -> anyhow::Result<BuildSnapshotLockGuard> {
+    let started = Instant::now();
+    let max_concurrency = max_concurrency.max(1);
+    let poll_interval = poll_interval.max(Duration::from_millis(100));
+    let lease_seconds = lease.lease_seconds.clamp(1, 86_400);
+
+    loop {
+        let wait_sec = started.elapsed().as_secs_f64();
+        let diagnostics = serde_json::json!({
+            "build_snapshot_lock": {
+                "enabled": true,
+                "strategy": "worker_jobs_phase_lease",
+                "max_concurrency": max_concurrency,
+                "wait_sec": wait_sec,
+                "waiting": false,
+            }
+        });
+        let row = sqlx::query(acquire_build_snapshot_worker_jobs_slot_sql())
+            .bind(lease.worker_job_id)
+            .bind(lease.lease_token)
+            .bind(i32::try_from(max_concurrency).unwrap_or(i32::MAX))
+            .bind(lease_seconds)
+            .bind(BUILD_SNAPSHOT_ADVISORY_LOCK_BASE)
+            .bind(diagnostics)
+            .fetch_optional(pool)
+            .await?;
+
+        if let Some(row) = row {
+            let active_build_count = row.try_get::<i32, _>("active_build_count")?;
+            info!(
+                worker_job_id = %lease.worker_job_id,
+                max_concurrency,
+                active_build_count,
+                wait_sec,
+                "acquired build_snapshot worker_jobs lease slot"
+            );
+            return Ok(BuildSnapshotLockGuard {
+                tx: None,
+                key: Some(BUILD_SNAPSHOT_ADVISORY_LOCK_BASE),
+                slot: Some(active_build_count.max(0).cast_unsigned()),
+                wait_sec,
+                max_concurrency,
+                acquired_at: Instant::now(),
+                strategy: "worker_jobs_phase_lease",
+                worker_lease: Some(lease),
+            });
+        }
+
+        crate::worker_jobs::heartbeat_worker_job(
+            pool,
+            lease.worker_job_id,
+            lease.lease_token,
+            "waiting_for_build_snapshot_lock",
+            0.05,
+            Some(serde_json::json!({
+                "build_snapshot_lock": {
+                    "enabled": true,
+                    "strategy": "worker_jobs_phase_lease",
+                    "max_concurrency": max_concurrency,
+                    "wait_sec": wait_sec,
+                    "waiting": true,
+                }
+            })),
+            lease_seconds,
+        )
+        .await?;
         sleep(poll_interval).await;
     }
 }
@@ -801,8 +958,35 @@ fn is_undefined_table(err: &sqlx::Error) -> bool {
 
 /// Executes one queue payload end-to-end.
 #[instrument(skip(state))]
-#[allow(clippy::too_many_lines)]
 pub async fn handle_job_payload(state: &AppState, payload: JobPayload) -> anyhow::Result<()> {
+    handle_job_payload_with_worker_lease(state, payload, None).await
+}
+
+pub(crate) async fn handle_worker_jobs_job_payload(
+    state: &AppState,
+    payload: JobPayload,
+    worker_job_id: Uuid,
+    lease_token: Uuid,
+    lease_seconds: i32,
+) -> anyhow::Result<()> {
+    handle_job_payload_with_worker_lease(
+        state,
+        payload,
+        Some(BuildSnapshotWorkerLease {
+            worker_job_id,
+            lease_token,
+            lease_seconds,
+        }),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn handle_job_payload_with_worker_lease(
+    state: &AppState,
+    payload: JobPayload,
+    build_snapshot_worker_lease: Option<BuildSnapshotWorkerLease>,
+) -> anyhow::Result<()> {
     match payload {
         JobPayload::PrepareFactorization {
             job_id,
@@ -1210,6 +1394,11 @@ pub async fn handle_job_payload(state: &AppState, payload: JobPayload) -> anyhow
             method_version,
             no_lcia,
         } => {
+            let lock_strategy = if build_snapshot_worker_lease.is_some() {
+                "worker_jobs_phase_lease"
+            } else {
+                "postgres_transaction_advisory_lock"
+            };
             let running_db_write_sec = update_job_status(
                 &state.pool,
                 job_id,
@@ -1219,7 +1408,7 @@ pub async fn handle_job_payload(state: &AppState, payload: JobPayload) -> anyhow
                     "snapshot_id": snapshot_id,
                     "build_snapshot_lock": {
                         "enabled": true,
-                        "strategy": "postgres_transaction_advisory_lock",
+                        "strategy": lock_strategy,
                         "max_concurrency": state.build_snapshot_max_concurrency,
                         "waiting": true,
                     },
@@ -1227,12 +1416,25 @@ pub async fn handle_job_payload(state: &AppState, payload: JobPayload) -> anyhow
             )
             .await?;
 
-            let lock_guard = acquire_build_snapshot_lock(
-                &state.pool,
-                state.build_snapshot_max_concurrency,
-                state.build_snapshot_lock_poll_interval,
-            )
-            .await?;
+            let lock_guard = match build_snapshot_worker_lease.clone() {
+                Some(lease) => {
+                    acquire_build_snapshot_worker_jobs_slot(
+                        &state.pool,
+                        state.build_snapshot_max_concurrency,
+                        state.build_snapshot_lock_poll_interval,
+                        lease,
+                    )
+                    .await?
+                }
+                None => {
+                    acquire_build_snapshot_lock(
+                        &state.pool,
+                        state.build_snapshot_max_concurrency,
+                        state.build_snapshot_lock_poll_interval,
+                    )
+                    .await?
+                }
+            };
             let mut build_snapshot_lock = lock_guard.diagnostics();
             if let Some(lock_payload) = build_snapshot_lock.as_object_mut() {
                 lock_payload.insert("waiting".to_owned(), Value::Bool(false));
@@ -1249,7 +1451,7 @@ pub async fn handle_job_payload(state: &AppState, payload: JobPayload) -> anyhow
             )
             .await?;
 
-            let executed_result = run_snapshot_builder_job(
+            let build_future = run_snapshot_builder_job(
                 snapshot_id,
                 process_states.as_deref(),
                 include_user_id,
@@ -1267,8 +1469,23 @@ pub async fn handle_job_payload(state: &AppState, payload: JobPayload) -> anyhow
                 None,
                 None,
                 no_lcia.unwrap_or(false),
-            )
-            .await;
+            );
+            let executed_result = match build_snapshot_worker_lease.as_ref() {
+                Some(lease) => {
+                    run_snapshot_builder_job_with_worker_heartbeat(
+                        &state.pool,
+                        lease,
+                        build_snapshot_lock.clone(),
+                        build_future,
+                    )
+                    .await
+                }
+                None => build_future.await,
+            };
+            let mut completed_build_snapshot_lock = lock_guard.diagnostics();
+            if let Some(lock_payload) = completed_build_snapshot_lock.as_object_mut() {
+                lock_payload.insert("waiting".to_owned(), Value::Bool(false));
+            }
             let release_result = lock_guard.release().await;
             let executed = match executed_result {
                 Ok(executed) => {
@@ -1289,9 +1506,30 @@ pub async fn handle_job_payload(state: &AppState, payload: JobPayload) -> anyhow
                     return Err(err);
                 }
             };
+            let build_snapshot_lock = completed_build_snapshot_lock;
 
             let resolved_snapshot_id = executed.resolved_snapshot_id;
             let build_timing_sec = executed.build_timing_sec.clone();
+            if let Some(lease) = &build_snapshot_worker_lease {
+                crate::worker_jobs::heartbeat_worker_job(
+                    &state.pool,
+                    lease.worker_job_id,
+                    lease.lease_token,
+                    "build_snapshot",
+                    0.90,
+                    Some(serde_json::json!({
+                        "build_snapshot_lock": build_snapshot_lock.clone(),
+                        "publishing": true,
+                    })),
+                    lease.lease_seconds.clamp(1, 86_400),
+                )
+                .await
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "build_snapshot worker_jobs lease heartbeat failed before publish: {err}"
+                    )
+                })?;
+            }
             if resolved_snapshot_id != snapshot_id {
                 set_job_snapshot_id(&state.pool, job_id, resolved_snapshot_id).await?;
             }
@@ -1995,6 +2233,46 @@ async fn execute_optional_lcia_result_package_worker_job_ref_update(
     }
 }
 
+async fn run_snapshot_builder_job_with_worker_heartbeat<F>(
+    pool: &PgPool,
+    lease: &BuildSnapshotWorkerLease,
+    build_snapshot_lock: Value,
+    build_future: F,
+) -> anyhow::Result<SnapshotBuilderExecution>
+where
+    F: Future<Output = anyhow::Result<SnapshotBuilderExecution>>,
+{
+    let mut build_future = Box::pin(build_future);
+    let heartbeat_interval = build_snapshot_heartbeat_interval(lease.lease_seconds);
+    let lease_seconds = lease.lease_seconds.clamp(1, 86_400);
+
+    loop {
+        tokio::select! {
+            result = &mut build_future => return result,
+            () = sleep(heartbeat_interval) => {
+                crate::worker_jobs::heartbeat_worker_job(
+                    pool,
+                    lease.worker_job_id,
+                    lease.lease_token,
+                    "build_snapshot",
+                    0.20,
+                    Some(serde_json::json!({
+                        "build_snapshot_lock": build_snapshot_lock.clone(),
+                        "builder": {
+                            "running": true,
+                        },
+                    })),
+                    lease_seconds,
+                )
+                .await
+                .map_err(|err| {
+                    anyhow::anyhow!("build_snapshot worker_jobs lease heartbeat failed: {err}")
+                })?;
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
 async fn run_snapshot_builder_job(
@@ -2579,13 +2857,42 @@ fn _assert_result_types(_a: SolveResult, _b: SolveBatchResult) {}
 #[cfg(test)]
 mod tests {
     use super::{
-        SolveOptionsPayload, build_all_unit_rhs_batch, lcia_result_package_request_roots,
+        SolveOptionsPayload, acquire_build_snapshot_worker_jobs_slot_sql, build_all_unit_rhs_batch,
+        build_snapshot_heartbeat_interval, lcia_result_package_request_roots,
         lcia_result_package_version, missing_legacy_tables_sparse_data_error,
         normalize_all_unit_batch_size, parse_snapshot_builder_build_timing,
         parse_snapshot_builder_resolved_snapshot_id, resolve_solve_all_unit_options,
     };
     use serde_json::json;
+    use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn build_snapshot_worker_jobs_slot_sql_uses_short_transaction_and_lease_fencing() {
+        let sql = acquire_build_snapshot_worker_jobs_slot_sql();
+
+        assert!(sql.contains("pg_advisory_xact_lock"));
+        assert!(
+            !sql.contains("pg_try_advisory_xact_lock"),
+            "worker_jobs build_snapshot gating must not hold a transaction advisory lock for the build duration"
+        );
+        assert!(sql.contains("lease_token is not distinct from $2"));
+        assert!(sql.contains("lease_expires_at >= NOW()"));
+        assert!(sql.contains("phase = 'build_snapshot'"));
+    }
+
+    #[test]
+    fn build_snapshot_heartbeat_interval_refreshes_before_lease_expiry() {
+        assert_eq!(
+            build_snapshot_heartbeat_interval(900),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            build_snapshot_heartbeat_interval(30),
+            Duration::from_secs(10)
+        );
+        assert_eq!(build_snapshot_heartbeat_interval(1), Duration::from_secs(1));
+    }
 
     #[test]
     fn solve_all_unit_options_default_to_h_only() {

@@ -9,8 +9,9 @@ use uuid::Uuid;
 use crate::{
     db::{
         AppState, archive_queue_message, handle_job_payload,
-        handle_lcia_result_package_build_worker_job, latest_result_id_for_job,
-        mark_result_cache_failed, read_one_queue_message, update_job_status,
+        handle_lcia_result_package_build_worker_job, handle_worker_jobs_job_payload,
+        latest_result_id_for_job, mark_result_cache_failed, read_one_queue_message,
+        update_job_status,
     },
     types::JobPayload,
     worker_jobs::{WorkerJob, WorkerJobResult, claim_worker_jobs, record_worker_job_result},
@@ -310,7 +311,16 @@ async fn process_solver_worker_job(state: &AppState, job: WorkerJob, lease_secon
                 .await
                 .map(|_| ())
         }
-        _ => handle_job_payload(state, payload.clone()).await,
+        _ => {
+            handle_worker_jobs_job_payload(
+                state,
+                payload.clone(),
+                job.id,
+                job.lease_token,
+                lease_seconds,
+            )
+            .await
+        }
     };
 
     match execution_result {
