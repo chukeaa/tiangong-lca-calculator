@@ -12,7 +12,7 @@ use crate::{
         validate_calculation_evidence, validate_public_owner_draft_build_request,
     },
     db::{
-        AppState, archive_queue_message, handle_job_payload,
+        AppState, archive_queue_message, fetch_snapshot_index_document, handle_job_payload,
         handle_lcia_result_package_build_worker_job, handle_worker_jobs_job_payload,
         latest_result_id_for_job, mark_result_cache_failed, read_one_queue_message,
         update_job_status,
@@ -80,27 +80,21 @@ async fn fetch_snapshot_coverage(pool: &sqlx::PgPool, snapshot_id: Uuid) -> Opti
 /// which produce linearly dependent columns in the technosphere matrix.
 async fn detect_duplicate_exchange_processes(
     pool: &sqlx::PgPool,
-    snapshot_id: Uuid,
+    process_ids: &[Uuid],
+    process_versions: &[String],
 ) -> Option<Value> {
+    if process_ids.is_empty() || process_ids.len() != process_versions.len() {
+        return None;
+    }
     let result = sqlx::query_scalar::<Value>(
         r"
-        WITH snapshot_scope AS (
-            SELECT
-                process_filter->>'include_user_id' AS uid,
-                process_filter->'process_states' AS states
-            FROM public.lca_network_snapshots
-            WHERE id = $1
-        ),
-        state_array AS (
-            SELECT array_agg(s::int) AS codes
-            FROM snapshot_scope, jsonb_array_elements_text(snapshot_scope.states) AS s
-        ),
         scope_procs AS (
-            SELECT DISTINCT ON (p.id) p.id, p.version, p.json
-            FROM public.processes p, snapshot_scope ss, state_array sa
-            WHERE (p.state_code = ANY(sa.codes) OR p.user_id = ss.uid::uuid)
-              AND p.json ? 'processDataSet'
-            ORDER BY p.id, p.version DESC
+            SELECT p.id, p.version, p.json
+            FROM unnest($1::uuid[], $2::text[]) AS scope(id, version)
+            INNER JOIN public.processes p
+              ON p.id = scope.id
+             AND p.version = scope.version::bpchar
+            WHERE p.json ? 'processDataSet'
         ),
         exchange_fp AS (
             SELECT
@@ -143,7 +137,8 @@ async fn detect_duplicate_exchange_processes(
         FROM dup_groups
         ",
     )
-    .bind(snapshot_id)
+    .bind(process_ids)
+    .bind(process_versions)
     .fetch_optional(pool)
     .await
     .ok()
@@ -158,26 +153,23 @@ async fn detect_duplicate_exchange_processes(
 /// A service-loop is when the same `flow_id` appears as both Input and Output
 /// in the same process with identical amounts — the process "provides to itself".
 /// This creates numerical instability (negative activities) in the solver.
-async fn detect_service_loop_processes(pool: &sqlx::PgPool, snapshot_id: Uuid) -> Option<Value> {
+async fn detect_service_loop_processes(
+    pool: &sqlx::PgPool,
+    process_ids: &[Uuid],
+    process_versions: &[String],
+) -> Option<Value> {
+    if process_ids.is_empty() || process_ids.len() != process_versions.len() {
+        return None;
+    }
     let result = sqlx::query_scalar::<Value>(
         r"
-        WITH snapshot_scope AS (
-            SELECT
-                process_filter->>'include_user_id' AS uid,
-                process_filter->'process_states' AS states
-            FROM public.lca_network_snapshots
-            WHERE id = $1
-        ),
-        state_array AS (
-            SELECT array_agg(s::int) AS codes
-            FROM snapshot_scope, jsonb_array_elements_text(snapshot_scope.states) AS s
-        ),
         scope_procs AS (
-            SELECT DISTINCT ON (p.id) p.id, p.version, p.json
-            FROM public.processes p, snapshot_scope ss, state_array sa
-            WHERE (p.state_code = ANY(sa.codes) OR p.user_id = ss.uid::uuid)
-              AND p.json ? 'processDataSet'
-            ORDER BY p.id, p.version DESC
+            SELECT p.id, p.version, p.json
+            FROM unnest($1::uuid[], $2::text[]) AS scope(id, version)
+            INNER JOIN public.processes p
+              ON p.id = scope.id
+             AND p.version = scope.version::bpchar
+            WHERE p.json ? 'processDataSet'
         ),
         exchanges AS (
             SELECT
@@ -221,7 +213,8 @@ async fn detect_service_loop_processes(pool: &sqlx::PgPool, snapshot_id: Uuid) -
           AND i.amount_text = o.amount_text
         ",
     )
-    .bind(snapshot_id)
+    .bind(process_ids)
+    .bind(process_versions)
     .fetch_optional(pool)
     .await
     .ok()
@@ -232,7 +225,7 @@ async fn detect_service_loop_processes(pool: &sqlx::PgPool, snapshot_id: Uuid) -
 
 /// Builds enriched diagnostics JSON when a job fails with a factorization error.
 async fn build_failure_diagnostics(
-    pool: &sqlx::PgPool,
+    state: &AppState,
     payload: &JobPayload,
     err_message: &str,
 ) -> Value {
@@ -243,18 +236,47 @@ async fn build_failure_diagnostics(
         && let Some(snapshot_id) = extract_snapshot_id(payload)
     {
         diag["snapshot_id"] = serde_json::json!(snapshot_id.to_string());
-        if let Some(coverage) = fetch_snapshot_coverage(pool, snapshot_id).await {
+        if let Some(coverage) = fetch_snapshot_coverage(&state.pool, snapshot_id).await {
             diag["snapshot_coverage"] = coverage;
         }
-        if let Some(duplicates) = detect_duplicate_exchange_processes(pool, snapshot_id).await {
-            diag["duplicate_exchange_processes"] = duplicates;
-        }
-        if let Some(loops) = detect_service_loop_processes(pool, snapshot_id).await {
-            diag["service_loop_processes"] = loops;
+        if let Ok(index) = fetch_snapshot_index_document(state, snapshot_id).await {
+            let (process_ids, process_versions) = snapshot_diagnostic_scope_pairs(&index);
+            diag["diagnostic_scope"] = json!({
+                "source": "snapshot_index.process_map",
+                "process_count": process_ids.len(),
+            });
+            if let Some(duplicates) =
+                detect_duplicate_exchange_processes(&state.pool, &process_ids, &process_versions)
+                    .await
+            {
+                diag["duplicate_exchange_processes"] = duplicates;
+            }
+            if let Some(loops) =
+                detect_service_loop_processes(&state.pool, &process_ids, &process_versions).await
+            {
+                diag["service_loop_processes"] = loops;
+            }
         }
     }
 
     diag
+}
+
+fn snapshot_diagnostic_scope_pairs(
+    index: &crate::snapshot_index::SnapshotIndexDocument,
+) -> (Vec<Uuid>, Vec<String>) {
+    (
+        index
+            .process_map
+            .iter()
+            .map(|process| process.process_id)
+            .collect(),
+        index
+            .process_map
+            .iter()
+            .map(|process| process.process_version.clone())
+            .collect(),
+    )
 }
 
 #[instrument(skip(state))]
@@ -280,7 +302,7 @@ pub async fn run_solver_worker_jobs_loop(
             }
             Ok(jobs) => {
                 for job in jobs {
-                    process_solver_worker_job(&state, job, lease_seconds).await;
+                    Box::pin(process_solver_worker_job(&state, job, lease_seconds)).await;
                 }
             }
             Err(err) => {
@@ -435,7 +457,7 @@ async fn record_solver_worker_job_failure(
         return;
     }
 
-    let diagnostics = build_failure_diagnostics(&state.pool, payload, err_message).await;
+    let diagnostics = build_failure_diagnostics(state, payload, err_message).await;
     let _ = update_job_status(&state.pool, lca_job_id, "failed", diagnostics.clone()).await;
     let _ = mark_result_cache_failed(&state.pool, lca_job_id, "job_execution_failed", err_message)
         .await;
@@ -538,6 +560,7 @@ async fn record_solver_worker_job_success(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn build_solver_worker_job_result(
     state: &AppState,
     worker_job_id: Uuid,
@@ -566,6 +589,48 @@ async fn build_solver_worker_job_result(
             )),
             diagnostics: Some(json!({
                 "lciaResultPackage": package_projection,
+            })),
+            error_code: None,
+            error_message: None,
+            error_details: None,
+            blocker_codes: Vec::new(),
+            resolution_scope: None,
+            retryable: None,
+        });
+    }
+
+    if let JobPayload::BuildSnapshot {
+        job_id: lca_job_id,
+        data_scope,
+        ..
+    } = payload
+    {
+        let diagnostics = fetch_worker_job_diagnostics(&state.pool, worker_job_id).await?;
+        let (snapshot_id, calculation_evidence) =
+            parse_build_snapshot_worker_projection(&diagnostics, data_scope.is_some())?;
+        let result_json = json!({
+            "workerJobId": worker_job_id,
+            "lcaJobId": lca_job_id,
+            "payloadType": payload_type_name(payload),
+            "snapshotId": snapshot_id,
+            "calculationEvidence": calculation_evidence.clone(),
+        });
+        return Ok(WorkerJobResult {
+            status: "completed".to_owned(),
+            result_json: Some(result_json),
+            result_schema_version: Some(result_schema_version_for_payload(payload).to_owned()),
+            result_ref: Some(json!({
+                "domainSource": "worker_jobs",
+                "workerJobId": worker_job_id,
+                "lcaJobId": lca_job_id,
+                "snapshot": {
+                    "table": "lca_network_snapshots",
+                    "id": snapshot_id,
+                },
+            })),
+            diagnostics: Some(json!({
+                "buildSnapshot": diagnostics.get("build_snapshot_result").cloned(),
+                "calculationEvidence": calculation_evidence,
             })),
             error_code: None,
             error_message: None,
@@ -613,6 +678,50 @@ async fn build_solver_worker_job_result(
         resolution_scope: None,
         retryable: None,
     })
+}
+
+async fn fetch_worker_job_diagnostics(
+    pool: &sqlx::PgPool,
+    worker_job_id: Uuid,
+) -> anyhow::Result<Value> {
+    let row = sqlx::query("SELECT diagnostics FROM public.worker_jobs WHERE id = $1")
+        .bind(worker_job_id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("worker_jobs row disappeared before result projection"))?;
+    Ok(row
+        .try_get::<Option<Value>, _>("diagnostics")?
+        .unwrap_or_else(|| json!({})))
+}
+
+fn parse_build_snapshot_worker_projection(
+    diagnostics: &Value,
+    requires_calculation_evidence: bool,
+) -> anyhow::Result<(
+    Uuid,
+    Option<crate::calculation_evidence::LcaCalculationEvidence>,
+)> {
+    let result = diagnostics
+        .get("build_snapshot_result")
+        .ok_or_else(|| anyhow::anyhow!("worker_jobs build result diagnostics are missing"))?;
+    let snapshot_id = result
+        .get("resolved_snapshot_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("worker_jobs build result lacks resolved snapshot id"))?
+        .parse::<Uuid>()?;
+    let calculation_evidence = result
+        .get("calculation_evidence")
+        .filter(|value| !value.is_null())
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()?;
+    if requires_calculation_evidence {
+        let evidence = calculation_evidence.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("versioned worker_jobs build result lacks calculation evidence")
+        })?;
+        validate_calculation_evidence(evidence)?;
+    }
+    Ok((snapshot_id, calculation_evidence))
 }
 
 async fn fetch_lcia_result_package_projection(
@@ -1152,7 +1261,7 @@ fn payload_type_for_job_kind(job_kind: &str) -> Option<&'static str> {
 
 fn result_schema_version_for_payload(payload: &JobPayload) -> &'static str {
     match payload {
-        JobPayload::BuildSnapshot { .. } => "lca.snapshot.result.v1",
+        JobPayload::BuildSnapshot { .. } => "lca.snapshot.result.v2",
         JobPayload::AnalyzeContributionPath { .. } => "lca.contribution_path.result.v1",
         JobPayload::PrepareFactorization { .. } => "lca.factorization_prepare.result.v1",
         JobPayload::LciaResultPackageBuild { .. } => "lcia_result.package_build.result.v1",
@@ -1203,13 +1312,14 @@ pub async fn run_worker_loop(
                 let parsed = serde_json::from_value::<JobPayload>(message.payload.clone());
                 match parsed {
                     Ok(payload) => {
-                        if let Err(err) = handle_job_payload(&state, payload.clone()).await {
+                        if let Err(err) =
+                            Box::pin(handle_job_payload(&state, payload.clone())).await
+                        {
                             error!(error = %err, "job execution failed");
                             let job_id = extract_job_id(&payload);
                             let err_message = err.to_string();
                             let diagnostics =
-                                build_failure_diagnostics(&state.pool, &payload, &err_message)
-                                    .await;
+                                build_failure_diagnostics(&state, &payload, &err_message).await;
                             let _ =
                                 update_job_status(&state.pool, job_id, "failed", diagnostics).await;
                             let _ = mark_result_cache_failed(
@@ -1292,11 +1402,20 @@ mod tests {
         calculation_evidence::{
             CALCULATION_EVIDENCE_SCHEMA_VERSION, FACTOR_COVERAGE_EVIDENCE_SCHEMA_VERSION,
             LcaCalculationEvidence, LcaMethodFactorSourceSnapshot, LciaFactorCoverageCounts,
-            LciaFactorCoverageEvidence, METHOD_SOURCE_SNAPSHOT_SCHEMA_VERSION,
-            MISSING_FACTOR_SEMANTICS, canonical_json_sha256, expected_factor_coverage_contract,
-            expected_method_factor_source_contract, expected_scope_manifest,
+            LciaFactorCoverageEvidence, LciaMethodFactorCoverage,
+            METHOD_SOURCE_SNAPSHOT_SCHEMA_VERSION, MISSING_FACTOR_SEMANTICS,
+            RELEASE_BUNDLE_MANIFEST_SHA256, RELEASE_BUNDLE_VERSION, RELEASE_FACTOR_MANIFEST_SHA256,
+            RELEASE_METHOD_COUNT, RELEASE_METHOD_IDENTITIES,
+            RELEASE_METHOD_IDENTITY_MANIFEST_SHA256, RELEASE_METHOD_MANIFEST_SHA256,
+            RELEASE_SOURCE_SNAPSHOT_SHA256, STATIC_CACHE_BUNDLE_MANIFEST_PATH,
+            canonical_json_sha256, expected_factor_coverage_contract, expected_scope_manifest,
+            method_factor_source_contract_fixture,
         },
-        queue::{payload_type_name, solver_worker_job_payload, solver_worker_result_ref},
+        queue::{
+            parse_build_snapshot_worker_projection, payload_type_name,
+            result_schema_version_for_payload, snapshot_diagnostic_scope_pairs,
+            solver_worker_job_payload, solver_worker_result_ref,
+        },
         types::JobPayload,
         worker_jobs::WorkerJob,
     };
@@ -1319,25 +1438,54 @@ mod tests {
     }
 
     fn complete_calculation_evidence(scope_hash: String) -> LcaCalculationEvidence {
+        let by_method = RELEASE_METHOD_IDENTITIES
+            .iter()
+            .map(
+                |(method_id, method_version, artifact_locator_id)| LciaMethodFactorCoverage {
+                    method_id: Uuid::parse_str(method_id).expect("method id"),
+                    method_version: (*method_version).to_owned(),
+                    artifact_locator_id: Uuid::parse_str(artifact_locator_id)
+                        .expect("artifact locator id"),
+                    counts: LciaFactorCoverageCounts {
+                        matched: 1,
+                        ..LciaFactorCoverageCounts::default()
+                    },
+                },
+            )
+            .collect::<Vec<_>>();
         LcaCalculationEvidence {
             schema_version: CALCULATION_EVIDENCE_SCHEMA_VERSION.to_owned(),
             scope_manifest_sha256: scope_hash,
             lcia_method_factor_source: LcaMethodFactorSourceSnapshot {
                 schema_version: METHOD_SOURCE_SNAPSHOT_SCHEMA_VERSION.to_owned(),
-                source_kind: "database".to_owned(),
-                relation: "public.lciamethods".to_owned(),
-                source_snapshot_sha256: "a".repeat(64),
-                method_manifest_sha256: "b".repeat(64),
-                factor_manifest_sha256: "c".repeat(64),
+                source_kind: "static_cache_bundle".to_owned(),
+                bundle_manifest_path: STATIC_CACHE_BUNDLE_MANIFEST_PATH.to_owned(),
+                bundle_manifest_sha256: RELEASE_BUNDLE_MANIFEST_SHA256.to_owned(),
+                bundle_version: RELEASE_BUNDLE_VERSION.to_owned(),
+                source_snapshot_sha256: RELEASE_SOURCE_SNAPSHOT_SHA256.to_owned(),
+                method_manifest_sha256: RELEASE_METHOD_MANIFEST_SHA256.to_owned(),
+                factor_manifest_sha256: RELEASE_FACTOR_MANIFEST_SHA256.to_owned(),
+                method_identity_manifest_sha256: RELEASE_METHOD_IDENTITY_MANIFEST_SHA256.to_owned(),
+                method_count: RELEASE_METHOD_COUNT,
             },
             lcia_factor_coverage: LciaFactorCoverageEvidence {
                 schema_version: FACTOR_COVERAGE_EVIDENCE_SCHEMA_VERSION.to_owned(),
+                source_snapshot_sha256: RELEASE_SOURCE_SNAPSHOT_SHA256.to_owned(),
+                method_manifest_sha256: RELEASE_METHOD_MANIFEST_SHA256.to_owned(),
+                factor_manifest_sha256: RELEASE_FACTOR_MANIFEST_SHA256.to_owned(),
+                method_identity_manifest_sha256: RELEASE_METHOD_IDENTITY_MANIFEST_SHA256.to_owned(),
+                count_unit: "exchange_method_pair".to_owned(),
+                key_dimensions: ["method_id", "method_version", "flow_uuid", "direction"]
+                    .into_iter()
+                    .map(ToOwned::to_owned)
+                    .collect(),
                 coverage_status: "complete".to_owned(),
                 missing_factor_semantics: MISSING_FACTOR_SEMANTICS.to_owned(),
                 counts: LciaFactorCoverageCounts {
-                    matched: 1,
+                    matched: RELEASE_METHOD_COUNT,
                     ..LciaFactorCoverageCounts::default()
                 },
+                by_method,
                 uncharacterized_evidence: None,
             },
         }
@@ -1491,7 +1639,7 @@ mod tests {
                 "data_scope": "public_plus_owner_draft",
                 "scope_manifest": manifest,
                 "scope_manifest_sha256": manifest_hash,
-                "lcia_method_factor_source": expected_method_factor_source_contract(),
+                "lcia_method_factor_source": method_factor_source_contract_fixture(),
                 "lcia_factor_coverage_contract": expected_factor_coverage_contract(),
                 "no_lcia": false,
             }),
@@ -1529,7 +1677,7 @@ mod tests {
                 "data_scope": "public_plus_owner_draft",
                 "scope_manifest": manifest,
                 "scope_manifest_sha256": manifest_hash,
-                "lcia_method_factor_source": expected_method_factor_source_contract(),
+                "lcia_method_factor_source": method_factor_source_contract_fixture(),
                 "lcia_factor_coverage_contract": expected_factor_coverage_contract(),
                 "no_lcia": false,
             }),
@@ -1571,6 +1719,91 @@ mod tests {
         );
         missing.requested_by = Some(actor);
         assert!(solver_worker_job_payload(&missing).is_err());
+    }
+
+    #[test]
+    fn build_snapshot_projection_uses_worker_diagnostics_without_lca_jobs() {
+        let actor = Uuid::new_v4();
+        let evidence = complete_calculation_evidence(
+            canonical_json_sha256(&expected_scope_manifest(actor)).expect("scope hash"),
+        );
+        let resolved_snapshot_id = Uuid::new_v4();
+        let diagnostics = json!({
+            "build_snapshot_result": {
+                "requested_snapshot_id": Uuid::new_v4(),
+                "resolved_snapshot_id": resolved_snapshot_id,
+                "calculation_evidence": evidence,
+            }
+        });
+        let (parsed_snapshot_id, parsed_evidence) =
+            parse_build_snapshot_worker_projection(&diagnostics, true)
+                .expect("worker-only build projection");
+        assert_eq!(parsed_snapshot_id, resolved_snapshot_id);
+        assert_eq!(parsed_evidence, Some(evidence));
+
+        let payload = JobPayload::BuildSnapshot {
+            job_id: Uuid::new_v4(),
+            snapshot_id: Uuid::new_v4(),
+            scope: None,
+            all_states: None,
+            process_states: None,
+            include_user_id: None,
+            include_user_state_codes: None,
+            include_user_unassigned_only: None,
+            include_user_review_free_only: None,
+            data_scope: None,
+            scope_manifest: None,
+            scope_manifest_sha256: None,
+            lcia_method_factor_source: None,
+            lcia_factor_coverage_contract: None,
+            request_roots: None,
+            provider_rule: None,
+            reference_normalization_mode: None,
+            allocation_fraction_mode: None,
+            process_limit: None,
+            self_loop_cutoff: None,
+            singular_eps: None,
+            method_id: None,
+            method_version: None,
+            no_lcia: None,
+        };
+        assert_eq!(
+            result_schema_version_for_payload(&payload),
+            "lca.snapshot.result.v2"
+        );
+    }
+
+    #[test]
+    fn failure_diagnostics_scope_uses_exact_snapshot_process_versions() {
+        let process_a = Uuid::new_v4();
+        let process_b = Uuid::new_v4();
+        let index = crate::snapshot_index::SnapshotIndexDocument {
+            version: 1,
+            snapshot_id: Uuid::new_v4(),
+            process_count: 2,
+            impact_count: 0,
+            process_map: vec![
+                crate::snapshot_index::SnapshotProcessMapEntry {
+                    process_id: process_a,
+                    process_index: 0,
+                    process_version: "01.00.000".to_owned(),
+                    process_name: None,
+                    location: None,
+                },
+                crate::snapshot_index::SnapshotProcessMapEntry {
+                    process_id: process_b,
+                    process_index: 1,
+                    process_version: "02.03.004".to_owned(),
+                    process_name: None,
+                    location: None,
+                },
+            ],
+            impact_map: Vec::new(),
+            calculation_evidence: None,
+        };
+        let (ids, versions) = snapshot_diagnostic_scope_pairs(&index);
+        assert_eq!(ids, vec![process_a, process_b]);
+        assert_eq!(versions, vec!["01.00.000", "02.03.004"]);
     }
 
     #[test]

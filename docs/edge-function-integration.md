@@ -25,8 +25,8 @@ checkPaths:
   - crates/**
   - supabase/migrations/**
 lastReviewedAt: 2026-07-12
-lastReviewedCommit: 855d48a543ef3d2670ea933432296bb4fc2e2ffe
-lastReviewedNote: "Reviewed for the Edge/Worker public-plus-owner-draft v2 evidence handoff in Issue #116."
+lastReviewedCommit: 9b66c8714fbbe15c7e25418ac963dc2c764ed8e1
+lastReviewedNote: "Reviewed for the Edge/Next/Worker static-bundle and 25-method matrix v2 handoff in Issue #116."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -143,7 +143,7 @@ Header 建议：
 4. 构造求解负载：
    - `demand_mode=single`：构造 `rhs`（长度 = `process_count`，只在目标 index 赋值 `amount`）。
    - `demand_mode=all_unit`：构造 `solve_all_unit` payload（不在 Edge 侧生成整块 `rhs_batch`）。
-   - 对 `public_plus_owner_draft`，先从 `snapshot-index-v1.json.calculation_evidence` 读取并校验 `lca.calculation_evidence.v1`，再原样写入 `calculation_evidence_binding`；分别使用 `lca.solve_one.request.v2`、`lca.solve_all_unit.request.v2` 或 `lca.contribution_path.request.v2`。证据缺失、scope hash 漂移、method/factor source hash 非法、coverage 状态与 gap/artifact 不一致时返回冲突，不入队 v1 fallback。
+   - 对 `public_plus_owner_draft`，先从 `snapshot-index-v1.json.calculation_evidence` 读取并校验 `lca.calculation_evidence.v2`，再原样写入 `calculation_evidence_binding`；分别使用 `lca.solve_one.request.v2`、`lca.solve_all_unit.request.v2` 或 `lca.contribution_path.request.v2`。证据缺失、scope hash 漂移、static-bundle source/identity hash 非法、25-method matrix 成员或计数不一致、coverage 状态与 gap/artifact 不一致时返回冲突，不入队 v1 fallback。
 5. 生成：
    - `request_key`（标准化请求哈希）
    - `idempotency_key`（优先 header，否则退化为 `user_id + request_key`）
@@ -159,7 +159,7 @@ Header 建议：
 
 worker 侧以 `worker_jobs` 为任务生命周期事实，并继续推进 domain/cache 表：`lca_result_cache` 从 `pending -> running -> ready`（或失败时 `failed`）。终态写回时会把 `lca_results`、`lca_result_cache`、`lca_latest_all_unit_results`、`lca_factorization_registry` 中可关联的 rows 回填到同一个 `worker_job_id`；optional `lca_jobs` 存在时才做 best-effort retained row 回填。
 
-`public_plus_owner_draft` 是 fail-closed 协议：Edge 负责生产和预校验证据，worker 仍会独立验证 payload、数据库行可见性、snapshot-index evidence 与 solve binding。worker 从 `public.lciamethods` 读取真实方法/因子并生成 source proof；前端静态 LCIA method cache 只负责 UI 展示，不能充当计算 source of truth。未匹配因子可以保留 trial 数值结果，但必须以 `incomplete_coverage_not_zero` 和 JSONL gap artifact 明确标识，不能被 UI 当成“完整的零影响”。
+`public_plus_owner_draft` 是 fail-closed 协议：Edge 负责生产和预校验证据，worker 仍会独立验证 payload、process/flow 数据库行可见性、reviewed static LCIA bundle、snapshot-index evidence 与 solve binding。scope manifest 只覆盖 processes/flows；LCIA 来源是 actor-independent、hash-bound 的 25-method cache bundle。Edge 只能发送固定相对清单路径、最终 raw SHA 和完全相同的 embedded manifest，不能发送 URL。worker 从可信配置的 HTTPS base（或本地验证目录）取文件，验证大小、全部哈希、alias、方法成员和 factor 数值后参与计算。coverage 按 method/exchange pair 统计；任一方法缺 factor 都保持 `incomplete_coverage_not_zero` 和外置 JSONL 证据，不能被 UI 当成“完整的零影响”。
 
 LCIA result package 构建走同一个 `worker_jobs(worker_queue=solver)` 生命周期，但不是普通 `/lca/solve` 请求。Edge 的 data product manager command 应先通过数据库 command 解析权限、published-only eligibility 和默认 impact category，再 enqueue `job_kind=lcia_result.package_build` / `payload_schema_version=lcia_result.package_build.request.v1`。payload 使用数据库返回的 `buildId`、`requestedBy`、`coverageMode`、`inputManifest`、`inputManifestHash`、`eligibleInputCount`、`includedInputCount`、`lciaMethodSet` 和可选 `defaultImpactCategory`；worker 只消费已发布 `stateCode/state_code=100..199` 的 manifest 输入。worker 完成后用 service-role DB 连接调用 `public.cmd_lcia_result_package_mark_ready(...)` 固化 `lcia_result_packages` preview package；发布仍由 Edge manager command 调用数据库 publish RPC 完成。
 
@@ -180,6 +180,7 @@ worker：
 - 用 `worker_record_job_result` 写统一任务终态、错误、`result_json` 和 `result_ref`
 - 写 domain/cache metadata（如 `lca_results` artifact、`lca_result_cache`），并在 optional `lca_jobs` 存在时 best-effort 写兼容状态；这些都不替代 `worker_jobs` 任务生命周期事实
 - 对 `lcia_result.package_build`，构建 published-only snapshot、持久化 all-unit result/query artifacts，并通过 service-role `cmd_lcia_result_package_mark_ready` 标记 package preview ready；失败只写 `worker_jobs` package-specific result，不更新 `lca_result_cache`
+- 对 `build_snapshot`，从同一 `worker_jobs` heartbeat diagnostics 投影 resolved snapshot ID 与 calculation evidence；不依赖 optional `lca_jobs`，snapshot reuse 也必须返回真实 resolved ID
 
 不要让 Edge 自己更新 worker lease/result 字段。
 

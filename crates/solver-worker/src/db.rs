@@ -1660,6 +1660,11 @@ async fn handle_job_payload_with_worker_lease(
                     Some(serde_json::json!({
                         "build_snapshot_lock": build_snapshot_lock.clone(),
                         "publishing": true,
+                        "build_snapshot_result": {
+                            "requested_snapshot_id": snapshot_id,
+                            "resolved_snapshot_id": resolved_snapshot_id,
+                            "calculation_evidence": calculation_evidence.clone(),
+                        },
                     })),
                     lease.lease_seconds.clamp(1, 86_400),
                 )

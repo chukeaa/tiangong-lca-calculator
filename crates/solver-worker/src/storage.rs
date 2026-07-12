@@ -214,21 +214,39 @@ impl ObjectStoreClient {
             .map(|result| result.object_url)
     }
 
-    /// Uploads deterministic LCIA uncharacterized-flow evidence for a snapshot.
-    pub async fn upload_snapshot_lcia_uncharacterized_evidence(
+    /// Uploads deterministic LCIA method/exchange gap evidence from a bounded local spool file.
+    pub async fn upload_snapshot_lcia_uncharacterized_evidence_file(
         &self,
         snapshot_id: Uuid,
-        bytes: Vec<u8>,
+        file_path: &Path,
+        artifact_byte_size: u64,
     ) -> anyhow::Result<String> {
         let key = if self.prefix.is_empty() {
-            format!("snapshots/{snapshot_id}/snapshot/lcia-uncharacterized-v1.jsonl")
+            format!("snapshots/{snapshot_id}/snapshot/lcia-uncharacterized-v2.jsonl")
         } else {
             format!(
-                "{}/snapshots/{snapshot_id}/snapshot/lcia-uncharacterized-v1.jsonl",
+                "{}/snapshots/{snapshot_id}/snapshot/lcia-uncharacterized-v2.jsonl",
                 self.prefix
             )
         };
-        self.upload_object(&key, "application/x-ndjson", bytes, None)
+        let upload_mode = if artifact_byte_size < MULTIPART_UPLOAD_THRESHOLD_BYTES {
+            "single_put"
+        } else {
+            "multipart"
+        };
+        self.ensure_upload_size_allowed(upload_mode, Some(artifact_byte_size))?;
+        if artifact_byte_size < MULTIPART_UPLOAD_THRESHOLD_BYTES {
+            return self
+                .upload_object(
+                    &key,
+                    "application/x-ndjson",
+                    std::fs::read(file_path)?,
+                    Some(artifact_byte_size),
+                )
+                .await
+                .map(|result| result.object_url);
+        }
+        self.upload_object_multipart(&key, "application/x-ndjson", file_path, artifact_byte_size)
             .await
             .map(|result| result.object_url)
     }

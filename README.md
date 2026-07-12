@@ -208,6 +208,7 @@ psql "$CONN" -v ON_ERROR_STOP=1 -f supabase/migrations/20260309042000_lca_latest
 - `--root-process <uuid@version>`：显式给出一个或多个 request roots，只构建从这些 roots 可达的 public+private process 闭包
 - `--no-lcia`：先不构建 C 矩阵（只跑到 LCI）
 - `--method-id <uuid> --method-version <ver>`：指定 LCIA 方法
+- `--lcia-static-cache-base-url <https-url>` / `--lcia-static-cache-dir <path>`：`public_plus_owner_draft` v2 专用的可信静态 LCIA bundle root（二选一；该 scope 固定使用完整 reviewed 25-method set，不接受单方法选择）
 - `--self-loop-cutoff 0.999999`：过滤会导致 `M = I - A` 奇异的对角自环（`|A_ii|` 过大）
 - `--report-dir <path>`：指定 coverage 报表输出目录
 
@@ -312,6 +313,7 @@ psql "$CONN" -v ON_ERROR_STOP=1 -f supabase/migrations/20260309042000_lca_latest
 - `SNAPSHOT_BUILDER_DB_MAX_CONNECTIONS`（`snapshot_builder` 子进程连接池上限，默认 `4`）
 - `SNAPSHOT_BUILDER_DB_ACQUIRE_TIMEOUT_SECONDS`（`snapshot_builder` 获取连接超时，默认 `30`）
 - `SNAPSHOT_DB_STATEMENT_TIMEOUT_SECONDS`（`snapshot_builder` 单条 SQL statement timeout，默认 `900`；设置为 `0` 表示关闭，仅建议用于人工恢复或排障）
+- `LCIA_STATIC_CACHE_BASE_URL` / `LCIA_STATIC_CACHE_DIR`（versioned private-incubation snapshot 的 reviewed LCIA bundle 来源，二选一；生产 URL 必须 HTTPS，HTTP 只允许 loopback 测试）
 - `SNAPSHOT_REPORT_MODE`（本地 snapshot coverage / matrix-readiness report 写入模式，默认 `guarded`；`disabled` 跳过本地报告写入，`force` 忽略低磁盘 guard）
 - `SNAPSHOT_REPORT_RETENTION_DAYS`（`reports/snapshot-coverage` 下已知本地报告的保留天数，默认 `14`）
 - `SNAPSHOT_REPORT_MAX_FILES`（`reports/snapshot-coverage` 下已知本地报告最多保留文件数，默认 `100`，超过后删除最旧文件）

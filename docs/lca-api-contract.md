@@ -23,8 +23,8 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
 lastReviewedAt: 2026-07-12
-lastReviewedCommit: 855d48a543ef3d2670ea933432296bb4fc2e2ffe
-lastReviewedNote: "Reviewed for Issue #116 public-plus-owner-draft v2 scope, LCIA source proof, coverage evidence, and solve binding."
+lastReviewedCommit: 9b66c8714fbbe15c7e25418ac963dc2c764ed8e1
+lastReviewedNote: "Reviewed for Issues #116/#118: release-pinned static LCIA source, per-method coverage, worker-only build projection, and exact snapshot diagnostics."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -156,7 +156,7 @@ solver worker 默认使用 `SOLVER_QUEUE_BACKEND=worker-jobs` / `--queue-backend
 | `lca.solve_one` | `lca.solve_one.request.v1` / `lca.solve_one.request.v2` | `solve_one` | `lca.solve.result.v1` |
 | `lca.solve_batch` | `lca.solve_batch.request.v1` | `solve_batch` | `lca.solve.result.v1` |
 | `lca.solve_all_unit` | `lca.solve_all_unit.request.v1` / `lca.solve_all_unit.request.v2` | `solve_all_unit` | `lca.solve.result.v1` |
-| `lca.build_snapshot` | `lca.build_snapshot.request.v1` / `lca.build_snapshot.request.v2` | `build_snapshot` | `lca.snapshot.result.v1` |
+| `lca.build_snapshot` | `lca.build_snapshot.request.v1` / `lca.build_snapshot.request.v2` | `build_snapshot` | `lca.snapshot.result.v2` |
 | `lca.contribution_path` | `lca.contribution_path.request.v1` / `lca.contribution_path.request.v2` | `analyze_contribution_path` | `lca.contribution_path.result.v1` |
 | `lca.factorization_prepare` | `lca.factorization_prepare.request.v1` | `prepare_factorization` | `lca.factorization_prepare.result.v1` |
 | `lcia_result.package_build` | `lcia_result.package_build.request.v1` | `lcia_result_package_build` | `lcia_result.package_build.result.v1` |
@@ -171,17 +171,17 @@ solver worker 默认使用 `SOLVER_QUEUE_BACKEND=worker-jobs` / `--queue-backend
 - `include_user_id=<authenticated actor>`, `include_user_state_codes="0"`;
 - `include_user_unassigned_only=true`, `include_user_review_free_only=true`;
 - `scope_manifest` using `lca.data_scope.manifest.v1` and its canonical `scope_manifest_sha256`;
-- `lcia_method_factor_source` using `lca.method_factor_source.request.v1` with database relation `public.lciamethods`;
-- `lcia_factor_coverage_contract` using `lcia.factor_coverage.contract.v1` and `missing_factor_semantics=incomplete_coverage_not_zero`;
+- `lcia_method_factor_source` using `lca.method_factor_source.request.v2`, the exact relative path `lciamethods/cache_manifest.json`, the reviewed raw-manifest SHA-256, an identical embedded `lcia.static_cache_bundle.v1` manifest, `base_url_binding=worker_trusted_configuration`, and snapshot evidence schema `lca.method_factor_source.snapshot.v2`;
+- `lcia_factor_coverage_contract` using `lcia.method_factor_coverage.contract.v2`, `count_unit=exchange_method_pair`, match dimensions `(method_id, method_version, flow_uuid, direction)`, and `missing_factor_semantics=incomplete_coverage_not_zero`;
 - `no_lcia=false`.
 
-The worker independently enforces the frozen predicate after queue decoding and again in the snapshot builder. Processes and flows are eligible only when `state_code=100`, or when they are actor-owned `state_code=0` rows with both `team_id` and `review_id` null. LCIA methods are eligible only when `state_code=100`, or actor-owned `state_code=0`; collaboration guards are not applicable to `lciamethods`. Public states `101..199`, foreign drafts, owner nonzero rows, team drafts, and review drafts are rejected. The Rust row recheck is mandatory even though SQL already applies the same predicate.
+The worker independently enforces the frozen predicate after queue decoding and again in the snapshot builder. The data scope applies only to processes and flows: they are eligible only when `state_code=100`, or when they are actor-owned `state_code=0` rows with both `team_id` and `review_id` null. Public states `101..199`, foreign drafts, owner nonzero rows, team drafts, and review drafts are rejected. LCIA methods are intentionally outside this actor-specific DB predicate.
 
-LCIA method rows and factors are loaded from `public.lciamethods`, not from the frontend's static method cache. A versioned build records three deterministic SHA-256 values in `lca.method_factor_source.snapshot.v1`: the selected source snapshot, method manifest, and raw factor manifest. The source fingerprint also includes this proof, so a snapshot with different method/factor content cannot be reused.
+LCIA methods and factors come from the reviewed 25-method static cache bundle shared with Next, not from `public.lciamethods`. The worker reads it only from `LCIA_STATIC_CACHE_BASE_URL` (HTTPS, except loopback test HTTP) or `LCIA_STATIC_CACHE_DIR`; request payloads cannot override the base. It requires the currently reviewed bundle version/hash set, verifies the fetched raw manifest against the request hash and embedded object, verifies raw/compressed/decompressed/canonical hashes and declared byte sizes under hard limits, validates the one known method/locator alias, rejects non-finite factors, and streams the 62.6 MB decompressed factor map instead of materializing a full JSON tree. Versioned directional builds prune only exact zero for static characterization factors and biosphere exchanges, so finite sub-epsilon values remain calculable; derived non-finite exchange amounts remain invalid coverage gaps and never enter A/B/C, while finite B aggregation overflow fails closed. `lca.method_factor_source.snapshot.v2` binds the bundle manifest, source/method/factor/identity hashes, bundle version, and exact method count. The source fingerprint includes this actor-independent proof, so bundle drift cannot reuse a prior snapshot.
 
-Factor coverage matches elementary exchanges by `(elementary_flow_uuid, direction)`. Counts are `matched`, `unmatched`, `invalid`, and `unsupported_direction`. `matched` means the exchange key is present in at least one selected LCIA method; this union coverage answers whether the inventory flow is characterized anywhere in the selected method set and does not claim that every method has a nonzero factor. Gaps are never represented as complete zero coverage. An incomplete build uploads `lcia-uncharacterized-jsonl:v1` with `elementary_flow_uuid`, `flow_version`, `direction`, `exchange_id`, `amount`, and `reason`, then records its URL, SHA-256, and exact record count.
+Factor coverage is counted for every selected method/exchange pair. Counts are `matched`, `unmatched`, `invalid`, and `unsupported_direction`, both overall and in `by_method`. A flow characterized by one method is still unmatched for methods that lack that flow/direction factor; numeric C-matrix behavior is unchanged, but missing factors can no longer masquerade as complete zero impact. An incomplete build writes deterministic `lcia-uncharacterized-jsonl:v2` records containing `method_id`, `method_version`, `artifact_locator_id`, `flow_uuid`, `flow_version`, `direction`, `exchange_id`, `amount`, and `reason`. The worker spools records to a local file in method/flow/exchange order, hashes and counts while writing, and uploads by file/multipart so evidence size is not proportional to in-memory objects. It fails closed instead of truncating at 25,000,000 records or 8 GiB, before publishing a snapshot index with incomplete evidence.
 
-`snapshot-index-v1.json` carries top-level `calculation_evidence` (`lca.calculation_evidence.v1`) with the exact scope hash, method/factor snapshot proof, and `lcia.factor_coverage.v1`. Complete coverage requires zero gap counts and a null evidence artifact. Incomplete coverage requires `coverage_status=incomplete_coverage`, an artifact, and `record_count = unmatched + invalid + unsupported_direction`.
+`snapshot-index-v1.json` carries top-level `calculation_evidence` (`lca.calculation_evidence.v2`) with the exact scope hash, `lca.method_factor_source.snapshot.v2`, and the single coverage truth source `lcia.method_factor_coverage.matrix.v1`. The matrix repeats the source hashes, count unit and key dimensions, binds `by_method` identities to the reviewed 25-method identity-manifest hash, requires every method row to have the same nonzero exchange-pair cardinality, requires global totals to equal per-method cardinality × 25, and rejects counts above JavaScript's safe-integer maximum. Complete coverage requires zero gap counts and a null evidence artifact. Incomplete coverage requires `coverage_status=incomplete_coverage`, a verified artifact, and `record_count = unmatched + invalid + unsupported_direction`.
 
 For this scope, `lca.solve_one.request.v2`, `lca.solve_all_unit.request.v2`, and `lca.contribution_path.request.v2` must carry `calculation_evidence_binding` equal to the snapshot-index evidence. The worker rejects missing, malformed, or drifted bindings before factorization/solve. A v1 solve against a bound snapshot is rejected, so the contract cannot silently downgrade. Successful scoped results repeat `calculation_evidence` in `lca_results.diagnostics` and job diagnostics; numeric trial results with gaps remain explicitly marked `incomplete_coverage`.
 
@@ -195,6 +195,10 @@ On success, the worker records a terminal `worker_jobs` result with:
 - `result_json.resultId` when a `lca_results` row was produced
 - `result_ref = {"domainSource":"worker_jobs","workerJobId":"<uuid>","lcaJobId":"<uuid>","result":{"table":"lca_results","id":"<uuid>"}}` for solve/result-producing jobs
 - `diagnostics.lcaJob` as an optional legacy `lca_jobs` projection; if the table is absent, the projection reports `legacyTableMissing=true`
+
+`build_snapshot` is projected independently from `worker_jobs.diagnostics.build_snapshot_result`: it always returns the resolved snapshot ID (including reuse) and scoped calculation evidence without reading optional `lca_jobs`. Its `result_ref.snapshot` points at the resolved `lca_network_snapshots` row.
+
+Singular/factorization failure diagnostics load the exact `(process_id, process_version)` pairs from `snapshot-index.process_map`. Duplicate-exchange and service-loop scans join only those pairs; they do not reconstruct scope from broad owner/state filters.
 
 On success or failure, the worker links `lca_results`, `lca_result_cache`, `lca_latest_all_unit_results`, and `lca_factorization_registry` rows back to the canonical `worker_jobs.id` where those rows exist. If optional `lca_jobs` exists, the worker also backfills `lca_jobs.worker_job_id`; if it does not exist, the compatibility write is skipped. On failure, the worker records `worker_jobs.status=failed` with `error_code=solver_worker_job_failed` and updates `lca_result_cache` failed state where a cache row exists; retained `lca_jobs.status/diagnostics` are best-effort compatibility only.
 

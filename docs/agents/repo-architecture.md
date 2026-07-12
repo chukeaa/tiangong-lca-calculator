@@ -34,7 +34,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-12
-lastReviewedCommit: 855d48a543ef3d2670ea933432296bb4fc2e2ffe
+lastReviewedCommit: 9b66c8714fbbe15c7e25418ac963dc2c764ed8e1
+lastReviewedNote: "Reviewed static LCIA cache ownership, streamed gap evidence, worker-only build projection, and exact snapshot diagnostic scope for Issues #116/#118."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -101,6 +102,8 @@ The worker currently covers families such as:
 These flows belong to the worker runtime, not to the API repo.
 
 The main solver worker has two queue backends. The default `SOLVER_QUEUE_BACKEND=worker-jobs` path claims `public.worker_jobs` rows from `worker_queue=solver`, maps `job_kind=lca.*` and `job_kind=lcia_result.package_build` payloads back to internal `JobPayload` variants, heartbeats `phase/progress`, records terminal results through `worker_record_job_result`, and links LCA domain rows back to the canonical `worker_jobs` id where applicable. Ordinary solve jobs link `lca_results` / cache / latest / factorization rows; LCIA result package builds use `lca_results` plus `lca_latest_all_unit_results` as the worker-produced artifacts and then mark `lcia_result_packages` preview-ready through the database service-role command. Optional `lca_jobs` rows are best-effort compatibility only for ordinary LCA jobs; production worker_jobs paths must run when `public.lca_jobs` is absent. The `SOLVER_QUEUE_BACKEND=pgmq` path is legacy compatibility/debug only, consumes `pgmq` messages from `PGMQ_QUEUE`, and requires the explicit `ALLOW_LEGACY_JOB_TABLE_BACKEND=true` / `--allow-legacy-job-table-backend` guard.
+
+Versioned `public_plus_owner_draft` snapshot builds keep actor visibility limited to process/flow rows and load LCIA methods from the reviewed, release-pinned static cache through `crates/solver-worker/src/static_lcia_cache.rs`. That module owns trusted-base retrieval, byte/decompression limits, raw and canonical hash verification, method/locator alias validation, and streaming factor normalization. `calculation_evidence.rs` owns the v2 source/bundle/25-method coverage binding. Gap evidence is deterministically spooled as JSONL rather than retained as an exchange-by-method object graph. Build-snapshot terminal projection comes from canonical `worker_jobs` diagnostics, including reuse-resolved snapshot ID and evidence, so optional `lca_jobs` is never required. Singular/factorization diagnostics use only the exact process/version pairs in the snapshot index.
 
 ### Snapshot builder and provider matching
 

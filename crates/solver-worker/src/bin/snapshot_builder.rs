@@ -14,6 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -27,10 +28,9 @@ use solver_core::{ModelSparseData, SparseTriplet};
 use solver_worker::calculation_evidence::{
     CALCULATION_EVIDENCE_SCHEMA_VERSION, FACTOR_COVERAGE_EVIDENCE_SCHEMA_VERSION,
     LcaCalculationEvidence, LcaMethodFactorSourceSnapshot, LciaFactorCoverageCounts,
-    LciaFactorCoverageEvidence, LciaUncharacterizedEvidenceArtifact, LciaUncharacterizedRecord,
-    METHOD_SOURCE_SNAPSHOT_SCHEMA_VERSION, MISSING_FACTOR_SEMANTICS, PUBLIC_PLUS_OWNER_DRAFT_SCOPE,
+    LciaFactorCoverageEvidence, LciaMethodFactorCoverage, LciaUncharacterizedEvidenceArtifact,
+    LciaUncharacterizedRecord, MISSING_FACTOR_SEMANTICS, PUBLIC_PLUS_OWNER_DRAFT_SCOPE,
     PublicOwnerDraftBuildRequest, UNCHARACTERIZED_ARTIFACT_FORMAT, ValidatedPublicOwnerDraftScope,
-    canonical_json_sha256, encode_uncharacterized_jsonl, sha256_bytes,
     validate_calculation_evidence, validate_public_owner_draft_build_request,
 };
 use solver_worker::compiled_graph::{
@@ -67,6 +67,10 @@ use solver_worker::snapshot_artifacts::{
 use solver_worker::snapshot_index::{
     SnapshotImpactMapEntry, SnapshotIndexDocument, SnapshotProcessMapEntry,
 };
+use solver_worker::static_lcia_cache::{
+    StaticLciaDirection, TrustedStaticCacheSource, VerifiedStaticLciaBundle,
+    load_verified_static_lcia_bundle,
+};
 use solver_worker::storage::ObjectStoreClient;
 use uuid::Uuid;
 
@@ -75,6 +79,8 @@ const REVIEW_SUBMIT_BASELINE_ARTIFACT_PURPOSE: &str = "review_submit_baseline";
 const REVIEW_SUBMIT_BASELINE_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
 const DEFAULT_SNAPSHOT_DB_STATEMENT_TIMEOUT_SECONDS: u64 = 900;
 const SLOW_QUERY_LOG_THRESHOLD: Duration = Duration::from_secs(30);
+const MAX_LCIA_GAP_EVIDENCE_RECORDS: u64 = 25_000_000;
+const MAX_LCIA_GAP_EVIDENCE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "snapshot-builder")]
@@ -139,6 +145,10 @@ struct Cli {
     lcia_method_factor_source_json: Option<String>,
     #[arg(long)]
     lcia_factor_coverage_contract_json: Option<String>,
+    #[arg(long, env = "LCIA_STATIC_CACHE_DIR")]
+    lcia_static_cache_dir: Option<PathBuf>,
+    #[arg(long, env = "LCIA_STATIC_CACHE_BASE_URL")]
+    lcia_static_cache_base_url: Option<String>,
     #[arg(long = "root-process")]
     root_processes: Vec<RequestRootProcess>,
     #[arg(long, default_value_t = 0)]
@@ -228,10 +238,6 @@ struct FlowRow {
 struct MethodRow {
     id: Uuid,
     version: String,
-    user_id: Option<Uuid>,
-    state_code: i32,
-    modified_at: Option<DateTime<Utc>>,
-    created_at: Option<DateTime<Utc>>,
     json: Value,
 }
 
@@ -358,11 +364,14 @@ struct MethodSelection {
     factor_count: i64,
     source_evidence: Option<LcaMethodFactorSourceSnapshot>,
     rows: Vec<MethodRow>,
+    static_bundle: Option<VerifiedStaticLciaBundle>,
 }
 
 #[derive(Debug, Clone)]
 struct ImpactFactorSet {
     impact_id: Uuid,
+    method_version: String,
+    artifact_locator_id: Uuid,
     impact_key: String,
     impact_name: String,
     unit: String,
@@ -370,7 +379,7 @@ struct ImpactFactorSet {
     factors_by_flow_direction: HashMap<(Uuid, ExchangeDirection), f64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct BuildOutput {
     data: ModelSparseData,
     coverage: SnapshotCoverageReport,
@@ -396,10 +405,14 @@ struct LciaExchangeObservation {
     amount: Option<f64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct LciaFactorCoverageBuild {
     counts: LciaFactorCoverageCounts,
-    records: Vec<LciaUncharacterizedRecord>,
+    by_method: Vec<LciaMethodFactorCoverage>,
+    records: tempfile::NamedTempFile,
+    record_count: u64,
+    artifact_byte_size: u64,
+    artifact_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1108,25 +1121,32 @@ async fn attach_versioned_calculation_evidence(
         .checked_add(coverage.counts.invalid)
         .and_then(|count| count.checked_add(coverage.counts.unsupported_direction))
         .ok_or_else(|| anyhow::anyhow!("LCIA factor coverage count overflow"))?;
-    let record_count = u64::try_from(coverage.records.len())
-        .map_err(|_| anyhow::anyhow!("LCIA gap record count overflow"))?;
+    let record_count = coverage.record_count;
     if gap_count != record_count {
         return Err(anyhow::anyhow!(
             "LCIA gap count differs from uncharacterized record count"
         ));
     }
-    let uncharacterized_evidence = if coverage.records.is_empty() {
+    let uncharacterized_evidence = if record_count == 0 {
         None
     } else {
-        let bytes = encode_uncharacterized_jsonl(&coverage.records)?;
-        let artifact_sha256 = sha256_bytes(&bytes);
+        let artifact_byte_size = coverage.records.as_file().metadata()?.len();
+        if artifact_byte_size != coverage.artifact_byte_size {
+            return Err(anyhow::anyhow!(
+                "LCIA gap evidence spool byte-size changed before upload"
+            ));
+        }
         let artifact_url = store
-            .upload_snapshot_lcia_uncharacterized_evidence(snapshot_id, bytes)
+            .upload_snapshot_lcia_uncharacterized_evidence_file(
+                snapshot_id,
+                coverage.records.path(),
+                artifact_byte_size,
+            )
             .await?;
         Some(LciaUncharacterizedEvidenceArtifact {
             artifact_url,
             artifact_format: UNCHARACTERIZED_ARTIFACT_FORMAT.to_owned(),
-            artifact_sha256,
+            artifact_sha256: coverage.artifact_sha256.clone(),
             record_count,
         })
     };
@@ -1136,6 +1156,35 @@ async fn attach_versioned_calculation_evidence(
         lcia_method_factor_source: source,
         lcia_factor_coverage: LciaFactorCoverageEvidence {
             schema_version: FACTOR_COVERAGE_EVIDENCE_SCHEMA_VERSION.to_owned(),
+            source_snapshot_sha256: method
+                .source_evidence
+                .as_ref()
+                .expect("source evidence checked above")
+                .source_snapshot_sha256
+                .clone(),
+            method_manifest_sha256: method
+                .source_evidence
+                .as_ref()
+                .expect("source evidence checked above")
+                .method_manifest_sha256
+                .clone(),
+            factor_manifest_sha256: method
+                .source_evidence
+                .as_ref()
+                .expect("source evidence checked above")
+                .factor_manifest_sha256
+                .clone(),
+            method_identity_manifest_sha256: method
+                .source_evidence
+                .as_ref()
+                .expect("source evidence checked above")
+                .method_identity_manifest_sha256
+                .clone(),
+            count_unit: "exchange_method_pair".to_owned(),
+            key_dimensions: ["method_id", "method_version", "flow_uuid", "direction"]
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect(),
             coverage_status: if gap_count == 0 {
                 "complete".to_owned()
             } else {
@@ -1143,6 +1192,7 @@ async fn attach_versioned_calculation_evidence(
             },
             missing_factor_semantics: MISSING_FACTOR_SEMANTICS.to_owned(),
             counts: coverage.counts.clone(),
+            by_method: coverage.by_method.clone(),
             uncharacterized_evidence,
         },
     };
@@ -2190,6 +2240,7 @@ async fn resolve_method_identity(
             factor_count: 0,
             source_evidence: None,
             rows: Vec::new(),
+            static_bundle: None,
         });
     }
 
@@ -2204,7 +2255,40 @@ async fn resolve_method_identity(
         ));
     }
 
-    let rows = fetch_selected_method_rows(pool, cli, versioned_scope).await?;
+    if let Some(scope) = versioned_scope {
+        if cli.method_id.is_some() || cli.method_version.is_some() {
+            return Err(anyhow::anyhow!(
+                "versioned static-cache builds must use the complete manifest method set"
+            ));
+        }
+        let source = TrustedStaticCacheSource::new(
+            cli.lcia_static_cache_dir.clone(),
+            cli.lcia_static_cache_base_url.clone(),
+        )?;
+        let bundle =
+            load_verified_static_lcia_bundle(&source, &scope.lcia_method_factor_source).await?;
+        let method_count = i64::try_from(bundle.methods.len())
+            .map_err(|_| anyhow::anyhow!("lciamethod count overflow"))?;
+        let factor_count = bundle
+            .factors_by_method
+            .values()
+            .try_fold(0_i64, |total, factors| {
+                total.checked_add(i64::try_from(factors.len()).ok()?)
+            })
+            .ok_or_else(|| anyhow::anyhow!("lciamethod factor count overflow"))?;
+        return Ok(MethodSelection {
+            has_lcia: true,
+            method_id: None,
+            method_version: None,
+            method_count,
+            factor_count,
+            source_evidence: Some(bundle.source_evidence.clone()),
+            rows: Vec::new(),
+            static_bundle: Some(bundle),
+        });
+    }
+
+    let rows = fetch_selected_method_rows(pool, cli).await?;
     if rows.is_empty() {
         return Err(anyhow::anyhow!("no lciamethods found"));
     }
@@ -2213,11 +2297,6 @@ async fn resolve_method_identity(
             "specific lciamethod selection resolved {} rows; expected exactly one",
             rows.len()
         ));
-    }
-    if let Some(scope) = versioned_scope {
-        for row in &rows {
-            validate_method_row_visibility(row, scope.actor_user_id)?;
-        }
     }
     let method_count =
         i64::try_from(rows.len()).map_err(|_| anyhow::anyhow!("lciamethod count overflow"))?;
@@ -2228,9 +2307,7 @@ async fn resolve_method_identity(
             .checked_add(count)
             .ok_or_else(|| anyhow::anyhow!("lciamethod factor count overflow"))
     })?;
-    let source_evidence = versioned_scope
-        .map(|scope| build_method_source_evidence(&rows, &scope.scope_manifest_sha256))
-        .transpose()?;
+    let source_evidence = None;
 
     Ok(MethodSelection {
         has_lcia: true,
@@ -2240,35 +2317,16 @@ async fn resolve_method_identity(
         factor_count,
         source_evidence,
         rows,
+        static_bundle: None,
     })
 }
 
-async fn fetch_selected_method_rows(
-    pool: &PgPool,
-    cli: &Cli,
-    versioned_scope: Option<&ValidatedPublicOwnerDraftScope>,
-) -> anyhow::Result<Vec<MethodRow>> {
-    let rows = match (cli.method_id, versioned_scope) {
-        (Some(method_id), Some(scope)) => {
+async fn fetch_selected_method_rows(pool: &PgPool, cli: &Cli) -> anyhow::Result<Vec<MethodRow>> {
+    let rows = match cli.method_id {
+        Some(method_id) => {
             sqlx::query(
                 r#"
-                SELECT id, version, user_id, state_code, modified_at, created_at, json
-                FROM public.lciamethods
-                WHERE id = $1
-                  AND version = $2::bpchar
-                  AND (state_code = 100 OR (user_id = $3 AND state_code = 0))
-                "#,
-            )
-            .bind(method_id)
-            .bind(cli.method_version.clone().unwrap_or_default())
-            .bind(scope.actor_user_id)
-            .fetch_all(pool)
-            .await?
-        }
-        (Some(method_id), None) => {
-            sqlx::query(
-                r#"
-                SELECT id, version, user_id, state_code, modified_at, created_at, json
+                SELECT id, version, json
                 FROM public.lciamethods
                 WHERE id = $1 AND version = $2::bpchar
                 "#,
@@ -2278,25 +2336,11 @@ async fn fetch_selected_method_rows(
             .fetch_all(pool)
             .await?
         }
-        (None, Some(scope)) => {
+        None => {
             sqlx::query(
                 r#"
                 SELECT DISTINCT ON (id)
-                  id, version, user_id, state_code, modified_at, created_at, json
-                FROM public.lciamethods
-                WHERE state_code = 100 OR (user_id = $1 AND state_code = 0)
-                ORDER BY id, version DESC, modified_at DESC NULLS LAST, created_at DESC NULLS LAST
-                "#,
-            )
-            .bind(scope.actor_user_id)
-            .fetch_all(pool)
-            .await?
-        }
-        (None, None) => {
-            sqlx::query(
-                r#"
-                SELECT DISTINCT ON (id)
-                  id, version, user_id, state_code, modified_at, created_at, json
+                  id, version, json
                 FROM public.lciamethods
                 ORDER BY id, state_code DESC, modified_at DESC NULLS LAST, created_at DESC NULLS LAST
                 "#,
@@ -2311,78 +2355,10 @@ async fn fetch_selected_method_rows(
             Ok(MethodRow {
                 id: row.try_get("id")?,
                 version: row.try_get::<String, _>("version")?.trim().to_owned(),
-                user_id: row.try_get("user_id")?,
-                state_code: row.try_get("state_code")?,
-                modified_at: row.try_get("modified_at")?,
-                created_at: row.try_get("created_at")?,
                 json: row.try_get("json")?,
             })
         })
         .collect()
-}
-
-fn validate_method_row_visibility(row: &MethodRow, actor_user_id: Uuid) -> anyhow::Result<()> {
-    if row.state_code == 100 || (row.state_code == 0 && row.user_id == Some(actor_user_id)) {
-        return Ok(());
-    }
-    Err(anyhow::anyhow!(
-        "lciamethod visibility recheck failed: {}@{} owner={:?} state_code={}",
-        row.id,
-        row.version,
-        row.user_id,
-        row.state_code
-    ))
-}
-
-fn build_method_source_evidence(
-    rows: &[MethodRow],
-    scope_manifest_sha256: &str,
-) -> anyhow::Result<LcaMethodFactorSourceSnapshot> {
-    let method_manifest = rows
-        .iter()
-        .map(|row| {
-            Ok(serde_json::json!({
-                "id": row.id,
-                "version": row.version,
-                "user_id": row.user_id,
-                "state_code": row.state_code,
-                "modified_at": row.modified_at.map(|value| value.to_rfc3339()),
-                "created_at": row.created_at.map(|value| value.to_rfc3339()),
-                "json_sha256": canonical_json_sha256(&row.json)?,
-            }))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let factor_manifest = rows
-        .iter()
-        .flat_map(|row| {
-            method_factor_items(&row.json).into_iter().enumerate().map(
-                move |(factor_index, factor)| {
-                    serde_json::json!({
-                        "method_id": row.id,
-                        "method_version": row.version,
-                        "factor_index": factor_index,
-                        "factor": factor,
-                    })
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-    let method_manifest_sha256 = canonical_json_sha256(&Value::Array(method_manifest))?;
-    let factor_manifest_sha256 = canonical_json_sha256(&Value::Array(factor_manifest))?;
-    let source_snapshot_sha256 = canonical_json_sha256(&serde_json::json!({
-        "schema_version": METHOD_SOURCE_SNAPSHOT_SCHEMA_VERSION,
-        "scope_manifest_sha256": scope_manifest_sha256,
-        "method_manifest_sha256": method_manifest_sha256,
-        "factor_manifest_sha256": factor_manifest_sha256,
-    }))?;
-    Ok(LcaMethodFactorSourceSnapshot {
-        schema_version: METHOD_SOURCE_SNAPSHOT_SCHEMA_VERSION.to_owned(),
-        source_kind: "database".to_owned(),
-        relation: "public.lciamethods".to_owned(),
-        source_snapshot_sha256,
-        method_manifest_sha256,
-        factor_manifest_sha256,
-    })
 }
 
 fn parse_lang_text(value: &Value) -> Option<String> {
@@ -2484,6 +2460,51 @@ fn load_impact_factor_sets(method: &MethodSelection) -> anyhow::Result<Vec<Impac
     if !method.has_lcia {
         return Ok(Vec::new());
     }
+    if let Some(bundle) = &method.static_bundle {
+        let mut out = Vec::with_capacity(bundle.methods.len());
+        for source_method in &bundle.methods {
+            let mut factor_map = HashMap::new();
+            let mut directional_factor_map = HashMap::new();
+            for factor in bundle
+                .factors_by_method
+                .get(&source_method.method_id)
+                .into_iter()
+                .flatten()
+            {
+                let direction = match factor.direction {
+                    StaticLciaDirection::Input => ExchangeDirection::Input,
+                    StaticLciaDirection::Output => ExchangeDirection::Output,
+                };
+                accumulate_finite_factor(
+                    &mut directional_factor_map,
+                    (factor.flow_id, direction),
+                    factor.value,
+                    source_method.method_id,
+                )?;
+                if factor.value != 0.0 {
+                    accumulate_finite_factor(
+                        &mut factor_map,
+                        factor.flow_id,
+                        factor.value,
+                        source_method.method_id,
+                    )?;
+                }
+            }
+            factor_map.retain(|_, value| *value != 0.0);
+            out.push(ImpactFactorSet {
+                impact_id: source_method.method_id,
+                method_version: source_method.method_version.clone(),
+                artifact_locator_id: source_method.artifact_locator_id,
+                impact_key: format!("method:{}", source_method.method_id),
+                impact_name: source_method.name.clone(),
+                unit: source_method.unit.clone(),
+                factors_by_flow: factor_map,
+                factors_by_flow_direction: directional_factor_map,
+            });
+        }
+        out.sort_unstable_by_key(|impact| impact.impact_id);
+        return Ok(out);
+    }
     if method.rows.is_empty() {
         return Err(anyhow::anyhow!("no lciamethods found for selected scope"));
     }
@@ -2508,19 +2529,24 @@ fn load_impact_factor_sets(method: &MethodSelection) -> anyhow::Result<Vec<Impac
             if let Some(direction) =
                 parse_exchange_direction(factor.get("exchangeDirection").and_then(Value::as_str))
             {
-                *directional_factor_map
-                    .entry((flow_id, direction))
-                    .or_insert(0.0) += value;
+                accumulate_finite_factor(
+                    &mut directional_factor_map,
+                    (flow_id, direction),
+                    value,
+                    row.id,
+                )?;
             }
             if value.abs() <= f64::EPSILON {
                 continue;
             }
-            *factor_map.entry(flow_id).or_insert(0.0) += value;
+            accumulate_finite_factor(&mut factor_map, flow_id, value, row.id)?;
         }
         factor_map.retain(|_, value| value.abs() > f64::EPSILON);
 
         out.push(ImpactFactorSet {
             impact_id: row.id,
+            method_version: row.version.clone(),
+            artifact_locator_id: row.id,
             impact_key: format!("method:{}", row.id),
             impact_name: parse_lcia_method_name(&row.json)
                 .unwrap_or_else(|| format!("LCIA Method {}", row.id)),
@@ -2531,6 +2557,61 @@ fn load_impact_factor_sets(method: &MethodSelection) -> anyhow::Result<Vec<Impac
     }
     out.sort_unstable_by_key(|impact| impact.impact_id);
     Ok(out)
+}
+
+fn accumulate_finite_factor<K>(
+    factors: &mut HashMap<K, f64>,
+    key: K,
+    value: f64,
+    method_id: Uuid,
+) -> anyhow::Result<()>
+where
+    K: Eq + std::hash::Hash,
+{
+    if !value.is_finite() {
+        return Err(anyhow::anyhow!(
+            "LCIA factor for method {method_id} is non-finite"
+        ));
+    }
+    let total = factors.get(&key).copied().unwrap_or_default() + value;
+    if !total.is_finite() {
+        return Err(anyhow::anyhow!(
+            "LCIA factor aggregation overflow for method {method_id}"
+        ));
+    }
+    factors.insert(key, total);
+    Ok(())
+}
+
+fn retain_sparse_value(value: f64, preserve_sub_epsilon_values: bool) -> bool {
+    if !value.is_finite() {
+        false
+    } else if preserve_sub_epsilon_values {
+        value != 0.0
+    } else {
+        value.abs() > f64::EPSILON
+    }
+}
+
+fn accumulate_biosphere_edge(
+    b_map: &mut HashMap<(i32, i32), f64>,
+    key: (i32, i32),
+    amount: f64,
+    preserve_sub_epsilon_values: bool,
+) -> anyhow::Result<()> {
+    if !retain_sparse_value(amount, preserve_sub_epsilon_values) {
+        return Ok(());
+    }
+    let total = b_map.get(&key).copied().unwrap_or_default() + amount;
+    if !total.is_finite() {
+        return Err(anyhow::anyhow!(
+            "biosphere edge aggregation overflow for flow_idx={} process_idx={}",
+            key.0,
+            key.1
+        ));
+    }
+    b_map.insert(key, total);
+    Ok(())
 }
 
 fn add_technosphere_edge(
@@ -2794,7 +2875,8 @@ fn parse_process_chunk(
                 .or_else(|| ex.get("resultingAmount"))
                 .or_else(|| ex.get("meanValue")),
         )
-        .map(|raw| raw * reference_scale * allocation_fraction);
+        .map(|raw| raw * reference_scale * allocation_fraction)
+        .filter(|normalized| normalized.is_finite());
 
         local_exchanges.push(ParsedExchange {
             process_idx,
@@ -2969,7 +3051,7 @@ async fn compile_scope_graph(
             && let Some(amount) = ex.amount
         {
             let value = biosphere_gross_value(amount);
-            if value.abs() > f64::EPSILON {
+            if retain_sparse_value(value, versioned_scope.is_some()) {
                 let process_partition =
                     compiled_process_for_idx(&compiled_processes, ex.process_idx)
                         .ok_or_else(|| {
@@ -3244,15 +3326,16 @@ fn assemble_sparse_payload(
     }
     let mut b_map: HashMap<(i32, i32), f64> = HashMap::new();
     for edge in &compiled_graph.biosphere_edges {
-        if edge.amount.abs() > f64::EPSILON {
-            *b_map
-                .entry((edge.flow_idx, edge.process_idx))
-                .or_insert(0.0) += edge.amount;
-        }
+        accumulate_biosphere_edge(
+            &mut b_map,
+            (edge.flow_idx, edge.process_idx),
+            edge.amount,
+            directional_lcia,
+        )?;
     }
 
     a_map.retain(|_, value| value.abs() > f64::EPSILON);
-    b_map.retain(|_, value| value.abs() > f64::EPSILON);
+    b_map.retain(|_, value| retain_sparse_value(*value, directional_lcia));
 
     let prefilter_diag_ge_cutoff = i64::try_from(
         a_map
@@ -3338,9 +3421,14 @@ fn assemble_sparse_payload(
                         continue;
                     };
                     if let Some(flow_idx) = flow_idx_by_id.get(flow_id).copied()
-                        && cf_value.abs() > f64::EPSILON
+                        && retain_sparse_value(*cf_value, true)
                     {
-                        *c_map.entry(flow_idx).or_insert(0.0) += *cf_value;
+                        accumulate_finite_factor(
+                            &mut c_map,
+                            flow_idx,
+                            *cf_value,
+                            impact.impact_id,
+                        )?;
                     }
                 }
             } else {
@@ -3348,11 +3436,16 @@ fn assemble_sparse_payload(
                     if let Some(flow_idx) = flow_idx_by_id.get(flow_id).copied()
                         && cf_value.abs() > f64::EPSILON
                     {
-                        *c_map.entry(flow_idx).or_insert(0.0) += *cf_value;
+                        accumulate_finite_factor(
+                            &mut c_map,
+                            flow_idx,
+                            *cf_value,
+                            impact.impact_id,
+                        )?;
                     }
                 }
             }
-            c_map.retain(|_, value| value.abs() > f64::EPSILON);
+            c_map.retain(|_, value| retain_sparse_value(*value, directional_lcia));
             characterization_factors.reserve(c_map.len());
             for (col, value) in c_map {
                 characterization_factors.push(SparseTriplet {
@@ -3578,66 +3671,133 @@ fn build_lcia_factor_coverage(
     impact_factor_sets: &[ImpactFactorSet],
     direction_by_flow: &HashMap<Uuid, Option<ExchangeDirection>>,
 ) -> anyhow::Result<LciaFactorCoverageBuild> {
-    let matched_keys = impact_factor_sets
-        .iter()
-        .flat_map(|impact| impact.factors_by_flow_direction.keys().copied())
-        .collect::<HashSet<_>>();
     let mut counts = LciaFactorCoverageCounts::default();
-    let mut records = Vec::new();
-
-    for observation in observations {
-        let amount = observation.amount.filter(|value| value.is_finite());
-        let outcome = if observation.direction.is_none() {
-            Some(("unsupported_direction", "unsupported_exchange_direction"))
-        } else if direction_by_flow.get(&observation.flow_id) == Some(&None) {
-            Some((
-                "unsupported_direction",
-                "ambiguous_elementary_flow_direction_axis",
-            ))
-        } else if amount.is_none() {
-            Some(("invalid", "invalid_exchange_amount"))
-        } else if observation
-            .direction
-            .is_some_and(|direction| matched_keys.contains(&(observation.flow_id, direction)))
-        {
-            None
-        } else {
-            Some(("unmatched", "no_lcia_factor_for_flow_direction"))
-        };
-
-        match outcome {
-            None => counts.matched = counts.matched.saturating_add(1),
-            Some((kind, reason)) => {
-                match kind {
-                    "unmatched" => counts.unmatched = counts.unmatched.saturating_add(1),
-                    "invalid" => counts.invalid = counts.invalid.saturating_add(1),
-                    "unsupported_direction" => {
-                        counts.unsupported_direction =
-                            counts.unsupported_direction.saturating_add(1);
-                    }
-                    _ => return Err(anyhow::anyhow!("unknown LCIA coverage outcome")),
-                }
-                records.push(LciaUncharacterizedRecord {
-                    elementary_flow_uuid: observation.flow_id,
-                    flow_version: observation.flow_version.clone(),
-                    direction: observation.direction.map_or_else(
-                        || observation.direction_label.clone(),
-                        |direction| direction.as_str().to_owned(),
-                    ),
-                    exchange_id: observation.exchange_id.clone(),
-                    amount,
-                    reason: reason.to_owned(),
-                });
-            }
-        }
-    }
-    records.sort_by(|left, right| {
-        left.elementary_flow_uuid
-            .cmp(&right.elementary_flow_uuid)
-            .then_with(|| left.direction.cmp(&right.direction))
+    let mut by_method = Vec::with_capacity(impact_factor_sets.len());
+    let mut records = tempfile::Builder::new()
+        .prefix("lcia-uncharacterized-")
+        .suffix(".jsonl")
+        .tempfile()?;
+    let mut record_count = 0_u64;
+    let mut artifact_byte_size = 0_u64;
+    let mut artifact_hasher = Sha256::new();
+    let mut sorted_observations = observations.iter().collect::<Vec<_>>();
+    sorted_observations.sort_by(|left, right| {
+        left.flow_id
+            .cmp(&right.flow_id)
+            .then_with(|| left.direction_label.cmp(&right.direction_label))
             .then_with(|| left.exchange_id.cmp(&right.exchange_id))
     });
-    Ok(LciaFactorCoverageBuild { counts, records })
+    let mut sorted_methods = impact_factor_sets.iter().collect::<Vec<_>>();
+    sorted_methods.sort_by_key(|method| (method.impact_id, method.method_version.clone()));
+
+    for method in sorted_methods {
+        let mut method_counts = LciaFactorCoverageCounts::default();
+        for observation in &sorted_observations {
+            let amount = observation.amount.filter(|value| value.is_finite());
+            let outcome = if observation.direction.is_none() {
+                Some(("unsupported_direction", "unsupported_exchange_direction"))
+            } else if direction_by_flow.get(&observation.flow_id) == Some(&None) {
+                Some((
+                    "unsupported_direction",
+                    "ambiguous_elementary_flow_direction_axis",
+                ))
+            } else if amount.is_none() {
+                Some(("invalid", "invalid_exchange_amount"))
+            } else if observation.direction.is_some_and(|direction| {
+                method
+                    .factors_by_flow_direction
+                    .contains_key(&(observation.flow_id, direction))
+            }) {
+                None
+            } else {
+                Some(("unmatched", "no_lcia_factor_for_flow_direction"))
+            };
+
+            match outcome {
+                None => method_counts.matched = method_counts.matched.saturating_add(1),
+                Some((kind, reason)) => {
+                    match kind {
+                        "unmatched" => {
+                            method_counts.unmatched = method_counts.unmatched.saturating_add(1);
+                        }
+                        "invalid" => {
+                            method_counts.invalid = method_counts.invalid.saturating_add(1);
+                        }
+                        "unsupported_direction" => {
+                            method_counts.unsupported_direction =
+                                method_counts.unsupported_direction.saturating_add(1);
+                        }
+                        _ => return Err(anyhow::anyhow!("unknown LCIA coverage outcome")),
+                    }
+                    let record = LciaUncharacterizedRecord {
+                        method_id: method.impact_id,
+                        method_version: method.method_version.clone(),
+                        artifact_locator_id: method.artifact_locator_id,
+                        flow_uuid: observation.flow_id,
+                        flow_version: observation.flow_version.clone(),
+                        direction: observation.direction.map_or_else(
+                            || observation.direction_label.clone(),
+                            |direction| direction.as_str().to_owned(),
+                        ),
+                        exchange_id: observation.exchange_id.clone(),
+                        amount,
+                        reason: reason.to_owned(),
+                    };
+                    let mut line = serde_json::to_vec(&record)?;
+                    line.push(b'\n');
+                    if record_count >= MAX_LCIA_GAP_EVIDENCE_RECORDS {
+                        return Err(anyhow::anyhow!(
+                            "LCIA gap evidence exceeds the {MAX_LCIA_GAP_EVIDENCE_RECORDS}-record fail-closed limit"
+                        ));
+                    }
+                    artifact_byte_size = artifact_byte_size
+                        .checked_add(u64::try_from(line.len())?)
+                        .ok_or_else(|| anyhow::anyhow!("LCIA gap evidence byte-size overflow"))?;
+                    if artifact_byte_size > MAX_LCIA_GAP_EVIDENCE_BYTES {
+                        return Err(anyhow::anyhow!(
+                            "LCIA gap evidence exceeds the {MAX_LCIA_GAP_EVIDENCE_BYTES}-byte fail-closed limit"
+                        ));
+                    }
+                    records.write_all(&line)?;
+                    artifact_hasher.update(&line);
+                    record_count = record_count
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow::anyhow!("LCIA gap record count overflow"))?;
+                }
+            }
+        }
+        counts.matched = counts
+            .matched
+            .checked_add(method_counts.matched)
+            .ok_or_else(|| anyhow::anyhow!("LCIA matched count overflow"))?;
+        counts.unmatched = counts
+            .unmatched
+            .checked_add(method_counts.unmatched)
+            .ok_or_else(|| anyhow::anyhow!("LCIA unmatched count overflow"))?;
+        counts.invalid = counts
+            .invalid
+            .checked_add(method_counts.invalid)
+            .ok_or_else(|| anyhow::anyhow!("LCIA invalid count overflow"))?;
+        counts.unsupported_direction = counts
+            .unsupported_direction
+            .checked_add(method_counts.unsupported_direction)
+            .ok_or_else(|| anyhow::anyhow!("LCIA unsupported-direction count overflow"))?;
+        by_method.push(LciaMethodFactorCoverage {
+            method_id: method.impact_id,
+            method_version: method.method_version.clone(),
+            artifact_locator_id: method.artifact_locator_id,
+            counts: method_counts,
+        });
+    }
+    records.flush()?;
+    Ok(LciaFactorCoverageBuild {
+        counts,
+        by_method,
+        records,
+        record_count,
+        artifact_byte_size,
+        artifact_sha256: hex::encode(artifact_hasher.finalize()),
+    })
 }
 
 fn build_snapshot_impact_map(
@@ -4965,11 +5125,17 @@ async fn compute_source_fingerprint(
         fetch_flow_source_summary(pool, versioned_scope).await?;
     let (lciamethod_count, lciamethod_max_modified_at_utc) = if config.has_lcia {
         if versioned_scope.is_some() {
-            summarize_selected_methods(
-                &method
-                    .ok_or_else(|| anyhow::anyhow!("missing selected LCIA method snapshot"))?
-                    .rows,
-            )?
+            let method =
+                method.ok_or_else(|| anyhow::anyhow!("missing selected LCIA method snapshot"))?;
+            let evidence = method
+                .source_evidence
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing static LCIA method source evidence"))?;
+            (
+                i64::try_from(evidence.method_count)
+                    .map_err(|_| anyhow::anyhow!("LCIA method count overflow"))?,
+                format!("static:{}", evidence.source_snapshot_sha256),
+            )
         } else {
             fetch_lciamethod_source_summary(pool).await?
         }
@@ -5071,13 +5237,6 @@ async fn fetch_flow_source_summary(
         row.try_get::<i64, _>("flow_count")?,
         row.try_get::<String, _>("flow_max_modified_at_utc")?,
     ))
-}
-
-fn summarize_selected_methods(rows: &[MethodRow]) -> anyhow::Result<(i64, String)> {
-    let count = i64::try_from(rows.len())
-        .map_err(|_| anyhow::anyhow!("selected LCIA method count overflow"))?;
-    let max_modified_at = rows.iter().filter_map(|row| row.modified_at).max();
-    Ok((count, format_modified_at_utc(max_modified_at)))
 }
 
 async fn fetch_lciamethod_source_summary(pool: &PgPool) -> anyhow::Result<(i64, String)> {
@@ -5538,14 +5697,15 @@ fn is_reference_internal_exchange(
 }
 
 fn parse_number(value: Option<&Value>) -> Option<f64> {
-    match value {
+    let number = match value {
         Some(Value::String(text)) => {
             let cleaned = text.replace(',', "");
             cleaned.parse::<f64>().ok()
         }
         Some(Value::Number(number)) => number.as_f64(),
         _ => None,
-    }
+    }?;
+    number.is_finite().then_some(number)
 }
 
 fn parse_exchange_location(exchange_json: &Value) -> Option<String> {
@@ -6666,19 +6826,18 @@ mod tests {
     use super::{
         AllocationFractionState, AllocationMode, Cli,
         DEFAULT_SNAPSHOT_DB_STATEMENT_TIMEOUT_SECONDS, ExchangeDirection, FlowRow, ImpactFactorSet,
-        LciaExchangeObservation, MethodRow, MethodSelection, MultiProviderDecision,
-        NormalizationMode, ParsedExchange, ProcessMeta, ProcessRow, ProviderRule,
+        LciaExchangeObservation, MethodSelection, MultiProviderDecision, NormalizationMode,
+        ParsedExchange, ProcessMeta, ProcessRow, ProviderRule, accumulate_finite_factor,
         add_technosphere_edge, assemble_sparse_payload, attach_artifact_lifecycle,
-        biosphere_gross_value, build_lcia_factor_coverage, build_method_source_evidence,
-        build_review_submit_overlay_graph, candidate_count_bucket_label, compute_scope_hash,
-        geo_score, location_granularity_label, no_provider_failure_reason, normalize_request_roots,
+        biosphere_gross_value, build_lcia_factor_coverage, build_review_submit_overlay_graph,
+        candidate_count_bucket_label, compute_scope_hash, geo_score, location_granularity_label,
+        no_provider_failure_reason, normalize_request_roots, parse_number,
         parse_process_annual_supply_or_production_volume, parse_process_states,
         parse_provider_rule_list, resolve_allocation_fraction, resolve_multi_provider,
         resolve_process_selection, resolve_reference_normalization,
         review_submit_root_dependency_fingerprint, snapshot_db_statement_timeout,
         summarize_matching_diagnostics, time_score, unique_supported_direction_by_flow,
-        validate_flow_row_visibility, validate_method_row_visibility,
-        validate_process_row_visibility,
+        validate_flow_row_visibility, validate_process_row_visibility,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -6687,8 +6846,8 @@ mod tests {
     use uuid::Uuid;
 
     use solver_worker::compiled_graph::{
-        CompiledAllocationStats, CompiledFlow, CompiledFlowKind, CompiledGraph,
-        CompiledMatchingStats, CompiledProcess, CompiledProviderAllocation,
+        CompiledAllocationStats, CompiledBiosphereEdge, CompiledFlow, CompiledFlowKind,
+        CompiledGraph, CompiledMatchingStats, CompiledProcess, CompiledProviderAllocation,
         CompiledProviderCandidateEligibility, CompiledProviderDecision,
         CompiledProviderDecisionKind, CompiledProviderFailureReason, CompiledProviderGeographyTier,
         CompiledProviderOutput, CompiledProviderOutputAllocationState,
@@ -6809,7 +6968,7 @@ mod tests {
         let manifest_hash = solver_worker::calculation_evidence::canonical_json_sha256(&manifest)
             .expect("manifest hash");
         let method_source =
-            solver_worker::calculation_evidence::expected_method_factor_source_contract();
+            solver_worker::calculation_evidence::method_factor_source_contract_fixture();
         let coverage = solver_worker::calculation_evidence::expected_factor_coverage_contract();
         let cli = Cli::try_parse_from([
             "snapshot-builder",
@@ -6985,6 +7144,7 @@ mod tests {
             factor_count: 0,
             source_evidence: None,
             rows: Vec::new(),
+            static_bundle: None,
         };
         let built = assemble_sparse_payload(
             Uuid::new_v4(),
@@ -7006,6 +7166,139 @@ mod tests {
         assert_eq!(overlay_graph.technosphere_edges[0].consumer_idx, 1);
         assert_eq!(built.data.process_count, 2);
         assert_eq!(built.coverage.matching.matched_unique_provider, 1);
+    }
+
+    #[test]
+    fn versioned_directional_snapshot_preserves_nonzero_sub_epsilon_b_and_c_values() {
+        let process_id = Uuid::new_v4();
+        let flow_id = Uuid::new_v4();
+        let method_id = Uuid::new_v4();
+        let tiny_exchange = f64::EPSILON / 4.0;
+        let tiny_factor: f64 = 7.006_49e-45;
+        assert!(tiny_exchange.abs() < f64::EPSILON);
+        assert!(tiny_factor.abs() < f64::EPSILON);
+
+        let graph = CompiledGraph {
+            processes: vec![CompiledProcess {
+                process_idx: 0,
+                process_id,
+                process_version: "01.00.000".to_owned(),
+                process_name: Some("tiny-value process".to_owned()),
+                model_id: None,
+                location: None,
+                reference_year: None,
+                annual_supply_or_production_volume: None,
+                partition: ScopeProcessPartition::Public,
+            }],
+            flows: vec![CompiledFlow {
+                flow_idx: 0,
+                flow_id,
+                kind: CompiledFlowKind::Elementary,
+            }],
+            provider_outputs: Vec::new(),
+            provider_decisions: Vec::new(),
+            technosphere_edges: Vec::new(),
+            biosphere_edges: vec![
+                CompiledBiosphereEdge {
+                    process_idx: 0,
+                    flow_idx: 0,
+                    amount: tiny_exchange,
+                    process_partition: ScopeProcessPartition::Public,
+                },
+                CompiledBiosphereEdge {
+                    process_idx: 0,
+                    flow_idx: 0,
+                    amount: f64::INFINITY,
+                    process_partition: ScopeProcessPartition::Public,
+                },
+            ],
+            reference_stats: CompiledReferenceStats::default(),
+            allocation_stats: CompiledAllocationStats::default(),
+            matching_stats: CompiledMatchingStats::default(),
+        };
+        let factors = vec![ImpactFactorSet {
+            impact_id: method_id,
+            method_version: "01.00.000".to_owned(),
+            artifact_locator_id: method_id,
+            impact_key: format!("method:{method_id}"),
+            impact_name: "Tiny factor method".to_owned(),
+            unit: "kg".to_owned(),
+            factors_by_flow: HashMap::from([(flow_id, tiny_factor)]),
+            factors_by_flow_direction: HashMap::from([(
+                (flow_id, ExchangeDirection::Output),
+                tiny_factor,
+            )]),
+        }];
+        let observations = vec![
+            LciaExchangeObservation {
+                flow_id,
+                flow_version: "01.00.000".to_owned(),
+                direction: Some(ExchangeDirection::Output),
+                direction_label: "Output".to_owned(),
+                exchange_id: "tiny-exchange".to_owned(),
+                amount: Some(tiny_exchange),
+            },
+            LciaExchangeObservation {
+                flow_id,
+                flow_version: "01.00.000".to_owned(),
+                direction: Some(ExchangeDirection::Output),
+                direction_label: "Output".to_owned(),
+                exchange_id: "nonfinite-exchange".to_owned(),
+                amount: Some(f64::INFINITY),
+            },
+        ];
+        let method = MethodSelection {
+            has_lcia: true,
+            method_id: None,
+            method_version: None,
+            method_count: 1,
+            factor_count: 1,
+            source_evidence: None,
+            rows: Vec::new(),
+            static_bundle: None,
+        };
+
+        let built = assemble_sparse_payload(
+            Uuid::new_v4(),
+            &method,
+            &graph,
+            0.999_999,
+            1e-12,
+            true,
+            &factors,
+            &observations,
+            true,
+        )
+        .expect("assemble versioned directional snapshot");
+
+        assert_eq!(built.data.biosphere_entries.len(), 1);
+        assert_eq!(
+            built.data.biosphere_entries[0].value.to_bits(),
+            tiny_exchange.to_bits()
+        );
+        assert_eq!(built.data.characterization_factors.len(), 1);
+        assert_eq!(
+            built.data.characterization_factors[0].value.to_bits(),
+            tiny_factor.to_bits()
+        );
+        assert_eq!(built.coverage.matrix_scale.b_nnz, 1);
+        assert_eq!(built.coverage.matrix_scale.c_nnz, 1);
+        let factor_coverage = built
+            .lcia_factor_coverage
+            .expect("versioned factor coverage");
+        assert_eq!(factor_coverage.counts.matched, 1);
+        assert_eq!(factor_coverage.counts.invalid, 1);
+        assert_eq!(factor_coverage.record_count, 1);
+    }
+
+    #[test]
+    fn biosphere_aggregation_rejects_finite_overflow() {
+        let mut b_map = HashMap::new();
+        super::accumulate_biosphere_edge(&mut b_map, (0, 0), f64::MAX, true)
+            .expect("first finite edge");
+        let error = super::accumulate_biosphere_edge(&mut b_map, (0, 0), f64::MAX, true)
+            .expect_err("finite aggregation overflow must fail closed");
+        assert!(error.to_string().contains("aggregation overflow"));
     }
 
     #[test]
@@ -8673,64 +8966,12 @@ mod tests {
     }
 
     #[test]
-    fn lciamethod_visibility_recheck_rejects_foreign_and_owner_nonzero() {
-        let actor = Uuid::new_v4();
-        let mut row = MethodRow {
-            id: Uuid::new_v4(),
-            version: "01.00.000".to_owned(),
-            user_id: Some(actor),
-            state_code: 0,
-            modified_at: None,
-            created_at: None,
-            json: json!({}),
-        };
-        validate_method_row_visibility(&row, actor).expect("owner state zero");
-        row.user_id = Some(Uuid::new_v4());
-        assert!(validate_method_row_visibility(&row, actor).is_err());
-        row.user_id = Some(actor);
-        row.state_code = 5;
-        assert!(validate_method_row_visibility(&row, actor).is_err());
-        row.state_code = 100;
-        validate_method_row_visibility(&row, actor).expect("public state 100");
-        row.state_code = 101;
-        assert!(validate_method_row_visibility(&row, actor).is_err());
-    }
-
-    #[test]
-    fn method_source_proof_changes_when_factor_content_drifts() {
-        let mut row = MethodRow {
-            id: Uuid::new_v4(),
-            version: "01.00.000".to_owned(),
-            user_id: None,
-            state_code: 100,
-            modified_at: None,
-            created_at: None,
-            json: json!({
-                "LCIAMethodDataSet": {
-                    "characterisationFactors": {
-                        "factor": [{
-                            "referenceToFlowDataSet": {"@refObjectId": Uuid::new_v4()},
-                            "exchangeDirection": "Output",
-                            "meanValue": 1.0
-                        }]
-                    }
-                }
-            }),
-        };
-        let first =
-            build_method_source_evidence(&[row.clone()], &"a".repeat(64)).expect("first proof");
-        row.json["LCIAMethodDataSet"]["characterisationFactors"]["factor"][0]["meanValue"] =
-            json!(2.0);
-        let second = build_method_source_evidence(&[row], &"a".repeat(64)).expect("second proof");
-        assert_ne!(first.factor_manifest_sha256, second.factor_manifest_sha256);
-        assert_ne!(first.source_snapshot_sha256, second.source_snapshot_sha256);
-    }
-
-    #[test]
     fn factor_coverage_matches_flow_and_direction_and_surfaces_gaps() {
         let flow_id = Uuid::new_v4();
         let factors = vec![ImpactFactorSet {
             impact_id: Uuid::new_v4(),
+            method_version: "01.00.000".to_owned(),
+            artifact_locator_id: Uuid::new_v4(),
             impact_key: "method:test".to_owned(),
             impact_name: "Test".to_owned(),
             unit: "kg".to_owned(),
@@ -8750,10 +8991,8 @@ mod tests {
             build_lcia_factor_coverage(&observations, &factors, &directions).expect("coverage");
         assert_eq!(coverage.counts.matched, 0);
         assert_eq!(coverage.counts.unmatched, 1);
-        assert_eq!(
-            coverage.records[0].reason,
-            "no_lcia_factor_for_flow_direction"
-        );
+        let gap_jsonl = std::fs::read_to_string(coverage.records.path()).expect("read gaps");
+        assert!(gap_jsonl.contains("no_lcia_factor_for_flow_direction"));
 
         let mut ambiguous = observations;
         ambiguous.push(LciaExchangeObservation {
@@ -8768,6 +9007,122 @@ mod tests {
         let coverage = build_lcia_factor_coverage(&ambiguous, &factors, &directions)
             .expect("ambiguous coverage");
         assert_eq!(coverage.counts.unsupported_direction, 2);
-        assert_eq!(coverage.records.len(), 2);
+        assert_eq!(coverage.record_count, 2);
+    }
+
+    #[test]
+    fn factor_coverage_is_per_method_when_no_key_is_shared_by_all_methods() {
+        let flow_a = Uuid::from_u128(1);
+        let flow_b = Uuid::from_u128(2);
+        let method_a = Uuid::from_u128(10);
+        let method_b = Uuid::from_u128(20);
+        let factors = vec![
+            ImpactFactorSet {
+                impact_id: method_b,
+                method_version: "01.00.000".to_owned(),
+                artifact_locator_id: method_b,
+                impact_key: "method:b".to_owned(),
+                impact_name: "B".to_owned(),
+                unit: "kg".to_owned(),
+                factors_by_flow: HashMap::from([(flow_b, 2.0)]),
+                factors_by_flow_direction: HashMap::from([(
+                    (flow_b, ExchangeDirection::Output),
+                    2.0,
+                )]),
+            },
+            ImpactFactorSet {
+                impact_id: method_a,
+                method_version: "01.00.000".to_owned(),
+                artifact_locator_id: method_a,
+                impact_key: "method:a".to_owned(),
+                impact_name: "A".to_owned(),
+                unit: "kg".to_owned(),
+                factors_by_flow: HashMap::from([(flow_a, 1.0)]),
+                factors_by_flow_direction: HashMap::from([(
+                    (flow_a, ExchangeDirection::Output),
+                    1.0,
+                )]),
+            },
+        ];
+        let observations = [flow_b, flow_a]
+            .into_iter()
+            .map(|flow_id| LciaExchangeObservation {
+                flow_id,
+                flow_version: "01.00.000".to_owned(),
+                direction: Some(ExchangeDirection::Output),
+                direction_label: "Output".to_owned(),
+                exchange_id: format!("exchange-{flow_id}"),
+                amount: Some(1.0),
+            })
+            .collect::<Vec<_>>();
+        let directions = unique_supported_direction_by_flow(&observations);
+        let coverage =
+            build_lcia_factor_coverage(&observations, &factors, &directions).expect("coverage");
+        assert_eq!(coverage.counts.matched, 2);
+        assert_eq!(coverage.counts.unmatched, 2);
+        assert_eq!(coverage.record_count, 2);
+        assert_eq!(coverage.by_method[0].method_id, method_a);
+        assert_eq!(coverage.by_method[0].counts.matched, 1);
+        assert_eq!(coverage.by_method[0].counts.unmatched, 1);
+        assert_eq!(coverage.by_method[1].method_id, method_b);
+        let lines = std::fs::read_to_string(coverage.records.path()).expect("gaps");
+        let records = lines
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("gap record"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            std::fs::metadata(coverage.records.path())
+                .expect("gap metadata")
+                .len(),
+            coverage.artifact_byte_size
+        );
+        assert_eq!(records[0]["method_id"], json!(method_a));
+        assert_eq!(records[1]["method_id"], json!(method_b));
+    }
+
+    #[test]
+    fn parse_number_rejects_nonfinite_values() {
+        assert_eq!(parse_number(Some(&json!("NaN"))), None);
+        assert_eq!(parse_number(Some(&json!("inf"))), None);
+        assert_eq!(parse_number(Some(&json!("-Infinity"))), None);
+        assert_eq!(parse_number(Some(&json!("1.25"))), Some(1.25));
+    }
+
+    #[test]
+    fn normalized_exchange_overflow_becomes_invalid_before_matrix_assembly() {
+        let reference_flow = Uuid::new_v4();
+        let overflow_flow = Uuid::new_v4();
+        let mut dataset = process_json(&[("Output", reference_flow), ("Input", overflow_flow)]);
+        dataset["processDataSet"]["exchanges"]["exchange"][0]["meanAmount"] = json!(1e-15);
+        dataset["processDataSet"]["exchanges"]["exchange"][1]["meanAmount"] = json!(f64::MAX);
+        let row = ProcessRow {
+            id: Uuid::new_v4(),
+            version: "01.00.000".to_owned(),
+            model_id: None,
+            user_id: None,
+            state_code: 100,
+            team_id: None,
+            review_id: None,
+            modified_at: None,
+            json: dataset,
+        };
+
+        let (_, exchanges, _, _, _) =
+            super::parse_process_chunk(&row, 0, NormalizationMode::Strict, AllocationMode::Strict)
+                .expect("parse process");
+
+        assert_eq!(exchanges.len(), 2);
+        assert!(exchanges[0].amount.is_some_and(f64::is_finite));
+        assert_eq!(exchanges[1].amount, None);
+    }
+
+    #[test]
+    fn factor_aggregation_rejects_finite_inputs_that_overflow() {
+        let method_id = Uuid::new_v4();
+        let mut factors = HashMap::new();
+        accumulate_finite_factor(&mut factors, Uuid::nil(), f64::MAX, method_id)
+            .expect("first finite factor");
+        assert!(accumulate_finite_factor(&mut factors, Uuid::nil(), f64::MAX, method_id).is_err());
+        assert!(factors[&Uuid::nil()].is_finite());
     }
 }
