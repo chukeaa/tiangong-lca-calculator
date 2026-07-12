@@ -21,6 +21,10 @@ use crate::{
         EncodedArtifact, encode_contribution_path_artifact, encode_solve_all_unit_query_artifact,
         encode_solve_batch_artifact, encode_solve_one_artifact,
     },
+    calculation_evidence::{
+        LcaCalculationEvidence, validate_calculation_evidence,
+        validate_calculation_evidence_binding,
+    },
     config::AppConfig,
     contribution_path::{ContributionPathArtifact, analyze_contribution_path},
     db_pool::{APP_SOLVER_WORKER, APP_SOLVER_WORKER_QUEUE, WorkerDbPoolOptions},
@@ -949,6 +953,18 @@ pub(crate) async fn fetch_snapshot_index_document(
     Ok(decoded)
 }
 
+async fn resolve_snapshot_calculation_evidence(
+    state: &AppState,
+    snapshot_id: Uuid,
+    request_binding: Option<&LcaCalculationEvidence>,
+) -> anyhow::Result<Option<LcaCalculationEvidence>> {
+    let snapshot_index = fetch_snapshot_index_document(state, snapshot_id).await?;
+    validate_calculation_evidence_binding(
+        snapshot_index.calculation_evidence.as_ref(),
+        request_binding,
+    )
+}
+
 fn is_undefined_table(err: &sqlx::Error) -> bool {
     match err {
         sqlx::Error::Database(db_err) => db_err.code().as_deref() == Some("42P01"),
@@ -1022,6 +1038,7 @@ async fn handle_job_payload_with_worker_lease(
             rhs,
             solve,
             print_level,
+            calculation_evidence_binding,
         } => {
             let running_db_write_sec = update_job_status(
                 &state.pool,
@@ -1040,6 +1057,12 @@ async fn handle_job_payload_with_worker_lease(
             }
 
             let level = print_level.unwrap_or(0.0);
+            let calculation_evidence = resolve_snapshot_calculation_evidence(
+                state,
+                snapshot_id,
+                calculation_evidence_binding.as_ref(),
+            )
+            .await?;
             ensure_prepared(state, snapshot_id, level).await?;
             let timed = state.solver.solve_one_timed(
                 snapshot_id,
@@ -1049,11 +1072,21 @@ async fn handle_job_payload_with_worker_lease(
             )?;
             let solved = timed.result;
 
-            let result_diag =
-                persist_solve_one_result(state, job_id, snapshot_id, &solved, &timed.timing)
-                    .await?;
+            let result_diag = persist_solve_one_result(
+                state,
+                job_id,
+                snapshot_id,
+                &solved,
+                &timed.timing,
+                calculation_evidence.clone(),
+            )
+            .await?;
             let completed_diag = merge_job_status_update_timing(
-                serde_json::json!({"result": "stored", "storage": result_diag}),
+                serde_json::json!({
+                    "result": "stored",
+                    "storage": result_diag,
+                    "calculation_evidence": calculation_evidence,
+                }),
                 "running",
                 running_db_write_sec,
             );
@@ -1076,6 +1109,7 @@ async fn handle_job_payload_with_worker_lease(
             rhs_batch,
             solve,
             print_level,
+            calculation_evidence_binding,
         } => {
             let running_db_write_sec = update_job_status(
                 &state.pool,
@@ -1094,6 +1128,12 @@ async fn handle_job_payload_with_worker_lease(
             }
 
             let level = print_level.unwrap_or(0.0);
+            let calculation_evidence = resolve_snapshot_calculation_evidence(
+                state,
+                snapshot_id,
+                calculation_evidence_binding.as_ref(),
+            )
+            .await?;
             ensure_prepared(state, snapshot_id, level).await?;
             let solved = state.solver.solve_batch(
                 snapshot_id,
@@ -1102,11 +1142,21 @@ async fn handle_job_payload_with_worker_lease(
                 to_core_solve_options(solve),
             )?;
 
-            let result_diag =
-                persist_solve_batch_result(state, job_id, snapshot_id, &solved, "solve_batch")
-                    .await?;
+            let result_diag = persist_solve_batch_result(
+                state,
+                job_id,
+                snapshot_id,
+                &solved,
+                "solve_batch",
+                calculation_evidence.clone(),
+            )
+            .await?;
             let completed_diag = merge_job_status_update_timing(
-                serde_json::json!({"result": "stored", "storage": result_diag}),
+                serde_json::json!({
+                    "result": "stored",
+                    "storage": result_diag,
+                    "calculation_evidence": calculation_evidence,
+                }),
                 "running",
                 running_db_write_sec,
             );
@@ -1129,6 +1179,7 @@ async fn handle_job_payload_with_worker_lease(
             solve,
             unit_batch_size,
             print_level,
+            calculation_evidence_binding,
         } => {
             let running_db_write_sec = update_job_status(
                 &state.pool,
@@ -1147,6 +1198,12 @@ async fn handle_job_payload_with_worker_lease(
             }
 
             let level = print_level.unwrap_or(0.0);
+            let calculation_evidence = resolve_snapshot_calculation_evidence(
+                state,
+                snapshot_id,
+                calculation_evidence_binding.as_ref(),
+            )
+            .await?;
             ensure_prepared(state, snapshot_id, level).await?;
             let process_count = fetch_snapshot_process_count(&state.pool, snapshot_id).await?;
             let n = usize::try_from(process_count)
@@ -1186,9 +1243,15 @@ async fn handle_job_payload_with_worker_lease(
                         err
                     })
                     .ok();
-            let result_diag =
-                persist_solve_batch_result(state, job_id, snapshot_id, &solved, "solve_all_unit")
-                    .await?;
+            let result_diag = persist_solve_batch_result(
+                state,
+                job_id,
+                snapshot_id,
+                &solved,
+                "solve_all_unit",
+                calculation_evidence.clone(),
+            )
+            .await?;
             let completed_diag = merge_job_status_update_timing(
                 serde_json::json!({
                     "result": "stored",
@@ -1196,7 +1259,8 @@ async fn handle_job_payload_with_worker_lease(
                     "solve_all_unit": {
                         "process_count": n,
                         "unit_batch_size": batch_size,
-                    }
+                    },
+                    "calculation_evidence": calculation_evidence,
                 }),
                 "running",
                 running_db_write_sec,
@@ -1243,6 +1307,7 @@ async fn handle_job_payload_with_worker_lease(
             amount,
             options,
             print_level,
+            calculation_evidence_binding,
         } => {
             let running_db_write_sec = update_job_status(
                 &state.pool,
@@ -1267,6 +1332,12 @@ async fn handle_job_payload_with_worker_lease(
             }
 
             let level = print_level.unwrap_or(0.0);
+            let calculation_evidence = resolve_snapshot_calculation_evidence(
+                state,
+                snapshot_id,
+                calculation_evidence_binding.as_ref(),
+            )
+            .await?;
             ensure_prepared(state, snapshot_id, level).await?;
             let snapshot_data = fetch_snapshot_sparse_data(state, snapshot_id).await?;
             let snapshot_index = fetch_snapshot_index_document(state, snapshot_id).await?;
@@ -1314,8 +1385,14 @@ async fn handle_job_payload_with_worker_lease(
                 &timed.result,
             )?;
 
-            let result_diag =
-                persist_contribution_path_result(state, job_id, snapshot_id, &analysis).await?;
+            let result_diag = persist_contribution_path_result(
+                state,
+                job_id,
+                snapshot_id,
+                &analysis,
+                calculation_evidence.clone(),
+            )
+            .await?;
             let completed_diag = merge_job_status_update_timing(
                 serde_json::json!({
                     "result": "stored",
@@ -1325,7 +1402,8 @@ async fn handle_job_payload_with_worker_lease(
                         "impact_id": impact_id,
                         "amount": amount,
                         "summary": analysis.summary,
-                    }
+                    },
+                    "calculation_evidence": calculation_evidence,
                 }),
                 "running",
                 running_db_write_sec,
@@ -1381,8 +1459,17 @@ async fn handle_job_payload_with_worker_lease(
             job_id,
             snapshot_id,
             scope,
+            all_states,
             process_states,
             include_user_id,
+            include_user_state_codes,
+            include_user_unassigned_only,
+            include_user_review_free_only,
+            data_scope,
+            scope_manifest,
+            scope_manifest_sha256,
+            lcia_method_factor_source,
+            lcia_factor_coverage_contract,
             request_roots,
             provider_rule,
             reference_normalization_mode,
@@ -1394,6 +1481,11 @@ async fn handle_job_payload_with_worker_lease(
             method_version,
             no_lcia,
         } => {
+            if data_scope.is_some() && build_snapshot_worker_lease.is_none() {
+                return Err(anyhow::anyhow!(
+                    "versioned snapshot scope requires authenticated worker_jobs context"
+                ));
+            }
             let lock_strategy = if build_snapshot_worker_lease.is_some() {
                 "worker_jobs_phase_lease"
             } else {
@@ -1451,6 +1543,38 @@ async fn handle_job_payload_with_worker_lease(
             )
             .await?;
 
+            let versioned_builder_args = data_scope
+                .as_ref()
+                .map(|data_scope| {
+                    Ok::<_, anyhow::Error>(VersionedSnapshotBuilderArgs {
+                        all_states: all_states
+                            .ok_or_else(|| anyhow::anyhow!("versioned build missing all_states"))?,
+                        include_user_state_codes: include_user_state_codes.clone().ok_or_else(
+                            || anyhow::anyhow!("versioned build missing include_user_state_codes"),
+                        )?,
+                        include_user_unassigned_only: include_user_unassigned_only
+                            .ok_or_else(|| anyhow::anyhow!("versioned build missing team guard"))?,
+                        include_user_review_free_only: include_user_review_free_only.ok_or_else(
+                            || anyhow::anyhow!("versioned build missing review guard"),
+                        )?,
+                        data_scope: data_scope.clone(),
+                        scope_manifest: scope_manifest.clone().ok_or_else(|| {
+                            anyhow::anyhow!("versioned build missing scope_manifest")
+                        })?,
+                        scope_manifest_sha256: scope_manifest_sha256.clone().ok_or_else(|| {
+                            anyhow::anyhow!("versioned build missing scope_manifest_sha256")
+                        })?,
+                        lcia_method_factor_source: lcia_method_factor_source.clone().ok_or_else(
+                            || anyhow::anyhow!("versioned build missing method source contract"),
+                        )?,
+                        lcia_factor_coverage_contract: lcia_factor_coverage_contract
+                            .clone()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("versioned build missing factor coverage contract")
+                            })?,
+                    })
+                })
+                .transpose()?;
             let build_future = run_snapshot_builder_job(
                 snapshot_id,
                 process_states.as_deref(),
@@ -1468,6 +1592,7 @@ async fn handle_job_payload_with_worker_lease(
                 None,
                 None,
                 None,
+                versioned_builder_args.as_ref(),
                 no_lcia.unwrap_or(false),
             );
             let executed_result = match build_snapshot_worker_lease.as_ref() {
@@ -1510,6 +1635,21 @@ async fn handle_job_payload_with_worker_lease(
 
             let resolved_snapshot_id = executed.resolved_snapshot_id;
             let build_timing_sec = executed.build_timing_sec.clone();
+            let calculation_evidence = if let Some(versioned) = &versioned_builder_args {
+                let index = fetch_snapshot_index_document(state, resolved_snapshot_id).await?;
+                let evidence = index.calculation_evidence.ok_or_else(|| {
+                    anyhow::anyhow!("versioned snapshot build produced no calculation evidence")
+                })?;
+                validate_calculation_evidence(&evidence)?;
+                if evidence.scope_manifest_sha256 != versioned.scope_manifest_sha256 {
+                    return Err(anyhow::anyhow!(
+                        "versioned snapshot build produced scope evidence drift"
+                    ));
+                }
+                Some(evidence)
+            } else {
+                None
+            };
             if let Some(lease) = &build_snapshot_worker_lease {
                 crate::worker_jobs::heartbeat_worker_job(
                     &state.pool,
@@ -1554,6 +1694,7 @@ async fn handle_job_payload_with_worker_lease(
                 "builder": executed,
                 "build_snapshot_lock": build_snapshot_lock,
                 "source_hash": source_hash,
+                "calculation_evidence": calculation_evidence,
             });
             if let (Some(build_timing_sec), Some(payload)) =
                 (build_timing_sec, completed_payload.as_object_mut())
@@ -1599,6 +1740,7 @@ async fn persist_solve_one_result(
     snapshot_id: Uuid,
     solved: &SolveResult,
     timing: &SolveComputationTiming,
+    calculation_evidence: Option<LcaCalculationEvidence>,
 ) -> anyhow::Result<Value> {
     let timing_json = serde_json::to_value(timing)?;
     let encode_started = Instant::now();
@@ -1614,6 +1756,7 @@ async fn persist_solve_one_result(
             encoded,
             compute_timing: Some(timing_json),
             encode_artifact_sec,
+            calculation_evidence,
         },
     )
     .await
@@ -1625,6 +1768,7 @@ async fn persist_solve_batch_result(
     snapshot_id: Uuid,
     solved: &SolveBatchResult,
     suffix: &'static str,
+    calculation_evidence: Option<LcaCalculationEvidence>,
 ) -> anyhow::Result<Value> {
     let encode_started = Instant::now();
     let encoded = encode_solve_batch_artifact(snapshot_id, job_id, solved)?;
@@ -1639,6 +1783,7 @@ async fn persist_solve_batch_result(
             encoded,
             compute_timing: None,
             encode_artifact_sec,
+            calculation_evidence,
         },
     )
     .await
@@ -1678,6 +1823,7 @@ async fn persist_contribution_path_result(
     job_id: Uuid,
     snapshot_id: Uuid,
     analysis: &ContributionPathArtifact,
+    calculation_evidence: Option<LcaCalculationEvidence>,
 ) -> anyhow::Result<Value> {
     let encoded = encode_contribution_path_artifact(analysis)?;
     persist_result_artifact(
@@ -1689,6 +1835,7 @@ async fn persist_contribution_path_result(
             encoded,
             compute_timing: None,
             encode_artifact_sec: 0.0,
+            calculation_evidence,
         },
     )
     .await
@@ -1747,6 +1894,7 @@ struct PersistArtifactInput {
     encoded: EncodedArtifact,
     compute_timing: Option<Value>,
     encode_artifact_sec: f64,
+    calculation_evidence: Option<LcaCalculationEvidence>,
 }
 
 struct ArtifactMeta {
@@ -1807,11 +1955,25 @@ struct BuilderCommandCandidate {
     current_dir: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone)]
+struct VersionedSnapshotBuilderArgs {
+    all_states: bool,
+    include_user_state_codes: String,
+    include_user_unassigned_only: bool,
+    include_user_review_free_only: bool,
+    data_scope: String,
+    scope_manifest: Value,
+    scope_manifest_sha256: String,
+    lcia_method_factor_source: Value,
+    lcia_factor_coverage_contract: Value,
+}
+
 #[derive(Clone)]
 struct PersistTimingContext {
     compute_timing: Option<Value>,
     encode_artifact_sec: f64,
     upload_artifact_sec: f64,
+    calculation_evidence: Option<LcaCalculationEvidence>,
 }
 
 pub(crate) async fn run_review_submit_gate_snapshot_builder(
@@ -1844,6 +2006,7 @@ pub(crate) async fn run_review_submit_gate_snapshot_builder(
         Some(REVIEW_SUBMIT_SNAPSHOT_TTL_SECONDS),
         Some(REVIEW_SUBMIT_SNAPSHOT_TTL_SECONDS),
         Some(revision_checksum),
+        None,
         true,
     )
     .await;
@@ -1984,6 +2147,7 @@ async fn run_lcia_result_package_snapshot_builder(
         None,
         None,
         None,
+        None,
         false,
     )
     .await;
@@ -2043,9 +2207,15 @@ async fn persist_lcia_result_package_all_unit_artifacts(
     let solved = SolveBatchResult { items };
     let query_artifact_meta =
         persist_solve_all_unit_query_artifact(state, result_job_id, snapshot_id, &solved).await?;
-    let result_diag =
-        persist_solve_batch_result(state, result_job_id, snapshot_id, &solved, "solve_all_unit")
-            .await?;
+    let result_diag = persist_solve_batch_result(
+        state,
+        result_job_id,
+        snapshot_id,
+        &solved,
+        "solve_all_unit",
+        None,
+    )
+    .await?;
     let result_id = latest_result_id_for_job(&state.pool, result_job_id)
         .await?
         .ok_or_else(|| {
@@ -2097,6 +2267,7 @@ async fn persist_result_artifact(
         encoded,
         compute_timing,
         encode_artifact_sec,
+        calculation_evidence,
     } = input;
     let EncodedArtifact {
         format,
@@ -2122,6 +2293,7 @@ async fn persist_result_artifact(
         compute_timing,
         encode_artifact_sec,
         upload_artifact_sec: upload_started.elapsed().as_secs_f64(),
+        calculation_evidence,
     };
     persist_object_storage_result(
         state,
@@ -2292,6 +2464,7 @@ async fn run_snapshot_builder_job(
     artifact_expires_in_seconds: Option<i64>,
     reuse_max_age_seconds: Option<i64>,
     review_submit_revision_checksum: Option<&str>,
+    versioned_scope: Option<&VersionedSnapshotBuilderArgs>,
     no_lcia: bool,
 ) -> anyhow::Result<SnapshotBuilderExecution> {
     let mut builder_args = vec![
@@ -2366,6 +2539,28 @@ async fn run_snapshot_builder_job(
     {
         builder_args.push("--review-submit-revision-checksum".to_owned());
         builder_args.push(checksum.to_owned());
+    }
+    if let Some(scope) = versioned_scope {
+        builder_args.push("--all-states".to_owned());
+        builder_args.push(scope.all_states.to_string());
+        builder_args.push("--include-user-state-codes".to_owned());
+        builder_args.push(scope.include_user_state_codes.clone());
+        if scope.include_user_unassigned_only {
+            builder_args.push("--include-user-unassigned-only".to_owned());
+        }
+        if scope.include_user_review_free_only {
+            builder_args.push("--include-user-review-free-only".to_owned());
+        }
+        builder_args.push("--data-scope".to_owned());
+        builder_args.push(scope.data_scope.clone());
+        builder_args.push("--scope-manifest-json".to_owned());
+        builder_args.push(serde_json::to_string(&scope.scope_manifest)?);
+        builder_args.push("--scope-manifest-sha256".to_owned());
+        builder_args.push(scope.scope_manifest_sha256.clone());
+        builder_args.push("--lcia-method-factor-source-json".to_owned());
+        builder_args.push(serde_json::to_string(&scope.lcia_method_factor_source)?);
+        builder_args.push("--lcia-factor-coverage-contract-json".to_owned());
+        builder_args.push(serde_json::to_string(&scope.lcia_factor_coverage_contract)?);
     }
 
     let candidates = snapshot_builder_candidates(builder_args);
@@ -2601,6 +2796,7 @@ async fn persist_object_storage_result(
         "artifact_sha256": artifact_meta.sha256,
         "artifact_bytes": artifact_meta.encoded_len,
         "artifact_url": artifact_url,
+        "calculation_evidence": timing.calculation_evidence.clone(),
         "compute_timing_sec": timing.compute_timing,
         "persistence_timing_sec": persistence_timing_json(
             Some(timing.encode_artifact_sec),
@@ -2632,6 +2828,7 @@ async fn persist_object_storage_result(
         "artifact_sha256": artifact_meta.sha256,
         "artifact_bytes": artifact_meta.encoded_len,
         "artifact_url": artifact_url,
+        "calculation_evidence": timing.calculation_evidence.clone(),
         "compute_timing_sec": timing.compute_timing,
         "persistence_timing_sec": persistence_timing_json(
             Some(timing.encode_artifact_sec),
@@ -2885,7 +3082,7 @@ mod tests {
     fn build_snapshot_heartbeat_interval_refreshes_before_lease_expiry() {
         assert_eq!(
             build_snapshot_heartbeat_interval(900),
-            Duration::from_secs(60)
+            Duration::from_mins(1)
         );
         assert_eq!(
             build_snapshot_heartbeat_interval(30),

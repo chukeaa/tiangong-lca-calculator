@@ -5,6 +5,7 @@
     clippy::format_push_string,
     clippy::needless_raw_string_hashes,
     clippy::reserve_after_initialization,
+    clippy::struct_excessive_bools,
     clippy::struct_field_names,
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -23,6 +24,15 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use solver_core::{ModelSparseData, SparseTriplet};
+use solver_worker::calculation_evidence::{
+    CALCULATION_EVIDENCE_SCHEMA_VERSION, FACTOR_COVERAGE_EVIDENCE_SCHEMA_VERSION,
+    LcaCalculationEvidence, LcaMethodFactorSourceSnapshot, LciaFactorCoverageCounts,
+    LciaFactorCoverageEvidence, LciaUncharacterizedEvidenceArtifact, LciaUncharacterizedRecord,
+    METHOD_SOURCE_SNAPSHOT_SCHEMA_VERSION, MISSING_FACTOR_SEMANTICS, PUBLIC_PLUS_OWNER_DRAFT_SCOPE,
+    PublicOwnerDraftBuildRequest, UNCHARACTERIZED_ARTIFACT_FORMAT, ValidatedPublicOwnerDraftScope,
+    canonical_json_sha256, encode_uncharacterized_jsonl, sha256_bytes,
+    validate_calculation_evidence, validate_public_owner_draft_build_request,
+};
 use solver_worker::compiled_graph::{
     CompiledAllocationStats, CompiledBiosphereEdge, CompiledEdgePartition, CompiledFlow,
     CompiledFlowKind, CompiledGraph, CompiledMatchingStats, CompiledProcess,
@@ -111,6 +121,24 @@ struct Cli {
     process_states: String,
     #[arg(long)]
     include_user_id: Option<Uuid>,
+    #[arg(long)]
+    all_states: Option<bool>,
+    #[arg(long)]
+    include_user_state_codes: Option<String>,
+    #[arg(long, default_value_t = false)]
+    include_user_unassigned_only: bool,
+    #[arg(long, default_value_t = false)]
+    include_user_review_free_only: bool,
+    #[arg(long)]
+    data_scope: Option<String>,
+    #[arg(long)]
+    scope_manifest_json: Option<String>,
+    #[arg(long)]
+    scope_manifest_sha256: Option<String>,
+    #[arg(long)]
+    lcia_method_factor_source_json: Option<String>,
+    #[arg(long)]
+    lcia_factor_coverage_contract_json: Option<String>,
     #[arg(long = "root-process")]
     root_processes: Vec<RequestRootProcess>,
     #[arg(long, default_value_t = 0)]
@@ -178,22 +206,67 @@ struct ProcessRow {
     version: String,
     model_id: Option<Uuid>,
     user_id: Option<Uuid>,
+    state_code: i32,
+    team_id: Option<Uuid>,
+    review_id: Option<Uuid>,
     modified_at: Option<DateTime<Utc>>,
     json: Value,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
+struct FlowRow {
+    id: Uuid,
+    version: String,
+    user_id: Option<Uuid>,
+    state_code: i32,
+    team_id: Option<Uuid>,
+    review_id: Option<Uuid>,
+    json: Value,
+}
+
+#[derive(Debug, Clone)]
+struct MethodRow {
+    id: Uuid,
+    version: String,
+    user_id: Option<Uuid>,
+    state_code: i32,
+    modified_at: Option<DateTime<Utc>>,
+    created_at: Option<DateTime<Utc>>,
+    json: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 enum ExchangeDirection {
     Input,
     Output,
+}
+
+impl ExchangeDirection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Input => "Input",
+            Self::Output => "Output",
+        }
+    }
+}
+
+fn parse_exchange_direction(value: Option<&str>) -> Option<ExchangeDirection> {
+    match value.map(str::trim) {
+        Some("Input") => Some(ExchangeDirection::Input),
+        Some("Output") => Some(ExchangeDirection::Output),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone)]
 struct ParsedExchange {
     process_idx: i32,
     flow_id: Uuid,
-    direction: ExchangeDirection,
+    direction: Option<ExchangeDirection>,
+    direction_label: String,
     internal_id: Option<String>,
+    exchange_id: String,
+    flow_version: String,
     is_reference_exchange: bool,
     amount: Option<f64>,
     allocation_state: AllocationFractionState,
@@ -283,6 +356,8 @@ struct MethodSelection {
     method_version: Option<String>,
     method_count: i64,
     factor_count: i64,
+    source_evidence: Option<LcaMethodFactorSourceSnapshot>,
+    rows: Vec<MethodRow>,
 }
 
 #[derive(Debug, Clone)]
@@ -292,6 +367,7 @@ struct ImpactFactorSet {
     impact_name: String,
     unit: String,
     factors_by_flow: HashMap<Uuid, f64>,
+    factors_by_flow_direction: HashMap<(Uuid, ExchangeDirection), f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -301,6 +377,29 @@ struct BuildOutput {
     snapshot_index: SnapshotIndexDocument,
     readiness: MatrixReadinessReport,
     compiled_graph: CompiledGraph,
+    lcia_factor_coverage: Option<LciaFactorCoverageBuild>,
+}
+
+#[derive(Debug, Clone)]
+struct CompiledScopeGraph {
+    graph: CompiledGraph,
+    lcia_exchange_observations: Vec<LciaExchangeObservation>,
+}
+
+#[derive(Debug, Clone)]
+struct LciaExchangeObservation {
+    flow_id: Uuid,
+    flow_version: String,
+    direction: Option<ExchangeDirection>,
+    direction_label: String,
+    exchange_id: String,
+    amount: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct LciaFactorCoverageBuild {
+    counts: LciaFactorCoverageCounts,
+    records: Vec<LciaUncharacterizedRecord>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -473,10 +572,60 @@ fn snapshot_report_policy(cli: &Cli) -> anyhow::Result<LocalSnapshotReportPolicy
     })
 }
 
+fn validate_versioned_scope_cli(
+    cli: &Cli,
+) -> anyhow::Result<Option<ValidatedPublicOwnerDraftScope>> {
+    let has_versioned_field = cli.all_states.is_some()
+        || cli.data_scope.is_some()
+        || cli.scope_manifest_json.is_some()
+        || cli.scope_manifest_sha256.is_some()
+        || cli.lcia_method_factor_source_json.is_some()
+        || cli.lcia_factor_coverage_contract_json.is_some()
+        || cli.include_user_state_codes.is_some()
+        || cli.include_user_unassigned_only
+        || cli.include_user_review_free_only;
+    if !has_versioned_field {
+        return Ok(None);
+    }
+
+    let scope_manifest =
+        parse_required_json_arg(cli.scope_manifest_json.as_deref(), "--scope-manifest-json")?;
+    let method_source = parse_required_json_arg(
+        cli.lcia_method_factor_source_json.as_deref(),
+        "--lcia-method-factor-source-json",
+    )?;
+    let coverage_contract = parse_required_json_arg(
+        cli.lcia_factor_coverage_contract_json.as_deref(),
+        "--lcia-factor-coverage-contract-json",
+    )?;
+    validate_public_owner_draft_build_request(PublicOwnerDraftBuildRequest {
+        all_states: cli.all_states,
+        process_states: Some(&cli.process_states),
+        include_user_id: cli.include_user_id,
+        include_user_state_codes: cli.include_user_state_codes.as_deref(),
+        include_user_unassigned_only: Some(cli.include_user_unassigned_only),
+        include_user_review_free_only: Some(cli.include_user_review_free_only),
+        data_scope: cli.data_scope.as_deref(),
+        scope_manifest: Some(&scope_manifest),
+        scope_manifest_sha256: cli.scope_manifest_sha256.as_deref(),
+        lcia_method_factor_source: Some(&method_source),
+        lcia_factor_coverage_contract: Some(&coverage_contract),
+        no_lcia: Some(cli.no_lcia),
+        requested_by: cli.include_user_id,
+    })
+    .map(Some)
+}
+
+fn parse_required_json_arg(value: Option<&str>, name: &str) -> anyhow::Result<Value> {
+    let value = value.ok_or_else(|| anyhow::anyhow!("{name} is required for versioned scope"))?;
+    serde_json::from_str(value).map_err(|error| anyhow::anyhow!("invalid {name}: {error}"))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let total_started = Instant::now();
     let cli = Cli::parse();
+    let versioned_scope = validate_versioned_scope_cli(&cli)?;
     let provider_rule = ProviderRule::parse(&cli.provider_rule)?;
     let reference_normalization_mode = NormalizationMode::parse(&cli.reference_normalization_mode)?;
     let allocation_mode = AllocationMode::parse(&cli.allocation_fraction_mode)?;
@@ -527,13 +676,20 @@ async fn main() -> anyhow::Result<()> {
     };
     let mut build_timing = BuildTimingSec::default();
     let method_started = Instant::now();
-    let method = resolve_method_identity(&pool, &cli).await?;
+    let method = resolve_method_identity(&pool, &cli, versioned_scope.as_ref()).await?;
     build_timing.resolve_method_identity_sec = method_started.elapsed().as_secs_f64();
     let artifact_expires_in_seconds = positive_seconds(cli.artifact_expires_in_seconds);
     let reuse_max_age_seconds = positive_seconds(cli.reuse_max_age_seconds);
     let build_config = SnapshotBuildConfig {
         process_states: process_states_label.clone(),
         include_user_id: cli.include_user_id,
+        data_scope: versioned_scope
+            .as_ref()
+            .map(|_| PUBLIC_PLUS_OWNER_DRAFT_SCOPE.to_owned()),
+        scope_manifest_sha256: versioned_scope
+            .as_ref()
+            .map(|scope| scope.scope_manifest_sha256.clone()),
+        lcia_method_factor_source: method.source_evidence.clone(),
         selection_mode,
         request_roots: request_roots.clone(),
         process_limit: i32::try_from(cli.process_limit)
@@ -552,8 +708,14 @@ async fn main() -> anyhow::Result<()> {
         method_id: method.method_id,
         method_version: method.method_version.clone(),
     };
-    let candidate_processes =
-        fetch_processes(&pool, all_states, &state_codes, cli.include_user_id).await?;
+    let candidate_processes = fetch_processes(
+        &pool,
+        all_states,
+        &state_codes,
+        cli.include_user_id,
+        versioned_scope.as_ref(),
+    )
+    .await?;
     let resolved_scope = resolve_process_selection(
         candidate_processes,
         all_states,
@@ -564,8 +726,14 @@ async fn main() -> anyhow::Result<()> {
         cli.process_limit,
     )?;
     let fingerprint_started = Instant::now();
-    let (source_summary, source_fingerprint) =
-        compute_source_fingerprint(&pool, &resolved_scope.processes, &build_config).await?;
+    let (source_summary, source_fingerprint) = compute_source_fingerprint(
+        &pool,
+        &resolved_scope.processes,
+        &build_config,
+        versioned_scope.as_ref(),
+        Some(&method),
+    )
+    .await?;
     build_timing.compute_source_fingerprint_sec = fingerprint_started.elapsed().as_secs_f64();
 
     if let Some(snapshot_id) = requested_snapshot_id {
@@ -644,6 +812,7 @@ async fn main() -> anyhow::Result<()> {
             &pool,
             &resolved_scope.processes,
             cli.include_user_id,
+            versioned_scope.as_ref(),
             &replay_rules,
             reference_normalization_mode,
             allocation_mode,
@@ -711,7 +880,13 @@ async fn main() -> anyhow::Result<()> {
     if let Some(reused) = reused_candidate {
         let snapshot_index_url = derive_snapshot_index_url(&reused.artifact_url);
         match store.download_object_url(&snapshot_index_url).await {
-            Ok(_) => {
+            Ok(index_bytes) => {
+                validate_reusable_snapshot_index(
+                    &index_bytes,
+                    reused.snapshot_id,
+                    versioned_scope.as_ref(),
+                    &method,
+                )?;
                 let resolved_snapshot_id = reused.snapshot_id;
 
                 build_timing.reused_snapshot = true;
@@ -770,17 +945,18 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let factor_map_started = Instant::now();
-    let impact_factor_sets = load_impact_factor_sets(&pool, &method).await?;
+    let impact_factor_sets = load_impact_factor_sets(&method)?;
     build_timing.load_method_factors_sec = factor_map_started.elapsed().as_secs_f64();
 
     let snapshot_id = requested_snapshot_id.unwrap_or_else(Uuid::new_v4);
     let build_started = Instant::now();
-    let built = build_sparse_payload(
+    let mut built = build_sparse_payload(
         &pool,
         snapshot_id,
         &method,
         resolved_scope.processes.clone(),
         cli.include_user_id,
+        versioned_scope.as_ref(),
         provider_rule,
         reference_normalization_mode,
         allocation_mode,
@@ -812,6 +988,15 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     build_timing.upload_artifact_sec = upload_started.elapsed().as_secs_f64();
 
+    attach_versioned_calculation_evidence(
+        &store,
+        snapshot_id,
+        &mut built,
+        versioned_scope.as_ref(),
+        &method,
+    )
+    .await?;
+
     let snapshot_index_bytes = serde_json::to_vec(&built.snapshot_index)?;
     let upload_snapshot_index_started = Instant::now();
     let snapshot_index_url = store
@@ -827,6 +1012,7 @@ async fn main() -> anyhow::Result<()> {
         all_states,
         &state_codes,
         cli.include_user_id,
+        versioned_scope.as_ref(),
         &resolved_scope.scope_summary,
         &source_fingerprint,
         &method,
@@ -896,6 +1082,107 @@ async fn main() -> anyhow::Result<()> {
         built.readiness.findings.len()
     );
 
+    Ok(())
+}
+
+async fn attach_versioned_calculation_evidence(
+    store: &ObjectStoreClient,
+    snapshot_id: Uuid,
+    built: &mut BuildOutput,
+    versioned_scope: Option<&ValidatedPublicOwnerDraftScope>,
+    method: &MethodSelection,
+) -> anyhow::Result<()> {
+    let Some(scope) = versioned_scope else {
+        return Ok(());
+    };
+    let source = method.source_evidence.clone().ok_or_else(|| {
+        anyhow::anyhow!("versioned scope build is missing LCIA method source evidence")
+    })?;
+    let coverage = built
+        .lcia_factor_coverage
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("versioned scope build is missing LCIA factor coverage"))?;
+    let gap_count = coverage
+        .counts
+        .unmatched
+        .checked_add(coverage.counts.invalid)
+        .and_then(|count| count.checked_add(coverage.counts.unsupported_direction))
+        .ok_or_else(|| anyhow::anyhow!("LCIA factor coverage count overflow"))?;
+    let record_count = u64::try_from(coverage.records.len())
+        .map_err(|_| anyhow::anyhow!("LCIA gap record count overflow"))?;
+    if gap_count != record_count {
+        return Err(anyhow::anyhow!(
+            "LCIA gap count differs from uncharacterized record count"
+        ));
+    }
+    let uncharacterized_evidence = if coverage.records.is_empty() {
+        None
+    } else {
+        let bytes = encode_uncharacterized_jsonl(&coverage.records)?;
+        let artifact_sha256 = sha256_bytes(&bytes);
+        let artifact_url = store
+            .upload_snapshot_lcia_uncharacterized_evidence(snapshot_id, bytes)
+            .await?;
+        Some(LciaUncharacterizedEvidenceArtifact {
+            artifact_url,
+            artifact_format: UNCHARACTERIZED_ARTIFACT_FORMAT.to_owned(),
+            artifact_sha256,
+            record_count,
+        })
+    };
+    let evidence = LcaCalculationEvidence {
+        schema_version: CALCULATION_EVIDENCE_SCHEMA_VERSION.to_owned(),
+        scope_manifest_sha256: scope.scope_manifest_sha256.clone(),
+        lcia_method_factor_source: source,
+        lcia_factor_coverage: LciaFactorCoverageEvidence {
+            schema_version: FACTOR_COVERAGE_EVIDENCE_SCHEMA_VERSION.to_owned(),
+            coverage_status: if gap_count == 0 {
+                "complete".to_owned()
+            } else {
+                "incomplete_coverage".to_owned()
+            },
+            missing_factor_semantics: MISSING_FACTOR_SEMANTICS.to_owned(),
+            counts: coverage.counts.clone(),
+            uncharacterized_evidence,
+        },
+    };
+    validate_calculation_evidence(&evidence)?;
+    println!(
+        "[calculation_evidence] {}",
+        serde_json::to_string(&evidence)?
+    );
+    built.snapshot_index.calculation_evidence = Some(evidence);
+    Ok(())
+}
+
+fn validate_reusable_snapshot_index(
+    bytes: &[u8],
+    snapshot_id: Uuid,
+    versioned_scope: Option<&ValidatedPublicOwnerDraftScope>,
+    method: &MethodSelection,
+) -> anyhow::Result<()> {
+    let index: SnapshotIndexDocument = serde_json::from_slice(bytes)?;
+    if index.snapshot_id != snapshot_id {
+        return Err(anyhow::anyhow!(
+            "reusable snapshot index id mismatch: expected={snapshot_id} actual={}",
+            index.snapshot_id
+        ));
+    }
+    let Some(scope) = versioned_scope else {
+        return Ok(());
+    };
+    let evidence = index
+        .calculation_evidence
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("versioned reusable snapshot lacks calculation evidence"))?;
+    validate_calculation_evidence(evidence)?;
+    if evidence.scope_manifest_sha256 != scope.scope_manifest_sha256
+        || method.source_evidence.as_ref() != Some(&evidence.lcia_method_factor_source)
+    {
+        return Err(anyhow::anyhow!(
+            "versioned reusable snapshot calculation evidence drift"
+        ));
+    }
     Ok(())
 }
 
@@ -1078,8 +1365,14 @@ async fn run_review_submit_overlay_build(
     baseline_config.artifact_purpose = Some(REVIEW_SUBMIT_BASELINE_ARTIFACT_PURPOSE.to_owned());
     baseline_config.root_dependency_fingerprint = Some(root_dependency_fingerprint.clone());
     baseline_config.root_revision_checksum = None;
-    let (baseline_source_summary, baseline_source_hash) =
-        compute_source_fingerprint(pool, &baseline_processes, &baseline_config).await?;
+    let (baseline_source_summary, baseline_source_hash) = compute_source_fingerprint(
+        pool,
+        &baseline_processes,
+        &baseline_config,
+        None,
+        Some(&method),
+    )
+    .await?;
 
     let mut overlay_config = build_config.clone();
     overlay_config.artifact_purpose = Some(REVIEW_SUBMIT_OVERLAY_ARTIFACT_PURPOSE.to_owned());
@@ -1184,6 +1477,8 @@ async fn run_review_submit_overlay_build(
         cli.singular_eps,
         false,
         &[],
+        &[],
+        false,
     )?;
     build_timing.build_sparse_payload_sec += overlay_started.elapsed().as_secs_f64();
 
@@ -1330,6 +1625,7 @@ async fn load_or_build_review_submit_baseline(
         method,
         baseline_processes.to_vec(),
         include_user_id,
+        None,
         provider_rule,
         reference_normalization_mode,
         allocation_mode,
@@ -1427,6 +1723,7 @@ async fn persist_built_snapshot_artifact(
         all_states,
         state_codes,
         include_user_id,
+        None,
         scope_summary,
         source_hash,
         method,
@@ -1507,13 +1804,13 @@ async fn build_review_submit_overlay_graph(
         .copied()
         .filter(|flow_id| !flow_idx_by_id.contains_key(flow_id))
         .collect::<BTreeSet<_>>();
-    let flow_meta = fetch_flow_meta(pool, &missing_flow_ids).await?;
+    let flow_meta = fetch_flow_meta(pool, &missing_flow_ids, None).await?;
     for flow_id in missing_flow_ids {
         let flow_idx =
             i32::try_from(graph.flows.len()).map_err(|_| anyhow::anyhow!("flow idx overflow"))?;
         let kind = if flow_meta
             .get(&flow_id)
-            .is_some_and(|meta| classify_flow_kind(meta) == "elementary")
+            .is_some_and(|meta| classify_flow_kind(&meta.json) == "elementary")
         {
             CompiledFlowKind::Elementary
         } else {
@@ -1533,7 +1830,7 @@ async fn build_review_submit_overlay_graph(
         .collect::<HashSet<_>>();
 
     for ex in &target_exchanges {
-        if ex.direction == ExchangeDirection::Output {
+        if ex.direction == Some(ExchangeDirection::Output) {
             graph.provider_outputs.push(CompiledProviderOutput {
                 flow_id: ex.flow_id,
                 provider_idx: target_idx,
@@ -1587,7 +1884,7 @@ async fn build_review_submit_overlay_graph(
             }
         }
 
-        if ex.direction != ExchangeDirection::Input {
+        if ex.direction != Some(ExchangeDirection::Input) {
             continue;
         }
         let Some(amount) = ex.amount else {
@@ -1879,7 +2176,11 @@ fn sorted_json(value: &Value) -> Value {
     }
 }
 
-async fn resolve_method_identity(pool: &PgPool, cli: &Cli) -> anyhow::Result<MethodSelection> {
+async fn resolve_method_identity(
+    pool: &PgPool,
+    cli: &Cli,
+    versioned_scope: Option<&ValidatedPublicOwnerDraftScope>,
+) -> anyhow::Result<MethodSelection> {
     if cli.no_lcia {
         return Ok(MethodSelection {
             has_lcia: false,
@@ -1887,6 +2188,8 @@ async fn resolve_method_identity(pool: &PgPool, cli: &Cli) -> anyhow::Result<Met
             method_version: None,
             method_count: 0,
             factor_count: 0,
+            source_evidence: None,
+            rows: Vec::new(),
         });
     }
 
@@ -1901,78 +2204,184 @@ async fn resolve_method_identity(pool: &PgPool, cli: &Cli) -> anyhow::Result<Met
         ));
     }
 
-    if let Some(method_id) = cli.method_id {
-        let method_version = cli
-            .method_version
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("missing method version"))?;
-        let factor_count = sqlx::query_scalar::<i64>(
-            r#"
-            SELECT
-              CASE
-                WHEN jsonb_typeof(json#>'{LCIAMethodDataSet,characterisationFactors,factor}') = 'array'
-                THEN jsonb_array_length(json#>'{LCIAMethodDataSet,characterisationFactors,factor}')
-                ELSE 0
-              END::bigint AS factor_cnt
-            FROM public.lciamethods
-            WHERE id = $1
-              AND version = $2::bpchar
-            "#,
-        )
-        .bind(method_id)
-        .bind(method_version.clone())
-        .fetch_optional(pool)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("lciamethod not found: {method_id}@{method_version}"))?;
-        return Ok(MethodSelection {
-            has_lcia: true,
-            method_id: Some(method_id),
-            method_version: Some(method_version),
-            method_count: 1,
-            factor_count,
-        });
-    }
-
-    let row = sqlx::query(
-        r#"
-        WITH latest AS (
-          SELECT DISTINCT ON (id)
-            id,
-            json
-          FROM public.lciamethods
-          ORDER BY id, state_code DESC, modified_at DESC NULLS LAST, created_at DESC NULLS LAST
-        )
-        SELECT
-          COUNT(*)::bigint AS method_cnt,
-          COALESCE(
-            SUM(
-              CASE
-                WHEN jsonb_typeof(json#>'{LCIAMethodDataSet,characterisationFactors,factor}') = 'array'
-                THEN jsonb_array_length(json#>'{LCIAMethodDataSet,characterisationFactors,factor}')
-                ELSE 0
-              END
-            ),
-            0
-          )::bigint AS factor_cnt
-        FROM latest
-        "#,
-    )
-    .fetch_optional(pool)
-    .await?;
-
-    let row = row.ok_or_else(|| anyhow::anyhow!("no lciamethods found"))?;
-    let method_count = row.try_get::<i64, _>("method_cnt")?;
-    if method_count <= 0 {
+    let rows = fetch_selected_method_rows(pool, cli, versioned_scope).await?;
+    if rows.is_empty() {
         return Err(anyhow::anyhow!("no lciamethods found"));
     }
-    let factor_count = row.try_get::<i64, _>("factor_cnt")?;
+    if cli.method_id.is_some() && rows.len() != 1 {
+        return Err(anyhow::anyhow!(
+            "specific lciamethod selection resolved {} rows; expected exactly one",
+            rows.len()
+        ));
+    }
+    if let Some(scope) = versioned_scope {
+        for row in &rows {
+            validate_method_row_visibility(row, scope.actor_user_id)?;
+        }
+    }
+    let method_count =
+        i64::try_from(rows.len()).map_err(|_| anyhow::anyhow!("lciamethod count overflow"))?;
+    let factor_count = rows.iter().try_fold(0_i64, |total, row| {
+        let count = i64::try_from(method_factor_items(&row.json).len())
+            .map_err(|_| anyhow::anyhow!("lciamethod factor count overflow"))?;
+        total
+            .checked_add(count)
+            .ok_or_else(|| anyhow::anyhow!("lciamethod factor count overflow"))
+    })?;
+    let source_evidence = versioned_scope
+        .map(|scope| build_method_source_evidence(&rows, &scope.scope_manifest_sha256))
+        .transpose()?;
 
     Ok(MethodSelection {
         has_lcia: true,
-        method_id: None,
-        method_version: None,
+        method_id: cli.method_id,
+        method_version: cli.method_version.clone(),
         method_count,
         factor_count,
+        source_evidence,
+        rows,
+    })
+}
+
+async fn fetch_selected_method_rows(
+    pool: &PgPool,
+    cli: &Cli,
+    versioned_scope: Option<&ValidatedPublicOwnerDraftScope>,
+) -> anyhow::Result<Vec<MethodRow>> {
+    let rows = match (cli.method_id, versioned_scope) {
+        (Some(method_id), Some(scope)) => {
+            sqlx::query(
+                r#"
+                SELECT id, version, user_id, state_code, modified_at, created_at, json
+                FROM public.lciamethods
+                WHERE id = $1
+                  AND version = $2::bpchar
+                  AND (state_code = 100 OR (user_id = $3 AND state_code = 0))
+                "#,
+            )
+            .bind(method_id)
+            .bind(cli.method_version.clone().unwrap_or_default())
+            .bind(scope.actor_user_id)
+            .fetch_all(pool)
+            .await?
+        }
+        (Some(method_id), None) => {
+            sqlx::query(
+                r#"
+                SELECT id, version, user_id, state_code, modified_at, created_at, json
+                FROM public.lciamethods
+                WHERE id = $1 AND version = $2::bpchar
+                "#,
+            )
+            .bind(method_id)
+            .bind(cli.method_version.clone().unwrap_or_default())
+            .fetch_all(pool)
+            .await?
+        }
+        (None, Some(scope)) => {
+            sqlx::query(
+                r#"
+                SELECT DISTINCT ON (id)
+                  id, version, user_id, state_code, modified_at, created_at, json
+                FROM public.lciamethods
+                WHERE state_code = 100 OR (user_id = $1 AND state_code = 0)
+                ORDER BY id, version DESC, modified_at DESC NULLS LAST, created_at DESC NULLS LAST
+                "#,
+            )
+            .bind(scope.actor_user_id)
+            .fetch_all(pool)
+            .await?
+        }
+        (None, None) => {
+            sqlx::query(
+                r#"
+                SELECT DISTINCT ON (id)
+                  id, version, user_id, state_code, modified_at, created_at, json
+                FROM public.lciamethods
+                ORDER BY id, state_code DESC, modified_at DESC NULLS LAST, created_at DESC NULLS LAST
+                "#,
+            )
+            .fetch_all(pool)
+            .await?
+        }
+    };
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(MethodRow {
+                id: row.try_get("id")?,
+                version: row.try_get::<String, _>("version")?.trim().to_owned(),
+                user_id: row.try_get("user_id")?,
+                state_code: row.try_get("state_code")?,
+                modified_at: row.try_get("modified_at")?,
+                created_at: row.try_get("created_at")?,
+                json: row.try_get("json")?,
+            })
+        })
+        .collect()
+}
+
+fn validate_method_row_visibility(row: &MethodRow, actor_user_id: Uuid) -> anyhow::Result<()> {
+    if row.state_code == 100 || (row.state_code == 0 && row.user_id == Some(actor_user_id)) {
+        return Ok(());
+    }
+    Err(anyhow::anyhow!(
+        "lciamethod visibility recheck failed: {}@{} owner={:?} state_code={}",
+        row.id,
+        row.version,
+        row.user_id,
+        row.state_code
+    ))
+}
+
+fn build_method_source_evidence(
+    rows: &[MethodRow],
+    scope_manifest_sha256: &str,
+) -> anyhow::Result<LcaMethodFactorSourceSnapshot> {
+    let method_manifest = rows
+        .iter()
+        .map(|row| {
+            Ok(serde_json::json!({
+                "id": row.id,
+                "version": row.version,
+                "user_id": row.user_id,
+                "state_code": row.state_code,
+                "modified_at": row.modified_at.map(|value| value.to_rfc3339()),
+                "created_at": row.created_at.map(|value| value.to_rfc3339()),
+                "json_sha256": canonical_json_sha256(&row.json)?,
+            }))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let factor_manifest = rows
+        .iter()
+        .flat_map(|row| {
+            method_factor_items(&row.json).into_iter().enumerate().map(
+                move |(factor_index, factor)| {
+                    serde_json::json!({
+                        "method_id": row.id,
+                        "method_version": row.version,
+                        "factor_index": factor_index,
+                        "factor": factor,
+                    })
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let method_manifest_sha256 = canonical_json_sha256(&Value::Array(method_manifest))?;
+    let factor_manifest_sha256 = canonical_json_sha256(&Value::Array(factor_manifest))?;
+    let source_snapshot_sha256 = canonical_json_sha256(&serde_json::json!({
+        "schema_version": METHOD_SOURCE_SNAPSHOT_SCHEMA_VERSION,
+        "scope_manifest_sha256": scope_manifest_sha256,
+        "method_manifest_sha256": method_manifest_sha256,
+        "factor_manifest_sha256": factor_manifest_sha256,
+    }))?;
+    Ok(LcaMethodFactorSourceSnapshot {
+        schema_version: METHOD_SOURCE_SNAPSHOT_SCHEMA_VERSION.to_owned(),
+        source_kind: "database".to_owned(),
+        relation: "public.lciamethods".to_owned(),
+        source_snapshot_sha256,
+        method_manifest_sha256,
+        factor_manifest_sha256,
     })
 }
 
@@ -2071,56 +2480,19 @@ fn parse_lcia_method_unit(method_json: &Value) -> Option<String> {
     })
 }
 
-async fn load_impact_factor_sets(
-    pool: &PgPool,
-    method: &MethodSelection,
-) -> anyhow::Result<Vec<ImpactFactorSet>> {
+fn load_impact_factor_sets(method: &MethodSelection) -> anyhow::Result<Vec<ImpactFactorSet>> {
     if !method.has_lcia {
         return Ok(Vec::new());
     }
-
-    let rows = if let Some(method_id) = method.method_id {
-        let method_version = method
-            .method_version
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("missing method version"))?;
-        sqlx::query(
-            r#"
-            SELECT id, json
-            FROM public.lciamethods
-            WHERE id = $1
-              AND version = $2::bpchar
-            "#,
-        )
-        .bind(method_id)
-        .bind(method_version)
-        .fetch_all(pool)
-        .await?
-    } else {
-        sqlx::query(
-            r#"
-            SELECT DISTINCT ON (id)
-              id,
-              json
-            FROM public.lciamethods
-            ORDER BY id, state_code DESC, modified_at DESC NULLS LAST, created_at DESC NULLS LAST
-            "#,
-        )
-        .fetch_all(pool)
-        .await?
-    };
-
-    if rows.is_empty() {
+    if method.rows.is_empty() {
         return Err(anyhow::anyhow!("no lciamethods found for selected scope"));
     }
 
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        let method_id = row.try_get::<Uuid, _>("id")?;
-        let method_json = row.try_get::<Value, _>("json")?;
-
+    let mut out = Vec::with_capacity(method.rows.len());
+    for row in &method.rows {
         let mut factor_map: HashMap<Uuid, f64> = HashMap::new();
-        for factor in method_factor_items(&method_json) {
+        let mut directional_factor_map: HashMap<(Uuid, ExchangeDirection), f64> = HashMap::new();
+        for factor in method_factor_items(&row.json) {
             let Some(flow_id) = parse_uuid_at(factor, &["referenceToFlowDataSet", "@refObjectId"])
             else {
                 continue;
@@ -2133,6 +2505,13 @@ async fn load_impact_factor_sets(
             ) else {
                 continue;
             };
+            if let Some(direction) =
+                parse_exchange_direction(factor.get("exchangeDirection").and_then(Value::as_str))
+            {
+                *directional_factor_map
+                    .entry((flow_id, direction))
+                    .or_insert(0.0) += value;
+            }
             if value.abs() <= f64::EPSILON {
                 continue;
             }
@@ -2141,12 +2520,13 @@ async fn load_impact_factor_sets(
         factor_map.retain(|_, value| value.abs() > f64::EPSILON);
 
         out.push(ImpactFactorSet {
-            impact_id: method_id,
-            impact_key: format!("method:{method_id}"),
-            impact_name: parse_lcia_method_name(&method_json)
-                .unwrap_or_else(|| format!("LCIA Method {method_id}")),
-            unit: parse_lcia_method_unit(&method_json).unwrap_or_else(|| "unknown".to_owned()),
+            impact_id: row.id,
+            impact_key: format!("method:{}", row.id),
+            impact_name: parse_lcia_method_name(&row.json)
+                .unwrap_or_else(|| format!("LCIA Method {}", row.id)),
+            unit: parse_lcia_method_unit(&row.json).unwrap_or_else(|| "unknown".to_owned()),
             factors_by_flow: factor_map,
+            factors_by_flow_direction: directional_factor_map,
         });
     }
     out.sort_unstable_by_key(|impact| impact.impact_id);
@@ -2166,8 +2546,8 @@ fn add_technosphere_edge(
 
 fn provider_outputs_from_map(provider_map: &ProviderMap) -> Vec<CompiledProviderOutput> {
     let mut outputs = provider_map
-        .iter()
-        .flat_map(|(_flow_id, providers)| {
+        .values()
+        .flat_map(|providers| {
             providers
                 .iter()
                 .map(|provider| CompiledProviderOutput {
@@ -2294,6 +2674,7 @@ async fn build_sparse_payload(
     method: &MethodSelection,
     processes: Vec<ProcessRow>,
     include_user_id: Option<Uuid>,
+    versioned_scope: Option<&ValidatedPublicOwnerDraftScope>,
     provider_rule: ProviderRule,
     reference_normalization_mode: NormalizationMode,
     allocation_mode: AllocationMode,
@@ -2314,6 +2695,7 @@ async fn build_sparse_payload(
         pool,
         processes,
         include_user_id,
+        versioned_scope,
         provider_rule,
         reference_normalization_mode,
         allocation_mode,
@@ -2324,11 +2706,13 @@ async fn build_sparse_payload(
     assemble_sparse_payload(
         snapshot_id,
         method,
-        &compiled_graph,
+        &compiled_graph.graph,
         self_loop_cutoff,
         singular_eps,
         has_lcia,
         impact_factor_sets,
+        &compiled_graph.lcia_exchange_observations,
+        versioned_scope.is_some(),
     )
 }
 
@@ -2362,23 +2746,35 @@ fn parse_process_chunk(
         reference_normalization_mode,
     )?;
 
-    for ex in &exchange_items {
-        let direction = match ex
+    for (exchange_index, ex) in exchange_items.iter().enumerate() {
+        let direction_label = ex
             .get("exchangeDirection")
             .and_then(Value::as_str)
-            .unwrap_or_default()
-        {
-            "Input" => Some(ExchangeDirection::Input),
-            "Output" => Some(ExchangeDirection::Output),
-            _ => None,
-        };
-        let Some(direction) = direction else {
-            continue;
-        };
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unknown")
+            .to_owned();
+        let direction = parse_exchange_direction(Some(&direction_label));
         let Some(flow_id) = parse_uuid_at(ex, &["referenceToFlowDataSet", "@refObjectId"]) else {
             continue;
         };
         let internal_id = parse_exchange_internal_id(ex);
+        let exchange_id = format!(
+            "{}:{}:{}",
+            proc_row.id,
+            proc_row.version,
+            internal_id
+                .as_deref()
+                .map_or_else(|| exchange_index.to_string(), ToOwned::to_owned)
+        );
+        let flow_version = ex
+            .get("referenceToFlowDataSet")
+            .and_then(|value| value.get("@version"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unknown")
+            .to_owned();
         local_allocation.exchange_total += 1;
         let (allocation_fraction, allocation_state) =
             resolve_allocation_fraction(ex, allocation_mode)?;
@@ -2404,7 +2800,10 @@ fn parse_process_chunk(
             process_idx,
             flow_id,
             direction,
+            direction_label,
             internal_id: internal_id.clone(),
+            exchange_id,
+            flow_version,
             is_reference_exchange: is_reference_internal_exchange(
                 internal_id.as_deref(),
                 reference_internal_id.as_deref(),
@@ -2429,11 +2828,12 @@ async fn compile_scope_graph(
     pool: &PgPool,
     processes: Vec<ProcessRow>,
     include_user_id: Option<Uuid>,
+    versioned_scope: Option<&ValidatedPublicOwnerDraftScope>,
     provider_rule: ProviderRule,
     reference_normalization_mode: NormalizationMode,
     allocation_mode: AllocationMode,
     impact_factor_sets: &[ImpactFactorSet],
-) -> anyhow::Result<CompiledGraph> {
+) -> anyhow::Result<CompiledScopeGraph> {
     let process_count_i32 =
         i32::try_from(processes.len()).map_err(|_| anyhow::anyhow!("process overflow"))?;
     let chunks = processes
@@ -2497,14 +2897,30 @@ async fn compile_scope_graph(
         });
     }
 
+    let exchange_flow_candidates = flow_candidates.clone();
     for impact in impact_factor_sets {
         for flow_id in impact.factors_by_flow.keys() {
             flow_candidates.insert(*flow_id);
         }
     }
 
-    let flow_meta = fetch_flow_meta(pool, &flow_candidates).await?;
-    let candidate_flow_ids = flow_candidates.into_iter().collect::<Vec<_>>();
+    let flow_meta = fetch_flow_meta(pool, &flow_candidates, versioned_scope).await?;
+    if versioned_scope.is_some() {
+        for flow_id in &exchange_flow_candidates {
+            if !flow_meta.contains_key(flow_id) {
+                return Err(anyhow::anyhow!(
+                    "process exchange references flow outside exact visibility scope: {flow_id}"
+                ));
+            }
+        }
+    }
+    let candidate_flow_ids = if versioned_scope.is_some() {
+        let mut ids = flow_meta.keys().copied().collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    } else {
+        flow_candidates.into_iter().collect::<Vec<_>>()
+    };
     let mut flows = Vec::with_capacity(candidate_flow_ids.len());
     let mut flow_idx_by_id = HashMap::with_capacity(candidate_flow_ids.len());
     let mut elementary_flow_idx = HashSet::new();
@@ -2512,7 +2928,7 @@ async fn compile_scope_graph(
         let flow_index = i32::try_from(idx).map_err(|_| anyhow::anyhow!("flow idx overflow"))?;
         let kind = if flow_meta
             .get(flow_id)
-            .is_some_and(|meta| classify_flow_kind(meta) == "elementary")
+            .is_some_and(|meta| classify_flow_kind(&meta.json) == "elementary")
         {
             CompiledFlowKind::Elementary
         } else {
@@ -2531,7 +2947,7 @@ async fn compile_scope_graph(
 
     let mut provider_map: ProviderMap = HashMap::new();
     for ex in &exchanges {
-        if ex.direction == ExchangeDirection::Output {
+        if ex.direction == Some(ExchangeDirection::Output) {
             provider_map.entry(ex.flow_id).or_default().push(
                 provider_output_candidate_from_exchange(ex.process_idx, ex.flow_id, ex),
             );
@@ -2572,7 +2988,7 @@ async fn compile_scope_graph(
             }
         }
 
-        if ex.direction != ExchangeDirection::Input {
+        if ex.direction != Some(ExchangeDirection::Input) {
             continue;
         }
 
@@ -2755,25 +3171,45 @@ async fn compile_scope_graph(
         }
     }
 
-    Ok(CompiledGraph {
-        processes: compiled_processes,
-        flows,
-        provider_outputs,
-        provider_decisions,
-        technosphere_edges,
-        biosphere_edges,
-        reference_stats: CompiledReferenceStats {
-            missing_reference: reference_stats.missing_reference,
-            invalid_reference: reference_stats.invalid_reference,
-            normalized_processes: reference_stats.normalized_processes,
+    let lcia_exchange_observations = exchanges
+        .iter()
+        .filter(|exchange| {
+            flow_idx_by_id
+                .get(&exchange.flow_id)
+                .is_some_and(|flow_idx| elementary_flow_idx.contains(flow_idx))
+        })
+        .map(|exchange| LciaExchangeObservation {
+            flow_id: exchange.flow_id,
+            flow_version: exchange.flow_version.clone(),
+            direction: exchange.direction,
+            direction_label: exchange.direction_label.clone(),
+            exchange_id: exchange.exchange_id.clone(),
+            amount: exchange.amount,
+        })
+        .collect();
+
+    Ok(CompiledScopeGraph {
+        graph: CompiledGraph {
+            processes: compiled_processes,
+            flows,
+            provider_outputs,
+            provider_decisions,
+            technosphere_edges,
+            biosphere_edges,
+            reference_stats: CompiledReferenceStats {
+                missing_reference: reference_stats.missing_reference,
+                invalid_reference: reference_stats.invalid_reference,
+                normalized_processes: reference_stats.normalized_processes,
+            },
+            allocation_stats: CompiledAllocationStats {
+                exchange_total: allocation_stats.exchange_total,
+                fraction_present_count: allocation_stats.fraction_present_count,
+                fraction_missing_count: allocation_stats.fraction_missing_count,
+                fraction_invalid_count: allocation_stats.fraction_invalid_count,
+            },
+            matching_stats,
         },
-        allocation_stats: CompiledAllocationStats {
-            exchange_total: allocation_stats.exchange_total,
-            fraction_present_count: allocation_stats.fraction_present_count,
-            fraction_missing_count: allocation_stats.fraction_missing_count,
-            fraction_invalid_count: allocation_stats.fraction_invalid_count,
-        },
-        matching_stats,
+        lcia_exchange_observations,
     })
 }
 
@@ -2785,6 +3221,8 @@ fn assemble_sparse_payload(
     singular_eps: f64,
     has_lcia: bool,
     impact_factor_sets: &[ImpactFactorSet],
+    lcia_exchange_observations: &[LciaExchangeObservation],
+    directional_lcia: bool,
 ) -> anyhow::Result<BuildOutput> {
     let process_count_i32 = i32::try_from(compiled_graph.processes.len())
         .map_err(|_| anyhow::anyhow!("process overflow"))?;
@@ -2877,17 +3315,41 @@ fn assemble_sparse_payload(
         biosphere_entries.push(SparseTriplet { row, col, value });
     }
 
+    let direction_by_flow = if directional_lcia {
+        unique_supported_direction_by_flow(lcia_exchange_observations)
+    } else {
+        HashMap::new()
+    };
     let mut characterization_factors = Vec::new();
     if has_lcia {
         for (impact_idx, impact) in impact_factor_sets.iter().enumerate() {
             let impact_row =
                 i32::try_from(impact_idx).map_err(|_| anyhow::anyhow!("impact idx overflow"))?;
             let mut c_map = HashMap::<i32, f64>::new();
-            for (flow_id, cf_value) in &impact.factors_by_flow {
-                if let Some(flow_idx) = flow_idx_by_id.get(flow_id).copied()
-                    && cf_value.abs() > f64::EPSILON
-                {
-                    *c_map.entry(flow_idx).or_insert(0.0) += *cf_value;
+            if directional_lcia {
+                for (flow_id, direction) in &direction_by_flow {
+                    let Some(direction) = direction else {
+                        continue;
+                    };
+                    let Some(cf_value) = impact
+                        .factors_by_flow_direction
+                        .get(&(*flow_id, *direction))
+                    else {
+                        continue;
+                    };
+                    if let Some(flow_idx) = flow_idx_by_id.get(flow_id).copied()
+                        && cf_value.abs() > f64::EPSILON
+                    {
+                        *c_map.entry(flow_idx).or_insert(0.0) += *cf_value;
+                    }
+                }
+            } else {
+                for (flow_id, cf_value) in &impact.factors_by_flow {
+                    if let Some(flow_idx) = flow_idx_by_id.get(flow_id).copied()
+                        && cf_value.abs() > f64::EPSILON
+                    {
+                        *c_map.entry(flow_idx).or_insert(0.0) += *cf_value;
+                    }
                 }
             }
             c_map.retain(|_, value| value.abs() > f64::EPSILON);
@@ -3040,6 +3502,7 @@ fn assemble_sparse_payload(
         impact_count,
         process_map,
         impact_map,
+        calculation_evidence: None,
     };
     let readiness = verify_matrix_readiness(&MatrixReadinessInput {
         schema_version: "matrix_readiness_input.v1".to_owned(),
@@ -3054,13 +3517,127 @@ fn assemble_sparse_payload(
         },
     });
 
+    let lcia_factor_coverage = directional_lcia
+        .then(|| {
+            build_lcia_factor_coverage(
+                lcia_exchange_observations,
+                impact_factor_sets,
+                &direction_by_flow,
+            )
+        })
+        .transpose()?;
+
     Ok(BuildOutput {
         data,
         coverage,
         snapshot_index,
         readiness,
         compiled_graph: compiled_graph.clone(),
+        lcia_factor_coverage,
     })
+}
+
+fn unique_supported_direction_by_flow(
+    observations: &[LciaExchangeObservation],
+) -> HashMap<Uuid, Option<ExchangeDirection>> {
+    let mut directions = HashMap::<Uuid, HashSet<ExchangeDirection>>::new();
+    let mut unsupported = HashSet::<Uuid>::new();
+    for observation in observations {
+        if let Some(direction) = observation.direction {
+            directions
+                .entry(observation.flow_id)
+                .or_default()
+                .insert(direction);
+        } else {
+            unsupported.insert(observation.flow_id);
+        }
+    }
+    observations
+        .iter()
+        .map(|observation| observation.flow_id)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .map(|flow_id| {
+            let resolved = if unsupported.contains(&flow_id) {
+                None
+            } else {
+                let values = directions.get(&flow_id);
+                if values.is_some_and(|items| items.len() == 1) {
+                    values.and_then(|items| items.iter().next().copied())
+                } else {
+                    None
+                }
+            };
+            (flow_id, resolved)
+        })
+        .collect()
+}
+
+fn build_lcia_factor_coverage(
+    observations: &[LciaExchangeObservation],
+    impact_factor_sets: &[ImpactFactorSet],
+    direction_by_flow: &HashMap<Uuid, Option<ExchangeDirection>>,
+) -> anyhow::Result<LciaFactorCoverageBuild> {
+    let matched_keys = impact_factor_sets
+        .iter()
+        .flat_map(|impact| impact.factors_by_flow_direction.keys().copied())
+        .collect::<HashSet<_>>();
+    let mut counts = LciaFactorCoverageCounts::default();
+    let mut records = Vec::new();
+
+    for observation in observations {
+        let amount = observation.amount.filter(|value| value.is_finite());
+        let outcome = if observation.direction.is_none() {
+            Some(("unsupported_direction", "unsupported_exchange_direction"))
+        } else if direction_by_flow.get(&observation.flow_id) == Some(&None) {
+            Some((
+                "unsupported_direction",
+                "ambiguous_elementary_flow_direction_axis",
+            ))
+        } else if amount.is_none() {
+            Some(("invalid", "invalid_exchange_amount"))
+        } else if observation
+            .direction
+            .is_some_and(|direction| matched_keys.contains(&(observation.flow_id, direction)))
+        {
+            None
+        } else {
+            Some(("unmatched", "no_lcia_factor_for_flow_direction"))
+        };
+
+        match outcome {
+            None => counts.matched = counts.matched.saturating_add(1),
+            Some((kind, reason)) => {
+                match kind {
+                    "unmatched" => counts.unmatched = counts.unmatched.saturating_add(1),
+                    "invalid" => counts.invalid = counts.invalid.saturating_add(1),
+                    "unsupported_direction" => {
+                        counts.unsupported_direction =
+                            counts.unsupported_direction.saturating_add(1);
+                    }
+                    _ => return Err(anyhow::anyhow!("unknown LCIA coverage outcome")),
+                }
+                records.push(LciaUncharacterizedRecord {
+                    elementary_flow_uuid: observation.flow_id,
+                    flow_version: observation.flow_version.clone(),
+                    direction: observation.direction.map_or_else(
+                        || observation.direction_label.clone(),
+                        |direction| direction.as_str().to_owned(),
+                    ),
+                    exchange_id: observation.exchange_id.clone(),
+                    amount,
+                    reason: reason.to_owned(),
+                });
+            }
+        }
+    }
+    records.sort_by(|left, right| {
+        left.elementary_flow_uuid
+            .cmp(&right.elementary_flow_uuid)
+            .then_with(|| left.direction.cmp(&right.direction))
+            .then_with(|| left.exchange_id.cmp(&right.exchange_id))
+    });
+    Ok(LciaFactorCoverageBuild { counts, records })
 }
 
 fn build_snapshot_impact_map(
@@ -4114,7 +4691,7 @@ fn classify_scope_partition(
     row: &ProcessRow,
     include_user_id: Option<Uuid>,
 ) -> ScopeProcessPartition {
-    if include_user_id.is_some() && row.user_id == include_user_id {
+    if row.state_code != 100 && include_user_id.is_some() && row.user_id == include_user_id {
         ScopeProcessPartition::Private
     } else {
         ScopeProcessPartition::Public
@@ -4230,8 +4807,13 @@ fn resolve_process_selection(
                         &ParsedExchange {
                             process_idx,
                             flow_id,
-                            direction,
+                            direction: Some(direction),
+                            direction_label: direction.as_str().to_owned(),
                             internal_id: internal_id.clone(),
+                            exchange_id: internal_id
+                                .clone()
+                                .unwrap_or_else(|| format!("scope:{}:{}", proc_row.id, flow_id)),
+                            flow_version: "unknown".to_owned(),
                             is_reference_exchange: is_reference_internal_exchange(
                                 internal_id.as_deref(),
                                 reference_internal_id.as_deref(),
@@ -4246,8 +4828,13 @@ fn resolve_process_selection(
                 input_exchanges.push(ParsedExchange {
                     process_idx,
                     flow_id,
-                    direction,
+                    direction: Some(direction),
+                    direction_label: direction.as_str().to_owned(),
                     internal_id: internal_id.clone(),
+                    exchange_id: internal_id
+                        .clone()
+                        .unwrap_or_else(|| format!("scope:{}:{}", proc_row.id, flow_id)),
+                    flow_version: "unknown".to_owned(),
                     is_reference_exchange: is_reference_internal_exchange(
                         internal_id.as_deref(),
                         reference_internal_id.as_deref(),
@@ -4369,12 +4956,23 @@ async fn compute_source_fingerprint(
     pool: &PgPool,
     selected_processes: &[ProcessRow],
     config: &SnapshotBuildConfig,
+    versioned_scope: Option<&ValidatedPublicOwnerDraftScope>,
+    method: Option<&MethodSelection>,
 ) -> anyhow::Result<(SourceSnapshotSummary, String)> {
     let (process_count, process_max_modified_at_utc) =
         summarize_selected_processes(selected_processes)?;
-    let (flow_count, flow_max_modified_at_utc) = fetch_flow_source_summary(pool).await?;
+    let (flow_count, flow_max_modified_at_utc) =
+        fetch_flow_source_summary(pool, versioned_scope).await?;
     let (lciamethod_count, lciamethod_max_modified_at_utc) = if config.has_lcia {
-        fetch_lciamethod_source_summary(pool).await?
+        if versioned_scope.is_some() {
+            summarize_selected_methods(
+                &method
+                    .ok_or_else(|| anyhow::anyhow!("missing selected LCIA method snapshot"))?
+                    .rows,
+            )?
+        } else {
+            fetch_lciamethod_source_summary(pool).await?
+        }
     } else {
         (0, "disabled".to_owned())
     };
@@ -4427,9 +5025,35 @@ fn format_modified_at_utc(timestamp: Option<DateTime<Utc>>) -> String {
     )
 }
 
-async fn fetch_flow_source_summary(pool: &PgPool) -> anyhow::Result<(i64, String)> {
-    let row = sqlx::query(
-        r#"
+async fn fetch_flow_source_summary(
+    pool: &PgPool,
+    versioned_scope: Option<&ValidatedPublicOwnerDraftScope>,
+) -> anyhow::Result<(i64, String)> {
+    let row = if let Some(scope) = versioned_scope {
+        sqlx::query(
+            r#"
+            SELECT
+              COUNT(*)::bigint AS flow_count,
+              COALESCE(
+                to_char(MAX(modified_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+                'none'
+              ) AS flow_max_modified_at_utc
+            FROM public.flows
+            WHERE state_code = 100
+               OR (
+                 user_id = $1
+                 AND state_code = 0
+                 AND team_id IS NULL
+                 AND review_id IS NULL
+               )
+            "#,
+        )
+        .bind(scope.actor_user_id)
+        .fetch_one(pool)
+        .await?
+    } else {
+        sqlx::query(
+            r#"
         SELECT
           COUNT(*)::bigint AS flow_count,
           COALESCE(
@@ -4438,14 +5062,22 @@ async fn fetch_flow_source_summary(pool: &PgPool) -> anyhow::Result<(i64, String
           ) AS flow_max_modified_at_utc
         FROM public.flows
         "#,
-    )
-    .fetch_one(pool)
-    .await?;
+        )
+        .fetch_one(pool)
+        .await?
+    };
 
     Ok((
         row.try_get::<i64, _>("flow_count")?,
         row.try_get::<String, _>("flow_max_modified_at_utc")?,
     ))
+}
+
+fn summarize_selected_methods(rows: &[MethodRow]) -> anyhow::Result<(i64, String)> {
+    let count = i64::try_from(rows.len())
+        .map_err(|_| anyhow::anyhow!("selected LCIA method count overflow"))?;
+    let max_modified_at = rows.iter().filter_map(|row| row.modified_at).max();
+    Ok((count, format_modified_at_utc(max_modified_at)))
 }
 
 async fn fetch_lciamethod_source_summary(pool: &PgPool) -> anyhow::Result<(i64, String)> {
@@ -4612,12 +5244,36 @@ async fn fetch_processes(
     all_states: bool,
     state_codes: &[i32],
     include_user_id: Option<Uuid>,
+    versioned_scope: Option<&ValidatedPublicOwnerDraftScope>,
 ) -> anyhow::Result<Vec<ProcessRow>> {
     let query_started = Instant::now();
-    let rows = if all_states {
+    let rows = if let Some(scope) = versioned_scope {
         sqlx::query(
             r#"
-            SELECT DISTINCT ON (id) id, version, model_id, user_id, modified_at, json
+            SELECT DISTINCT ON (id)
+              id, version, model_id, user_id, state_code, team_id, review_id, modified_at, json
+            FROM public.processes
+            WHERE (
+                state_code = 100
+                OR (
+                    user_id = $1
+                    AND state_code = 0
+                    AND team_id IS NULL
+                    AND review_id IS NULL
+                )
+              )
+              AND json ? 'processDataSet'
+            ORDER BY id, version DESC, modified_at DESC NULLS LAST
+            "#,
+        )
+        .bind(scope.actor_user_id)
+        .fetch_all(pool)
+        .await?
+    } else if all_states {
+        sqlx::query(
+            r#"
+            SELECT DISTINCT ON (id)
+              id, version, model_id, user_id, state_code, team_id, review_id, modified_at, json
             FROM public.processes
             WHERE json ? 'processDataSet'
             ORDER BY id, version DESC
@@ -4628,7 +5284,8 @@ async fn fetch_processes(
     } else if let Some(user_id) = include_user_id {
         sqlx::query(
             r#"
-            SELECT DISTINCT ON (id) id, version, model_id, user_id, modified_at, json
+            SELECT DISTINCT ON (id)
+              id, version, model_id, user_id, state_code, team_id, review_id, modified_at, json
             FROM public.processes
             WHERE (state_code = ANY($1) OR user_id = $2)
               AND json ? 'processDataSet'
@@ -4642,7 +5299,8 @@ async fn fetch_processes(
     } else {
         sqlx::query(
             r#"
-            SELECT DISTINCT ON (id) id, version, model_id, user_id, modified_at, json
+            SELECT DISTINCT ON (id)
+              id, version, model_id, user_id, state_code, team_id, review_id, modified_at, json
             FROM public.processes
             WHERE state_code = ANY($1)
               AND json ? 'processDataSet'
@@ -4670,38 +5328,92 @@ async fn fetch_processes(
 
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        out.push(ProcessRow {
+        let process = ProcessRow {
             id: row.try_get::<Uuid, _>("id")?,
             version: row.try_get::<String, _>("version")?.trim().to_owned(),
             model_id: row.try_get::<Option<Uuid>, _>("model_id")?,
             user_id: row.try_get::<Option<Uuid>, _>("user_id")?,
+            state_code: row.try_get::<i32, _>("state_code")?,
+            team_id: row.try_get::<Option<Uuid>, _>("team_id")?,
+            review_id: row.try_get::<Option<Uuid>, _>("review_id")?,
             modified_at: row.try_get::<Option<DateTime<Utc>>, _>("modified_at")?,
             json: row.try_get::<Value, _>("json")?,
-        });
+        };
+        if let Some(scope) = versioned_scope {
+            validate_process_row_visibility(&process, scope.actor_user_id)?;
+        }
+        out.push(process);
     }
     Ok(out)
+}
+
+fn validate_process_row_visibility(row: &ProcessRow, actor_user_id: Uuid) -> anyhow::Result<()> {
+    if row.state_code == 100
+        || (row.state_code == 0
+            && row.user_id == Some(actor_user_id)
+            && row.team_id.is_none()
+            && row.review_id.is_none())
+    {
+        return Ok(());
+    }
+    Err(anyhow::anyhow!(
+        "process visibility recheck failed: {}@{} owner={:?} state_code={} team_id={:?} review_id={:?}",
+        row.id,
+        row.version,
+        row.user_id,
+        row.state_code,
+        row.team_id,
+        row.review_id
+    ))
 }
 
 async fn fetch_flow_meta(
     pool: &PgPool,
     flow_candidates: &BTreeSet<Uuid>,
-) -> anyhow::Result<HashMap<Uuid, Value>> {
+    versioned_scope: Option<&ValidatedPublicOwnerDraftScope>,
+) -> anyhow::Result<HashMap<Uuid, FlowRow>> {
     if flow_candidates.is_empty() {
         return Ok(HashMap::new());
     }
     let query_started = Instant::now();
     let candidate_ids = flow_candidates.iter().copied().collect::<Vec<_>>();
-    let rows = sqlx::query(
-        r#"
-        SELECT DISTINCT ON (id) id, json
-        FROM public.flows
-        WHERE id = ANY($1)
-        ORDER BY id, state_code DESC, modified_at DESC NULLS LAST, created_at DESC NULLS LAST
-        "#,
-    )
-    .bind(&candidate_ids)
-    .fetch_all(pool)
-    .await?;
+    let rows = if let Some(scope) = versioned_scope {
+        sqlx::query(
+            r#"
+            SELECT DISTINCT ON (id)
+              id, version, user_id, state_code, team_id, review_id, json
+            FROM public.flows
+            WHERE id = ANY($1)
+              AND (
+                state_code = 100
+                OR (
+                  user_id = $2
+                  AND state_code = 0
+                  AND team_id IS NULL
+                  AND review_id IS NULL
+                )
+              )
+            ORDER BY id, version DESC, modified_at DESC NULLS LAST, created_at DESC NULLS LAST
+            "#,
+        )
+        .bind(&candidate_ids)
+        .bind(scope.actor_user_id)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query(
+            r#"
+            SELECT DISTINCT ON (id)
+              id, version, user_id, state_code, team_id, review_id, json
+            FROM public.flows
+            WHERE id = ANY($1)
+            ORDER BY id, state_code DESC, modified_at DESC NULLS LAST, created_at DESC NULLS LAST
+            "#,
+        )
+        .bind(&candidate_ids)
+        .fetch_all(pool)
+        .await?
+    };
 
     let elapsed = query_started.elapsed();
     let missing_count = candidate_ids.len().saturating_sub(rows.len());
@@ -4718,12 +5430,43 @@ async fn fetch_flow_meta(
         elapsed.as_secs_f64()
     );
 
-    let mut out = HashMap::<Uuid, Value>::new();
+    let mut out = HashMap::<Uuid, FlowRow>::new();
     for row in rows {
-        let id = row.try_get::<Uuid, _>("id")?;
-        out.insert(id, row.try_get::<Value, _>("json")?);
+        let flow = FlowRow {
+            id: row.try_get("id")?,
+            version: row.try_get::<String, _>("version")?.trim().to_owned(),
+            user_id: row.try_get("user_id")?,
+            state_code: row.try_get("state_code")?,
+            team_id: row.try_get("team_id")?,
+            review_id: row.try_get("review_id")?,
+            json: row.try_get("json")?,
+        };
+        if let Some(scope) = versioned_scope {
+            validate_flow_row_visibility(&flow, scope.actor_user_id)?;
+        }
+        out.insert(flow.id, flow);
     }
     Ok(out)
+}
+
+fn validate_flow_row_visibility(row: &FlowRow, actor_user_id: Uuid) -> anyhow::Result<()> {
+    if row.state_code == 100
+        || (row.state_code == 0
+            && row.user_id == Some(actor_user_id)
+            && row.team_id.is_none()
+            && row.review_id.is_none())
+    {
+        return Ok(());
+    }
+    Err(anyhow::anyhow!(
+        "flow visibility recheck failed: {}@{} owner={:?} state_code={} team_id={:?} review_id={:?}",
+        row.id,
+        row.version,
+        row.user_id,
+        row.state_code,
+        row.team_id,
+        row.review_id
+    ))
 }
 
 fn process_exchange_items(process_json: &Value) -> Vec<&Value> {
@@ -4984,6 +5727,7 @@ async fn persist_snapshot_metadata(
     all_states: bool,
     state_codes: &[i32],
     include_user_id: Option<Uuid>,
+    versioned_scope: Option<&ValidatedPublicOwnerDraftScope>,
     scope_summary: &ResolvedRequestScopeSummary,
     source_hash: &str,
     method: &MethodSelection,
@@ -4996,7 +5740,29 @@ async fn persist_snapshot_metadata(
     artifact_expires_in_seconds: Option<i64>,
 ) -> anyhow::Result<()> {
     let artifact_expires_at_utc = artifact_expires_at_utc(artifact_expires_in_seconds)?;
-    let mut process_filter = if all_states {
+    let mut process_filter = if let Some(versioned_scope) = versioned_scope {
+        serde_json::json!({
+            "all_states": false,
+            "process_states": [100],
+            "include_user_id": versioned_scope.actor_user_id,
+            "include_user_state_codes": [0],
+            "include_user_unassigned_only": true,
+            "include_user_review_free_only": true,
+            "data_scope": PUBLIC_PLUS_OWNER_DRAFT_SCOPE,
+            "scope_manifest": versioned_scope.scope_manifest,
+            "scope_manifest_sha256": versioned_scope.scope_manifest_sha256,
+            "lcia_method_factor_source": versioned_scope.lcia_method_factor_source,
+            "lcia_factor_coverage_contract": versioned_scope.lcia_factor_coverage_contract,
+            "selection_mode": scope_summary.selection_mode,
+            "request_roots": scope_summary.roots,
+            "scope_hash": scope_summary.scope_hash,
+            "resolved_scope": {
+                "public_process_count": scope_summary.public_process_count,
+                "private_process_count": scope_summary.private_process_count,
+                "process_count": scope_summary.processes.len(),
+            }
+        })
+    } else if all_states {
         serde_json::json!({
             "all_states": true,
             "selection_mode": scope_summary.selection_mode,
@@ -5740,6 +6506,7 @@ async fn run_provider_rule_replay(
     pool: &PgPool,
     processes: &[ProcessRow],
     include_user_id: Option<Uuid>,
+    versioned_scope: Option<&ValidatedPublicOwnerDraftScope>,
     rules: &[ProviderRule],
     reference_normalization_mode: NormalizationMode,
     allocation_mode: AllocationMode,
@@ -5750,13 +6517,14 @@ async fn run_provider_rule_replay(
             pool,
             processes.to_vec(),
             include_user_id,
+            versioned_scope,
             *rule,
             reference_normalization_mode,
             allocation_mode,
             &[],
         )
         .await?;
-        out.push(build_provider_rule_replay_row(*rule, &compiled_graph));
+        out.push(build_provider_rule_replay_row(*rule, &compiled_graph.graph));
     }
     Ok(out)
 }
@@ -5897,16 +6665,20 @@ fn write_provider_rule_replay_report_files(
 mod tests {
     use super::{
         AllocationFractionState, AllocationMode, Cli,
-        DEFAULT_SNAPSHOT_DB_STATEMENT_TIMEOUT_SECONDS, ExchangeDirection, MethodSelection,
-        MultiProviderDecision, NormalizationMode, ParsedExchange, ProcessMeta, ProcessRow,
-        ProviderRule, add_technosphere_edge, assemble_sparse_payload, attach_artifact_lifecycle,
-        biosphere_gross_value, build_review_submit_overlay_graph, candidate_count_bucket_label,
-        compute_scope_hash, geo_score, location_granularity_label, no_provider_failure_reason,
-        normalize_request_roots, parse_process_annual_supply_or_production_volume,
-        parse_process_states, parse_provider_rule_list, resolve_allocation_fraction,
-        resolve_multi_provider, resolve_process_selection, resolve_reference_normalization,
+        DEFAULT_SNAPSHOT_DB_STATEMENT_TIMEOUT_SECONDS, ExchangeDirection, FlowRow, ImpactFactorSet,
+        LciaExchangeObservation, MethodRow, MethodSelection, MultiProviderDecision,
+        NormalizationMode, ParsedExchange, ProcessMeta, ProcessRow, ProviderRule,
+        add_technosphere_edge, assemble_sparse_payload, attach_artifact_lifecycle,
+        biosphere_gross_value, build_lcia_factor_coverage, build_method_source_evidence,
+        build_review_submit_overlay_graph, candidate_count_bucket_label, compute_scope_hash,
+        geo_score, location_granularity_label, no_provider_failure_reason, normalize_request_roots,
+        parse_process_annual_supply_or_production_volume, parse_process_states,
+        parse_provider_rule_list, resolve_allocation_fraction, resolve_multi_provider,
+        resolve_process_selection, resolve_reference_normalization,
         review_submit_root_dependency_fingerprint, snapshot_db_statement_timeout,
-        summarize_matching_diagnostics, time_score,
+        summarize_matching_diagnostics, time_score, unique_supported_direction_by_flow,
+        validate_flow_row_visibility, validate_method_row_visibility,
+        validate_process_row_visibility,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -5938,7 +6710,7 @@ mod tests {
     fn snapshot_db_statement_timeout_defaults_to_bounded_duration() {
         assert_eq!(
             snapshot_db_statement_timeout(DEFAULT_SNAPSHOT_DB_STATEMENT_TIMEOUT_SECONDS),
-            Some(std::time::Duration::from_secs(900))
+            Some(std::time::Duration::from_mins(15))
         );
     }
 
@@ -6031,6 +6803,46 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_builder_validates_exact_versioned_scope_cli_contract() {
+        let actor = Uuid::new_v4();
+        let manifest = solver_worker::calculation_evidence::expected_scope_manifest(actor);
+        let manifest_hash = solver_worker::calculation_evidence::canonical_json_sha256(&manifest)
+            .expect("manifest hash");
+        let method_source =
+            solver_worker::calculation_evidence::expected_method_factor_source_contract();
+        let coverage = solver_worker::calculation_evidence::expected_factor_coverage_contract();
+        let cli = Cli::try_parse_from([
+            "snapshot-builder",
+            "--process-states",
+            "100",
+            "--include-user-id",
+            &actor.to_string(),
+            "--all-states",
+            "false",
+            "--include-user-state-codes",
+            "0",
+            "--include-user-unassigned-only",
+            "--include-user-review-free-only",
+            "--data-scope",
+            "public_plus_owner_draft",
+            "--scope-manifest-json",
+            &manifest.to_string(),
+            "--scope-manifest-sha256",
+            &manifest_hash,
+            "--lcia-method-factor-source-json",
+            &method_source.to_string(),
+            "--lcia-factor-coverage-contract-json",
+            &coverage.to_string(),
+        ])
+        .expect("parse v2 cli");
+        let validated = super::validate_versioned_scope_cli(&cli)
+            .expect("validate v2 cli")
+            .expect("versioned scope");
+        assert_eq!(validated.actor_user_id, actor);
+        assert_eq!(validated.scope_manifest_sha256, manifest_hash);
+    }
+
+    #[test]
     fn artifact_lifecycle_metadata_is_attached_to_process_filter() {
         let mut process_filter = json!({"all_states": false});
 
@@ -6059,6 +6871,9 @@ mod tests {
             version: "01.00.000".to_owned(),
             model_id: None,
             user_id: None,
+            state_code: 100,
+            team_id: None,
+            review_id: None,
             modified_at: Some(Utc::now()),
             json: process_json(&[("Input", flow_id)]),
         };
@@ -6079,6 +6894,9 @@ mod tests {
             version: "01.00.000".to_owned(),
             model_id: None,
             user_id: None,
+            state_code: 100,
+            team_id: None,
+            review_id: None,
             modified_at: Some(Utc::now()),
             json: process_json(&[("Input", fixed_flow_id("left-flow"))]),
         };
@@ -6141,6 +6959,9 @@ mod tests {
             version: "01.00.000".to_owned(),
             model_id: None,
             user_id: None,
+            state_code: 100,
+            team_id: None,
+            review_id: None,
             modified_at: Some(Utc::now()),
             json: process_json(&[("Input", flow_id)]),
         };
@@ -6162,6 +6983,8 @@ mod tests {
             method_version: None,
             method_count: 0,
             factor_count: 0,
+            source_evidence: None,
+            rows: Vec::new(),
         };
         let built = assemble_sparse_payload(
             Uuid::new_v4(),
@@ -6171,6 +6994,8 @@ mod tests {
             1e-12,
             false,
             &[],
+            &[],
+            false,
         )
         .expect("assemble overlay");
 
@@ -6274,6 +7099,9 @@ mod tests {
                     version: "01.00.000".to_owned(),
                     model_id: None,
                     user_id: None,
+                    state_code: 100,
+                    team_id: None,
+                    review_id: None,
                     modified_at: Some(Utc::now()),
                     json: process_json(&[
                         ("Output", fixed_flow_id("public-output")),
@@ -6285,6 +7113,9 @@ mod tests {
                     version: "01.00.000".to_owned(),
                     model_id: None,
                     user_id: Some(private_user),
+                    state_code: 0,
+                    team_id: None,
+                    review_id: None,
                     modified_at: Some(Utc::now()),
                     json: process_json(&[
                         ("Input", fixed_flow_id("public-output")),
@@ -6794,7 +7625,10 @@ mod tests {
         let exchange = ParsedExchange {
             process_idx: 0,
             flow_id: Uuid::new_v4(),
-            direction: ExchangeDirection::Input,
+            direction: Some(ExchangeDirection::Input),
+            direction_label: "Input".to_owned(),
+            exchange_id: "test-exchange".to_owned(),
+            flow_version: "01.00.000".to_owned(),
             internal_id: None,
             is_reference_exchange: false,
             amount: Some(1.0),
@@ -6839,7 +7673,10 @@ mod tests {
         let exchange = ParsedExchange {
             process_idx: 0,
             flow_id: Uuid::new_v4(),
-            direction: ExchangeDirection::Input,
+            direction: Some(ExchangeDirection::Input),
+            direction_label: "Input".to_owned(),
+            exchange_id: "test-exchange".to_owned(),
+            flow_version: "01.00.000".to_owned(),
             internal_id: None,
             is_reference_exchange: false,
             amount: Some(1.0),
@@ -6877,7 +7714,10 @@ mod tests {
         let exchange = ParsedExchange {
             process_idx: 0,
             flow_id: Uuid::new_v4(),
-            direction: ExchangeDirection::Input,
+            direction: Some(ExchangeDirection::Input),
+            direction_label: "Input".to_owned(),
+            exchange_id: "test-exchange".to_owned(),
+            flow_version: "01.00.000".to_owned(),
             internal_id: None,
             is_reference_exchange: false,
             amount: Some(1.0),
@@ -6917,7 +7757,10 @@ mod tests {
         let exchange = ParsedExchange {
             process_idx: 0,
             flow_id: Uuid::new_v4(),
-            direction: ExchangeDirection::Input,
+            direction: Some(ExchangeDirection::Input),
+            direction_label: "Input".to_owned(),
+            exchange_id: "test-exchange".to_owned(),
+            flow_version: "01.00.000".to_owned(),
             internal_id: None,
             is_reference_exchange: false,
             amount: Some(1.0),
@@ -6955,7 +7798,10 @@ mod tests {
         let exchange = ParsedExchange {
             process_idx: 0,
             flow_id: Uuid::new_v4(),
-            direction: ExchangeDirection::Input,
+            direction: Some(ExchangeDirection::Input),
+            direction_label: "Input".to_owned(),
+            exchange_id: "test-exchange".to_owned(),
+            flow_version: "01.00.000".to_owned(),
             internal_id: None,
             is_reference_exchange: false,
             amount: Some(1.0),
@@ -6992,7 +7838,10 @@ mod tests {
         let exchange = ParsedExchange {
             process_idx: 0,
             flow_id: Uuid::new_v4(),
-            direction: ExchangeDirection::Input,
+            direction: Some(ExchangeDirection::Input),
+            direction_label: "Input".to_owned(),
+            exchange_id: "test-exchange".to_owned(),
+            flow_version: "01.00.000".to_owned(),
             internal_id: None,
             is_reference_exchange: false,
             amount: Some(1.0),
@@ -7032,7 +7881,10 @@ mod tests {
         let exchange = ParsedExchange {
             process_idx: 0,
             flow_id: Uuid::new_v4(),
-            direction: ExchangeDirection::Input,
+            direction: Some(ExchangeDirection::Input),
+            direction_label: "Input".to_owned(),
+            exchange_id: "test-exchange".to_owned(),
+            flow_version: "01.00.000".to_owned(),
             internal_id: None,
             is_reference_exchange: false,
             amount: Some(1.0),
@@ -7072,6 +7924,9 @@ mod tests {
                     version: "01.00.000".to_owned(),
                     model_id: None,
                     user_id: None,
+                    state_code: 100,
+                    team_id: None,
+                    review_id: None,
                     modified_at: Some(Utc::now()),
                     json: process_json_with_metadata(&[("Input", flow_id)], Some("CN-BJ"), None),
                 },
@@ -7080,6 +7935,9 @@ mod tests {
                     version: "01.00.000".to_owned(),
                     model_id: None,
                     user_id: None,
+                    state_code: 100,
+                    team_id: None,
+                    review_id: None,
                     modified_at: Some(Utc::now()),
                     json: process_json_with_metadata(
                         &[("Output", flow_id)],
@@ -7092,6 +7950,9 @@ mod tests {
                     version: "01.00.000".to_owned(),
                     model_id: None,
                     user_id: None,
+                    state_code: 100,
+                    team_id: None,
+                    review_id: None,
                     modified_at: Some(Utc::now()),
                     json: process_json_with_metadata(
                         &[("Output", flow_id)],
@@ -7134,6 +7995,9 @@ mod tests {
                     version: "01.00.000".to_owned(),
                     model_id: None,
                     user_id: None,
+                    state_code: 100,
+                    team_id: None,
+                    review_id: None,
                     modified_at: Some(Utc::now()),
                     json: process_json_with_exchange_locations(
                         &[("Input", flow_id, Some("GLO"))],
@@ -7146,6 +8010,9 @@ mod tests {
                     version: "01.00.000".to_owned(),
                     model_id: None,
                     user_id: None,
+                    state_code: 100,
+                    team_id: None,
+                    review_id: None,
                     modified_at: Some(Utc::now()),
                     json: process_json_with_metadata(
                         &[("Output", flow_id)],
@@ -7158,6 +8025,9 @@ mod tests {
                     version: "01.00.000".to_owned(),
                     model_id: None,
                     user_id: None,
+                    state_code: 100,
+                    team_id: None,
+                    review_id: None,
                     modified_at: Some(Utc::now()),
                     json: process_json_with_metadata(
                         &[("Output", flow_id)],
@@ -7201,6 +8071,9 @@ mod tests {
                     version: "01.00.000".to_owned(),
                     model_id: None,
                     user_id: None,
+                    state_code: 100,
+                    team_id: None,
+                    review_id: None,
                     modified_at: Some(Utc::now()),
                     json: process_json_with_metadata(
                         &[("Input", demanded_flow_id)],
@@ -7213,6 +8086,9 @@ mod tests {
                     version: "01.00.000".to_owned(),
                     model_id: None,
                     user_id: None,
+                    state_code: 100,
+                    team_id: None,
+                    review_id: None,
                     modified_at: Some(Utc::now()),
                     json: process_json_with_metadata(
                         &[
@@ -7228,6 +8104,9 @@ mod tests {
                     version: "01.00.000".to_owned(),
                     model_id: None,
                     user_id: None,
+                    state_code: 100,
+                    team_id: None,
+                    review_id: None,
                     modified_at: Some(Utc::now()),
                     json: process_json_with_metadata(
                         &[("Output", demanded_flow_id)],
@@ -7273,6 +8152,9 @@ mod tests {
                     version: "01.00.000".to_owned(),
                     model_id: None,
                     user_id: None,
+                    state_code: 100,
+                    team_id: None,
+                    review_id: None,
                     modified_at: Some(Utc::now()),
                     json: process_json_with_metadata(
                         &[("Input", demanded_flow_id)],
@@ -7285,6 +8167,9 @@ mod tests {
                     version: "01.00.000".to_owned(),
                     model_id: None,
                     user_id: None,
+                    state_code: 100,
+                    team_id: None,
+                    review_id: None,
                     modified_at: Some(Utc::now()),
                     json: process_json_without_quantitative_reference(
                         &[("Output", demanded_flow_id)],
@@ -7296,6 +8181,9 @@ mod tests {
                     version: "01.00.000".to_owned(),
                     model_id: None,
                     user_id: None,
+                    state_code: 100,
+                    team_id: None,
+                    review_id: None,
                     modified_at: Some(Utc::now()),
                     json: process_json_with_metadata(
                         &[("Output", demanded_flow_id)],
@@ -7386,7 +8274,10 @@ mod tests {
         let exchange = ParsedExchange {
             process_idx: 0,
             flow_id: Uuid::new_v4(),
-            direction: ExchangeDirection::Input,
+            direction: Some(ExchangeDirection::Input),
+            direction_label: "Input".to_owned(),
+            exchange_id: "test-exchange".to_owned(),
+            flow_version: "01.00.000".to_owned(),
             internal_id: None,
             is_reference_exchange: false,
             amount: Some(1.0),
@@ -7452,7 +8343,10 @@ mod tests {
         let exchange = ParsedExchange {
             process_idx: 0,
             flow_id: Uuid::new_v4(),
-            direction: ExchangeDirection::Input,
+            direction: Some(ExchangeDirection::Input),
+            direction_label: "Input".to_owned(),
+            exchange_id: "test-exchange".to_owned(),
+            flow_version: "01.00.000".to_owned(),
             internal_id: None,
             is_reference_exchange: false,
             amount: Some(1.0),
@@ -7512,7 +8406,10 @@ mod tests {
         let exchange = ParsedExchange {
             process_idx: 0,
             flow_id: Uuid::new_v4(),
-            direction: ExchangeDirection::Input,
+            direction: Some(ExchangeDirection::Input),
+            direction_label: "Input".to_owned(),
+            exchange_id: "test-exchange".to_owned(),
+            flow_version: "01.00.000".to_owned(),
             internal_id: None,
             is_reference_exchange: false,
             amount: Some(1.0),
@@ -7574,7 +8471,10 @@ mod tests {
         let exchange = ParsedExchange {
             process_idx: 0,
             flow_id: Uuid::new_v4(),
-            direction: ExchangeDirection::Input,
+            direction: Some(ExchangeDirection::Input),
+            direction_label: "Input".to_owned(),
+            exchange_id: "test-exchange".to_owned(),
+            flow_version: "01.00.000".to_owned(),
             internal_id: None,
             is_reference_exchange: false,
             amount: Some(1.0),
@@ -7633,7 +8533,10 @@ mod tests {
         let exchange = ParsedExchange {
             process_idx: 0,
             flow_id: Uuid::new_v4(),
-            direction: ExchangeDirection::Input,
+            direction: Some(ExchangeDirection::Input),
+            direction_label: "Input".to_owned(),
+            exchange_id: "test-exchange".to_owned(),
+            flow_version: "01.00.000".to_owned(),
             internal_id: None,
             is_reference_exchange: false,
             amount: Some(1.0),
@@ -7720,5 +8623,151 @@ mod tests {
         assert_close(biosphere_gross_value(5.0), 5.0);
         assert_close(biosphere_gross_value(-5.0), -5.0);
         assert_close(biosphere_gross_value(0.0), 0.0);
+    }
+
+    #[test]
+    fn exact_visibility_rechecks_reject_nonpublic_and_collaboration_drafts() {
+        let actor = Uuid::new_v4();
+        let foreign = Uuid::new_v4();
+        let base = ProcessRow {
+            id: Uuid::new_v4(),
+            version: "01.00.000".to_owned(),
+            model_id: None,
+            user_id: Some(actor),
+            state_code: 0,
+            team_id: None,
+            review_id: None,
+            modified_at: None,
+            json: json!({}),
+        };
+        validate_process_row_visibility(&base, actor).expect("owner draft");
+
+        let mut row = base.clone();
+        row.state_code = 100;
+        row.user_id = Some(foreign);
+        validate_process_row_visibility(&row, actor).expect("public state 100");
+        row.state_code = 101;
+        assert!(validate_process_row_visibility(&row, actor).is_err());
+        row.state_code = 0;
+        assert!(validate_process_row_visibility(&row, actor).is_err());
+        row.user_id = Some(actor);
+        row.state_code = 1;
+        assert!(validate_process_row_visibility(&row, actor).is_err());
+        row.state_code = 0;
+        row.team_id = Some(Uuid::new_v4());
+        assert!(validate_process_row_visibility(&row, actor).is_err());
+        row.team_id = None;
+        row.review_id = Some(Uuid::new_v4());
+        assert!(validate_process_row_visibility(&row, actor).is_err());
+
+        let flow = FlowRow {
+            id: row.id,
+            version: row.version.clone(),
+            user_id: row.user_id,
+            state_code: row.state_code,
+            team_id: row.team_id,
+            review_id: row.review_id,
+            json: json!({}),
+        };
+        assert!(validate_flow_row_visibility(&flow, actor).is_err());
+    }
+
+    #[test]
+    fn lciamethod_visibility_recheck_rejects_foreign_and_owner_nonzero() {
+        let actor = Uuid::new_v4();
+        let mut row = MethodRow {
+            id: Uuid::new_v4(),
+            version: "01.00.000".to_owned(),
+            user_id: Some(actor),
+            state_code: 0,
+            modified_at: None,
+            created_at: None,
+            json: json!({}),
+        };
+        validate_method_row_visibility(&row, actor).expect("owner state zero");
+        row.user_id = Some(Uuid::new_v4());
+        assert!(validate_method_row_visibility(&row, actor).is_err());
+        row.user_id = Some(actor);
+        row.state_code = 5;
+        assert!(validate_method_row_visibility(&row, actor).is_err());
+        row.state_code = 100;
+        validate_method_row_visibility(&row, actor).expect("public state 100");
+        row.state_code = 101;
+        assert!(validate_method_row_visibility(&row, actor).is_err());
+    }
+
+    #[test]
+    fn method_source_proof_changes_when_factor_content_drifts() {
+        let mut row = MethodRow {
+            id: Uuid::new_v4(),
+            version: "01.00.000".to_owned(),
+            user_id: None,
+            state_code: 100,
+            modified_at: None,
+            created_at: None,
+            json: json!({
+                "LCIAMethodDataSet": {
+                    "characterisationFactors": {
+                        "factor": [{
+                            "referenceToFlowDataSet": {"@refObjectId": Uuid::new_v4()},
+                            "exchangeDirection": "Output",
+                            "meanValue": 1.0
+                        }]
+                    }
+                }
+            }),
+        };
+        let first =
+            build_method_source_evidence(&[row.clone()], &"a".repeat(64)).expect("first proof");
+        row.json["LCIAMethodDataSet"]["characterisationFactors"]["factor"][0]["meanValue"] =
+            json!(2.0);
+        let second = build_method_source_evidence(&[row], &"a".repeat(64)).expect("second proof");
+        assert_ne!(first.factor_manifest_sha256, second.factor_manifest_sha256);
+        assert_ne!(first.source_snapshot_sha256, second.source_snapshot_sha256);
+    }
+
+    #[test]
+    fn factor_coverage_matches_flow_and_direction_and_surfaces_gaps() {
+        let flow_id = Uuid::new_v4();
+        let factors = vec![ImpactFactorSet {
+            impact_id: Uuid::new_v4(),
+            impact_key: "method:test".to_owned(),
+            impact_name: "Test".to_owned(),
+            unit: "kg".to_owned(),
+            factors_by_flow: HashMap::from([(flow_id, 1.0)]),
+            factors_by_flow_direction: HashMap::from([((flow_id, ExchangeDirection::Output), 1.0)]),
+        }];
+        let observations = vec![LciaExchangeObservation {
+            flow_id,
+            flow_version: "01.00.000".to_owned(),
+            direction: Some(ExchangeDirection::Input),
+            direction_label: "Input".to_owned(),
+            exchange_id: "exchange-1".to_owned(),
+            amount: Some(2.0),
+        }];
+        let directions = unique_supported_direction_by_flow(&observations);
+        let coverage =
+            build_lcia_factor_coverage(&observations, &factors, &directions).expect("coverage");
+        assert_eq!(coverage.counts.matched, 0);
+        assert_eq!(coverage.counts.unmatched, 1);
+        assert_eq!(
+            coverage.records[0].reason,
+            "no_lcia_factor_for_flow_direction"
+        );
+
+        let mut ambiguous = observations;
+        ambiguous.push(LciaExchangeObservation {
+            flow_id,
+            flow_version: "01.00.000".to_owned(),
+            direction: Some(ExchangeDirection::Output),
+            direction_label: "Output".to_owned(),
+            exchange_id: "exchange-2".to_owned(),
+            amount: Some(1.0),
+        });
+        let directions = unique_supported_direction_by_flow(&ambiguous);
+        let coverage = build_lcia_factor_coverage(&ambiguous, &factors, &directions)
+            .expect("ambiguous coverage");
+        assert_eq!(coverage.counts.unsupported_direction, 2);
+        assert_eq!(coverage.records.len(), 2);
     }
 }

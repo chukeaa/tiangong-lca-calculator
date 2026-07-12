@@ -23,8 +23,8 @@ checkPaths:
   - crates/solver-worker/src/bin/snapshot_builder.rs
   - crates/solver-worker/src/compiled_graph.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
-lastReviewedAt: 2026-06-21
-lastReviewedCommit: 20d18a12916cfe1929140493377445aced21eb35
+lastReviewedAt: 2026-07-12
+lastReviewedCommit: 855d48a543ef3d2670ea933432296bb4fc2e2ffe
 related:
   - AGENTS.md
   - docs/agents/repo-architecture.md

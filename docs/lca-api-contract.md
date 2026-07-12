@@ -22,8 +22,9 @@ checkPaths:
   - docs/review-submit-fast-gate-contract.md
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
-lastReviewedAt: 2026-07-03
-lastReviewedCommit: 9ee436d72619fe7bc7536c8ccef72e7e52619d49
+lastReviewedAt: 2026-07-12
+lastReviewedCommit: 855d48a543ef3d2670ea933432296bb4fc2e2ffe
+lastReviewedNote: "Reviewed for Issue #116 public-plus-owner-draft v2 scope, LCIA source proof, coverage evidence, and solve binding."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -152,15 +153,37 @@ solver worker 默认使用 `SOLVER_QUEUE_BACKEND=worker-jobs` / `--queue-backend
 
 | `worker_jobs.job_kind` | `payload_schema_version` | legacy payload `type` | result schema |
 | --- | --- | --- | --- |
-| `lca.solve_one` | `lca.solve_one.request.v1` | `solve_one` | `lca.solve.result.v1` |
+| `lca.solve_one` | `lca.solve_one.request.v1` / `lca.solve_one.request.v2` | `solve_one` | `lca.solve.result.v1` |
 | `lca.solve_batch` | `lca.solve_batch.request.v1` | `solve_batch` | `lca.solve.result.v1` |
-| `lca.solve_all_unit` | `lca.solve_all_unit.request.v1` | `solve_all_unit` | `lca.solve.result.v1` |
-| `lca.build_snapshot` | `lca.build_snapshot.request.v1` | `build_snapshot` | `lca.snapshot.result.v1` |
-| `lca.contribution_path` | `lca.contribution_path.request.v1` | `analyze_contribution_path` | `lca.contribution_path.result.v1` |
+| `lca.solve_all_unit` | `lca.solve_all_unit.request.v1` / `lca.solve_all_unit.request.v2` | `solve_all_unit` | `lca.solve.result.v1` |
+| `lca.build_snapshot` | `lca.build_snapshot.request.v1` / `lca.build_snapshot.request.v2` | `build_snapshot` | `lca.snapshot.result.v1` |
+| `lca.contribution_path` | `lca.contribution_path.request.v1` / `lca.contribution_path.request.v2` | `analyze_contribution_path` | `lca.contribution_path.result.v1` |
 | `lca.factorization_prepare` | `lca.factorization_prepare.request.v1` | `prepare_factorization` | `lca.factorization_prepare.result.v1` |
 | `lcia_result.package_build` | `lcia_result.package_build.request.v1` | `lcia_result_package_build` | `lcia_result.package_build.result.v1` |
 
 `worker_jobs.payload_json` may use the legacy snake_case fields above, or Edge-friendly camelCase aliases such as `lcaJobId`, `snapshotId`, `rhsBatch`, `unitBatchSize`, `processId`, `impactId`, `requestRoots`, `noLcia`, `buildId`, `requestedBy`, `inputManifest`, `inputManifestHash`, `lciaMethodSet`, and `defaultImpactCategory`. Payloads must still carry a valid `lcaJobId` / `job_id` compatibility UUID when the task writes `lca_results`、`lca_result_cache`、`lca_latest_all_unit_results` 或 `lca_factorization_registry` rows keyed by historical `job_id` columns. 这些 columns 不再要求 `public.lca_jobs` FK 或 parent row。
+
+### 3.7 `public_plus_owner_draft` versioned calculation contract
+
+`lca.build_snapshot.request.v2` is reserved for the private-incubation scope `public_plus_owner_draft`. It must carry the complete Edge-produced contract; the worker does not infer or default omitted fields:
+
+- `all_states=false`, `process_states="100"`;
+- `include_user_id=<authenticated actor>`, `include_user_state_codes="0"`;
+- `include_user_unassigned_only=true`, `include_user_review_free_only=true`;
+- `scope_manifest` using `lca.data_scope.manifest.v1` and its canonical `scope_manifest_sha256`;
+- `lcia_method_factor_source` using `lca.method_factor_source.request.v1` with database relation `public.lciamethods`;
+- `lcia_factor_coverage_contract` using `lcia.factor_coverage.contract.v1` and `missing_factor_semantics=incomplete_coverage_not_zero`;
+- `no_lcia=false`.
+
+The worker independently enforces the frozen predicate after queue decoding and again in the snapshot builder. Processes and flows are eligible only when `state_code=100`, or when they are actor-owned `state_code=0` rows with both `team_id` and `review_id` null. LCIA methods are eligible only when `state_code=100`, or actor-owned `state_code=0`; collaboration guards are not applicable to `lciamethods`. Public states `101..199`, foreign drafts, owner nonzero rows, team drafts, and review drafts are rejected. The Rust row recheck is mandatory even though SQL already applies the same predicate.
+
+LCIA method rows and factors are loaded from `public.lciamethods`, not from the frontend's static method cache. A versioned build records three deterministic SHA-256 values in `lca.method_factor_source.snapshot.v1`: the selected source snapshot, method manifest, and raw factor manifest. The source fingerprint also includes this proof, so a snapshot with different method/factor content cannot be reused.
+
+Factor coverage matches elementary exchanges by `(elementary_flow_uuid, direction)`. Counts are `matched`, `unmatched`, `invalid`, and `unsupported_direction`. `matched` means the exchange key is present in at least one selected LCIA method; this union coverage answers whether the inventory flow is characterized anywhere in the selected method set and does not claim that every method has a nonzero factor. Gaps are never represented as complete zero coverage. An incomplete build uploads `lcia-uncharacterized-jsonl:v1` with `elementary_flow_uuid`, `flow_version`, `direction`, `exchange_id`, `amount`, and `reason`, then records its URL, SHA-256, and exact record count.
+
+`snapshot-index-v1.json` carries top-level `calculation_evidence` (`lca.calculation_evidence.v1`) with the exact scope hash, method/factor snapshot proof, and `lcia.factor_coverage.v1`. Complete coverage requires zero gap counts and a null evidence artifact. Incomplete coverage requires `coverage_status=incomplete_coverage`, an artifact, and `record_count = unmatched + invalid + unsupported_direction`.
+
+For this scope, `lca.solve_one.request.v2`, `lca.solve_all_unit.request.v2`, and `lca.contribution_path.request.v2` must carry `calculation_evidence_binding` equal to the snapshot-index evidence. The worker rejects missing, malformed, or drifted bindings before factorization/solve. A v1 solve against a bound snapshot is rejected, so the contract cannot silently downgrade. Successful scoped results repeat `calculation_evidence` in `lca_results.diagnostics` and job diagnostics; numeric trial results with gaps remain explicitly marked `incomplete_coverage`.
 
 `lcia_result.package_build` 不是普通求解 API 的用户请求类型，而是 data product manager command 创建的后台构建任务。payload 必须来自数据库/Edge 的 service-role command 边界，包含 `buildId`、`requestedBy`、published-only `inputManifest`、`inputManifestHash`、`coverageMode`、`eligibleInputCount`、`includedInputCount`、`lciaMethodSet` 和可选 `defaultImpactCategory`。worker 只接受 `inputManifest.processes` 中 `stateCode/state_code` 为 `100..199` 的已发布过程；不会纳入 draft data。
 
@@ -205,6 +228,7 @@ legacy pgmq/debug 路径语义：
 - 必须写入 `artifact_url` / `artifact_sha256` / `artifact_byte_size` / `artifact_format`
 - 当前 `artifact_format = hdf5:v1`
 - 附加 retention 字段：`expires_at` / `is_pinned`
+- `diagnostics.calculation_evidence`：versioned scoped snapshots 必须为非空，并与 snapshot-index binding 完全一致；legacy snapshots 为 `null`
 
 `snapshot` artifact 当前格式：`snapshot-hdf5:v1`。
 

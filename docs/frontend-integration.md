@@ -20,8 +20,8 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/edge-function-integration.md
   - docs/review-submit-fast-gate-contract.md
-lastReviewedAt: 2026-06-23
-lastReviewedCommit: aaba7d6b2664619e66d7c5296545b011483298a0
+lastReviewedAt: 2026-07-12
+lastReviewedCommit: 855d48a543ef3d2670ea933432296bb4fc2e2ffe
 related:
   - AGENTS.md
   - .docpact/config.yaml

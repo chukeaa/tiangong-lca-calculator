@@ -207,7 +207,7 @@ mod tests {
 
     #[test]
     fn duration_millis_text_formats_postgres_statement_timeout_value() {
-        assert_eq!(duration_millis_text(Duration::from_secs(900)), "900000");
+        assert_eq!(duration_millis_text(Duration::from_mins(15)), "900000");
         assert_eq!(duration_millis_text(Duration::from_millis(250)), "250");
     }
 

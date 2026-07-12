@@ -7,6 +7,10 @@ use tracing::{error, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::{
+    calculation_evidence::{
+        PublicOwnerDraftBuildRequest, canonical_json_sha256, expected_scope_manifest,
+        validate_calculation_evidence, validate_public_owner_draft_build_request,
+    },
     db::{
         AppState, archive_queue_message, handle_job_payload,
         handle_lcia_result_package_build_worker_job, handle_worker_jobs_job_payload,
@@ -29,6 +33,30 @@ fn extract_snapshot_id(payload: &JobPayload) -> Option<Uuid> {
         | JobPayload::InvalidateFactorization { snapshot_id, .. }
         | JobPayload::RebuildFactorization { snapshot_id, .. } => Some(*snapshot_id),
         JobPayload::BuildSnapshot { .. } | JobPayload::LciaResultPackageBuild { .. } => None,
+    }
+}
+
+fn calculation_evidence_binding_for_payload(payload: &JobPayload) -> Option<Value> {
+    match payload {
+        JobPayload::SolveOne {
+            calculation_evidence_binding,
+            ..
+        }
+        | JobPayload::SolveBatch {
+            calculation_evidence_binding,
+            ..
+        }
+        | JobPayload::SolveAllUnit {
+            calculation_evidence_binding,
+            ..
+        }
+        | JobPayload::AnalyzeContributionPath {
+            calculation_evidence_binding,
+            ..
+        } => calculation_evidence_binding
+            .as_ref()
+            .and_then(|evidence| serde_json::to_value(evidence).ok()),
+        _ => None,
     }
 }
 
@@ -566,6 +594,7 @@ async fn build_solver_worker_job_result(
         "snapshotId": snapshot_id,
         "lcaJobStatus": job_projection.get("status").cloned().unwrap_or(Value::Null),
         "resultId": result_id,
+        "calculationEvidence": calculation_evidence_binding_for_payload(payload),
     });
 
     Ok(WorkerJobResult {
@@ -575,6 +604,7 @@ async fn build_solver_worker_job_result(
         result_ref: Some(result_ref),
         diagnostics: Some(json!({
             "lcaJob": job_projection,
+            "calculationEvidence": calculation_evidence_binding_for_payload(payload),
         })),
         error_code: None,
         error_message: None,
@@ -796,9 +826,7 @@ fn solver_worker_job_payload(job: &WorkerJob) -> anyhow::Result<JobPayload> {
         ));
     }
 
-    let expected_schema = payload_schema_version_for_job_kind(&job.job_kind)
-        .ok_or_else(|| anyhow::anyhow!("unsupported solver worker job kind: {}", job.job_kind))?;
-    if job.payload_schema_version != expected_schema {
+    if !payload_schema_supported_for_job_kind(&job.job_kind, &job.payload_schema_version) {
         return Err(anyhow::anyhow!(
             "unsupported payload schema for {}: {}",
             job.job_kind,
@@ -820,7 +848,19 @@ fn solver_worker_job_payload(job: &WorkerJob) -> anyhow::Result<JobPayload> {
         );
     }
 
-    Ok(serde_json::from_value(Value::Object(payload))?)
+    let parsed = serde_json::from_value(Value::Object(payload))?;
+    let expected_payload_type = payload_type_for_job_kind(&job.job_kind)
+        .ok_or_else(|| anyhow::anyhow!("unsupported solver worker job kind: {}", job.job_kind))?;
+    if payload_type_name(&parsed) != expected_payload_type {
+        return Err(anyhow::anyhow!(
+            "payload type mismatch for {}: expected={} actual={}",
+            job.job_kind,
+            expected_payload_type,
+            payload_type_name(&parsed)
+        ));
+    }
+    validate_versioned_payload_contract(&parsed, &job.payload_schema_version, job.requested_by)?;
+    Ok(parsed)
 }
 
 fn normalize_worker_payload_object(value: Value) -> anyhow::Result<Map<String, Value>> {
@@ -842,7 +882,41 @@ fn normalize_worker_payload_object(value: Value) -> anyhow::Result<Map<String, V
     copy_alias(&mut payload, "impactId", "impact_id");
     copy_alias(&mut payload, "impactIndex", "impact_index");
     copy_alias(&mut payload, "processStates", "process_states");
+    copy_alias(&mut payload, "allStates", "all_states");
     copy_alias(&mut payload, "includeUserId", "include_user_id");
+    copy_alias(
+        &mut payload,
+        "includeUserStateCodes",
+        "include_user_state_codes",
+    );
+    copy_alias(
+        &mut payload,
+        "includeUserUnassignedOnly",
+        "include_user_unassigned_only",
+    );
+    copy_alias(
+        &mut payload,
+        "includeUserReviewFreeOnly",
+        "include_user_review_free_only",
+    );
+    copy_alias(&mut payload, "dataScope", "data_scope");
+    copy_alias(&mut payload, "scopeManifest", "scope_manifest");
+    copy_alias(&mut payload, "scopeManifestSha256", "scope_manifest_sha256");
+    copy_alias(
+        &mut payload,
+        "lciaMethodFactorSource",
+        "lcia_method_factor_source",
+    );
+    copy_alias(
+        &mut payload,
+        "lciaFactorCoverageContract",
+        "lcia_factor_coverage_contract",
+    );
+    copy_alias(
+        &mut payload,
+        "calculationEvidenceBinding",
+        "calculation_evidence_binding",
+    );
     copy_alias(&mut payload, "requestRoots", "request_roots");
     copy_alias(&mut payload, "providerRule", "provider_rule");
     copy_alias(
@@ -908,17 +982,159 @@ fn normalize_request_roots(payload: &mut Map<String, Value>) {
     }
 }
 
-fn payload_schema_version_for_job_kind(job_kind: &str) -> Option<&'static str> {
-    match job_kind {
-        "lca.solve_one" => Some("lca.solve_one.request.v1"),
-        "lca.solve_batch" => Some("lca.solve_batch.request.v1"),
-        "lca.solve_all_unit" => Some("lca.solve_all_unit.request.v1"),
-        "lca.build_snapshot" => Some("lca.build_snapshot.request.v1"),
-        "lca.contribution_path" => Some("lca.contribution_path.request.v1"),
-        "lca.factorization_prepare" => Some("lca.factorization_prepare.request.v1"),
-        "lcia_result.package_build" => Some("lcia_result.package_build.request.v1"),
-        _ => None,
+fn payload_schema_supported_for_job_kind(job_kind: &str, schema: &str) -> bool {
+    matches!(
+        (job_kind, schema),
+        (
+            "lca.solve_one",
+            "lca.solve_one.request.v1" | "lca.solve_one.request.v2"
+        ) | ("lca.solve_batch", "lca.solve_batch.request.v1")
+            | (
+                "lca.solve_all_unit",
+                "lca.solve_all_unit.request.v1" | "lca.solve_all_unit.request.v2"
+            )
+            | (
+                "lca.build_snapshot",
+                "lca.build_snapshot.request.v1" | "lca.build_snapshot.request.v2"
+            )
+            | (
+                "lca.contribution_path",
+                "lca.contribution_path.request.v1" | "lca.contribution_path.request.v2"
+            )
+            | (
+                "lca.factorization_prepare",
+                "lca.factorization_prepare.request.v1"
+            )
+            | (
+                "lcia_result.package_build",
+                "lcia_result.package_build.request.v1"
+            )
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_versioned_payload_contract(
+    payload: &JobPayload,
+    schema: &str,
+    requested_by: Option<Uuid>,
+) -> anyhow::Result<()> {
+    match (schema, payload) {
+        (
+            "lca.build_snapshot.request.v2",
+            JobPayload::BuildSnapshot {
+                all_states,
+                process_states,
+                include_user_id,
+                include_user_state_codes,
+                include_user_unassigned_only,
+                include_user_review_free_only,
+                data_scope,
+                scope_manifest,
+                scope_manifest_sha256,
+                lcia_method_factor_source,
+                lcia_factor_coverage_contract,
+                no_lcia,
+                ..
+            },
+        ) => {
+            validate_public_owner_draft_build_request(PublicOwnerDraftBuildRequest {
+                all_states: *all_states,
+                process_states: process_states.as_deref(),
+                include_user_id: *include_user_id,
+                include_user_state_codes: include_user_state_codes.as_deref(),
+                include_user_unassigned_only: *include_user_unassigned_only,
+                include_user_review_free_only: *include_user_review_free_only,
+                data_scope: data_scope.as_deref(),
+                scope_manifest: scope_manifest.as_ref(),
+                scope_manifest_sha256: scope_manifest_sha256.as_deref(),
+                lcia_method_factor_source: lcia_method_factor_source.as_ref(),
+                lcia_factor_coverage_contract: lcia_factor_coverage_contract.as_ref(),
+                no_lcia: *no_lcia,
+                requested_by,
+            })?;
+        }
+        (
+            "lca.solve_one.request.v2"
+            | "lca.solve_all_unit.request.v2"
+            | "lca.contribution_path.request.v2",
+            JobPayload::SolveOne {
+                calculation_evidence_binding,
+                ..
+            }
+            | JobPayload::SolveAllUnit {
+                calculation_evidence_binding,
+                ..
+            }
+            | JobPayload::AnalyzeContributionPath {
+                calculation_evidence_binding,
+                ..
+            },
+        ) => {
+            let binding = calculation_evidence_binding
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("v2 solve requires calculation_evidence_binding"))?;
+            validate_calculation_evidence(binding)?;
+            let actor = requested_by
+                .ok_or_else(|| anyhow::anyhow!("v2 solve requires authenticated requested_by"))?;
+            let expected_scope_hash = canonical_json_sha256(&expected_scope_manifest(actor))?;
+            if binding.scope_manifest_sha256 != expected_scope_hash {
+                return Err(anyhow::anyhow!(
+                    "v2 solve requested_by differs from snapshot scope actor"
+                ));
+            }
+        }
+        (
+            "lca.build_snapshot.request.v1",
+            JobPayload::BuildSnapshot {
+                include_user_state_codes,
+                include_user_unassigned_only,
+                include_user_review_free_only,
+                data_scope,
+                scope_manifest,
+                scope_manifest_sha256,
+                lcia_method_factor_source,
+                lcia_factor_coverage_contract,
+                ..
+            },
+        ) if include_user_state_codes.is_some()
+            || include_user_unassigned_only.is_some()
+            || include_user_review_free_only.is_some()
+            || data_scope.is_some()
+            || scope_manifest.is_some()
+            || scope_manifest_sha256.is_some()
+            || lcia_method_factor_source.is_some()
+            || lcia_factor_coverage_contract.is_some() =>
+        {
+            return Err(anyhow::anyhow!(
+                "versioned scope fields cannot be carried by a v1 build payload"
+            ));
+        }
+        (
+            schema,
+            JobPayload::SolveOne {
+                calculation_evidence_binding,
+                ..
+            }
+            | JobPayload::SolveBatch {
+                calculation_evidence_binding,
+                ..
+            }
+            | JobPayload::SolveAllUnit {
+                calculation_evidence_binding,
+                ..
+            }
+            | JobPayload::AnalyzeContributionPath {
+                calculation_evidence_binding,
+                ..
+            },
+        ) if schema.ends_with(".request.v1") && calculation_evidence_binding.is_some() => {
+            return Err(anyhow::anyhow!(
+                "calculation_evidence_binding cannot be carried by a v1 solve payload"
+            ));
+        }
+        _ => {}
     }
+    Ok(())
 }
 
 fn payload_type_for_job_kind(job_kind: &str) -> Option<&'static str> {
@@ -1073,6 +1289,13 @@ mod tests {
     use uuid::Uuid;
 
     use crate::{
+        calculation_evidence::{
+            CALCULATION_EVIDENCE_SCHEMA_VERSION, FACTOR_COVERAGE_EVIDENCE_SCHEMA_VERSION,
+            LcaCalculationEvidence, LcaMethodFactorSourceSnapshot, LciaFactorCoverageCounts,
+            LciaFactorCoverageEvidence, METHOD_SOURCE_SNAPSHOT_SCHEMA_VERSION,
+            MISSING_FACTOR_SEMANTICS, canonical_json_sha256, expected_factor_coverage_contract,
+            expected_method_factor_source_contract, expected_scope_manifest,
+        },
         queue::{payload_type_name, solver_worker_job_payload, solver_worker_result_ref},
         types::JobPayload,
         worker_jobs::WorkerJob,
@@ -1092,6 +1315,31 @@ mod tests {
             requested_by: Some(Uuid::new_v4()),
             lease_token: Uuid::new_v4(),
             attempt_count: 1,
+        }
+    }
+
+    fn complete_calculation_evidence(scope_hash: String) -> LcaCalculationEvidence {
+        LcaCalculationEvidence {
+            schema_version: CALCULATION_EVIDENCE_SCHEMA_VERSION.to_owned(),
+            scope_manifest_sha256: scope_hash,
+            lcia_method_factor_source: LcaMethodFactorSourceSnapshot {
+                schema_version: METHOD_SOURCE_SNAPSHOT_SCHEMA_VERSION.to_owned(),
+                source_kind: "database".to_owned(),
+                relation: "public.lciamethods".to_owned(),
+                source_snapshot_sha256: "a".repeat(64),
+                method_manifest_sha256: "b".repeat(64),
+                factor_manifest_sha256: "c".repeat(64),
+            },
+            lcia_factor_coverage: LciaFactorCoverageEvidence {
+                schema_version: FACTOR_COVERAGE_EVIDENCE_SCHEMA_VERSION.to_owned(),
+                coverage_status: "complete".to_owned(),
+                missing_factor_semantics: MISSING_FACTOR_SEMANTICS.to_owned(),
+                counts: LciaFactorCoverageCounts {
+                    matched: 1,
+                    ..LciaFactorCoverageCounts::default()
+                },
+                uncharacterized_evidence: None,
+            },
         }
     }
 
@@ -1221,6 +1469,108 @@ mod tests {
             }
             other => panic!("unexpected payload: {other:?}"),
         }
+    }
+
+    #[test]
+    fn maps_exact_public_owner_draft_build_v2() {
+        let actor = Uuid::new_v4();
+        let manifest = expected_scope_manifest(actor);
+        let manifest_hash = canonical_json_sha256(&manifest).expect("manifest hash");
+        let mut job = worker_job(
+            "lca.build_snapshot",
+            "lca.build_snapshot.request.v2",
+            json!({
+                "job_id": Uuid::new_v4(),
+                "snapshot_id": Uuid::new_v4(),
+                "all_states": false,
+                "process_states": "100",
+                "include_user_id": actor,
+                "include_user_state_codes": "0",
+                "include_user_unassigned_only": true,
+                "include_user_review_free_only": true,
+                "data_scope": "public_plus_owner_draft",
+                "scope_manifest": manifest,
+                "scope_manifest_sha256": manifest_hash,
+                "lcia_method_factor_source": expected_method_factor_source_contract(),
+                "lcia_factor_coverage_contract": expected_factor_coverage_contract(),
+                "no_lcia": false,
+            }),
+        );
+        job.requested_by = Some(actor);
+
+        let payload = solver_worker_job_payload(&job).expect("v2 payload");
+        assert!(matches!(
+            payload,
+            JobPayload::BuildSnapshot {
+                include_user_id: Some(parsed_actor),
+                data_scope: Some(ref scope),
+                ..
+            } if parsed_actor == actor && scope == "public_plus_owner_draft"
+        ));
+    }
+
+    #[test]
+    fn rejects_public_101_or_actor_drift_in_build_v2() {
+        let actor = Uuid::new_v4();
+        let manifest = expected_scope_manifest(actor);
+        let manifest_hash = canonical_json_sha256(&manifest).expect("manifest hash");
+        let job = worker_job(
+            "lca.build_snapshot",
+            "lca.build_snapshot.request.v2",
+            json!({
+                "job_id": Uuid::new_v4(),
+                "snapshot_id": Uuid::new_v4(),
+                "all_states": false,
+                "process_states": "100,101",
+                "include_user_id": actor,
+                "include_user_state_codes": "0",
+                "include_user_unassigned_only": true,
+                "include_user_review_free_only": true,
+                "data_scope": "public_plus_owner_draft",
+                "scope_manifest": manifest,
+                "scope_manifest_sha256": manifest_hash,
+                "lcia_method_factor_source": expected_method_factor_source_contract(),
+                "lcia_factor_coverage_contract": expected_factor_coverage_contract(),
+                "no_lcia": false,
+            }),
+        );
+        assert!(solver_worker_job_payload(&job).is_err());
+    }
+
+    #[test]
+    fn solve_v2_requires_valid_calculation_evidence_binding() {
+        let actor = Uuid::new_v4();
+        let scope_hash =
+            canonical_json_sha256(&expected_scope_manifest(actor)).expect("scope hash");
+        let evidence = complete_calculation_evidence(scope_hash);
+        let mut job = worker_job(
+            "lca.solve_one",
+            "lca.solve_one.request.v2",
+            json!({
+                "job_id": Uuid::new_v4(),
+                "snapshot_id": Uuid::new_v4(),
+                "rhs": [1.0],
+                "calculation_evidence_binding": evidence,
+            }),
+        );
+        job.requested_by = Some(actor);
+        assert!(solver_worker_job_payload(&job).is_ok());
+
+        let mut actor_drift = job.clone();
+        actor_drift.requested_by = Some(Uuid::new_v4());
+        assert!(solver_worker_job_payload(&actor_drift).is_err());
+
+        let mut missing = worker_job(
+            "lca.solve_one",
+            "lca.solve_one.request.v2",
+            json!({
+                "job_id": Uuid::new_v4(),
+                "snapshot_id": Uuid::new_v4(),
+                "rhs": [1.0],
+            }),
+        );
+        missing.requested_by = Some(actor);
+        assert!(solver_worker_job_payload(&missing).is_err());
     }
 
     #[test]

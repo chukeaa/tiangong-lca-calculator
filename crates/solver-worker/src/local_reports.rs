@@ -304,29 +304,17 @@ mod tests {
 
     #[test]
     fn retention_deletes_expired_reports_and_excess_oldest_files() {
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30 * 24 * 60 * 60);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_hours(720);
         let policy = LocalSnapshotReportPolicy {
             retention_days: 14,
             max_files: 2,
             ..LocalSnapshotReportPolicy::default()
         };
         let candidates = vec![
-            candidate(
-                "matrix-readiness-old.json",
-                now - Duration::from_secs(20 * 24 * 60 * 60),
-            ),
-            candidate(
-                "matrix-readiness-b.json",
-                now - Duration::from_secs(3 * 24 * 60 * 60),
-            ),
-            candidate(
-                "matrix-readiness-c.json",
-                now - Duration::from_secs(2 * 24 * 60 * 60),
-            ),
-            candidate(
-                "matrix-readiness-d.json",
-                now - Duration::from_secs(24 * 60 * 60),
-            ),
+            candidate("matrix-readiness-old.json", now - Duration::from_hours(480)),
+            candidate("matrix-readiness-b.json", now - Duration::from_hours(72)),
+            candidate("matrix-readiness-c.json", now - Duration::from_hours(48)),
+            candidate("matrix-readiness-d.json", now - Duration::from_hours(24)),
         ];
 
         let delete = select_report_files_to_delete(&candidates, policy, now);

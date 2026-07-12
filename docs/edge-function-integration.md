@@ -24,8 +24,9 @@ checkPaths:
   - crates/solver-worker/src/bin/review_submit_gate_runner.rs
   - crates/**
   - supabase/migrations/**
-lastReviewedAt: 2026-06-02
-lastReviewedCommit: 07c46d2f1c5a01b702caa5c7b52d5fd6480a2fa6
+lastReviewedAt: 2026-07-12
+lastReviewedCommit: 855d48a543ef3d2670ea933432296bb4fc2e2ffe
+lastReviewedNote: "Reviewed for the Edge/Worker public-plus-owner-draft v2 evidence handoff in Issue #116."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -138,9 +139,11 @@ Header 建议：
 3. 选择 `snapshot_id`：
    - 若请求显式给出，校验存在且可用。
    - 否则读 `lca_active_snapshots(scope='prod')`。
+   - `data_scope=public_plus_owner_draft` 时，Edge 必须使用 `lca.build_snapshot.request.v2` 创建独立 snapshot family：只传 public `state_code=100` 与当前 actor `state_code=0`，并携带 frozen scope manifest、method/factor source contract 和 factor-coverage contract。不能复用 legacy `100..199 + all owner states` snapshot。
 4. 构造求解负载：
    - `demand_mode=single`：构造 `rhs`（长度 = `process_count`，只在目标 index 赋值 `amount`）。
    - `demand_mode=all_unit`：构造 `solve_all_unit` payload（不在 Edge 侧生成整块 `rhs_batch`）。
+   - 对 `public_plus_owner_draft`，先从 `snapshot-index-v1.json.calculation_evidence` 读取并校验 `lca.calculation_evidence.v1`，再原样写入 `calculation_evidence_binding`；分别使用 `lca.solve_one.request.v2`、`lca.solve_all_unit.request.v2` 或 `lca.contribution_path.request.v2`。证据缺失、scope hash 漂移、method/factor source hash 非法、coverage 状态与 gap/artifact 不一致时返回冲突，不入队 v1 fallback。
 5. 生成：
    - `request_key`（标准化请求哈希）
    - `idempotency_key`（优先 header，否则退化为 `user_id + request_key`）
@@ -155,6 +158,8 @@ Header 建议：
 7. 返回 `queued`。`worker_jobs` 路径应额外返回 `workerJobId`，供任务中心和 operator 查询使用。
 
 worker 侧以 `worker_jobs` 为任务生命周期事实，并继续推进 domain/cache 表：`lca_result_cache` 从 `pending -> running -> ready`（或失败时 `failed`）。终态写回时会把 `lca_results`、`lca_result_cache`、`lca_latest_all_unit_results`、`lca_factorization_registry` 中可关联的 rows 回填到同一个 `worker_job_id`；optional `lca_jobs` 存在时才做 best-effort retained row 回填。
+
+`public_plus_owner_draft` 是 fail-closed 协议：Edge 负责生产和预校验证据，worker 仍会独立验证 payload、数据库行可见性、snapshot-index evidence 与 solve binding。worker 从 `public.lciamethods` 读取真实方法/因子并生成 source proof；前端静态 LCIA method cache 只负责 UI 展示，不能充当计算 source of truth。未匹配因子可以保留 trial 数值结果，但必须以 `incomplete_coverage_not_zero` 和 JSONL gap artifact 明确标识，不能被 UI 当成“完整的零影响”。
 
 LCIA result package 构建走同一个 `worker_jobs(worker_queue=solver)` 生命周期，但不是普通 `/lca/solve` 请求。Edge 的 data product manager command 应先通过数据库 command 解析权限、published-only eligibility 和默认 impact category，再 enqueue `job_kind=lcia_result.package_build` / `payload_schema_version=lcia_result.package_build.request.v1`。payload 使用数据库返回的 `buildId`、`requestedBy`、`coverageMode`、`inputManifest`、`inputManifestHash`、`eligibleInputCount`、`includedInputCount`、`lciaMethodSet` 和可选 `defaultImpactCategory`；worker 只消费已发布 `stateCode/state_code=100..199` 的 manifest 输入。worker 完成后用 service-role DB 连接调用 `public.cmd_lcia_result_package_mark_ready(...)` 固化 `lcia_result_packages` preview package；发布仍由 Edge manager command 调用数据库 publish RPC 完成。
 

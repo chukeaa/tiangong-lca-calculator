@@ -674,6 +674,7 @@ mod tests {
                 impact_name: "Global warming".to_owned(),
                 unit: "kg CO2-eq".to_owned(),
             }],
+            calculation_evidence: None,
         };
 
         let data = ModelSparseData {

@@ -214,6 +214,25 @@ impl ObjectStoreClient {
             .map(|result| result.object_url)
     }
 
+    /// Uploads deterministic LCIA uncharacterized-flow evidence for a snapshot.
+    pub async fn upload_snapshot_lcia_uncharacterized_evidence(
+        &self,
+        snapshot_id: Uuid,
+        bytes: Vec<u8>,
+    ) -> anyhow::Result<String> {
+        let key = if self.prefix.is_empty() {
+            format!("snapshots/{snapshot_id}/snapshot/lcia-uncharacterized-v1.jsonl")
+        } else {
+            format!(
+                "{}/snapshots/{snapshot_id}/snapshot/lcia-uncharacterized-v1.jsonl",
+                self.prefix
+            )
+        };
+        self.upload_object(&key, "application/x-ndjson", bytes, None)
+            .await
+            .map(|result| result.object_url)
+    }
+
     /// Uploads one package artifact object and returns object URL.
     pub async fn upload_package_artifact(
         &self,

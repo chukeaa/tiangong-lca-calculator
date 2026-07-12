@@ -8,6 +8,7 @@ use solver_core::ModelSparseData;
 use tempfile::Builder;
 use uuid::Uuid;
 
+use crate::calculation_evidence::LcaMethodFactorSourceSnapshot;
 use crate::compiled_graph::CompiledGraph;
 use crate::graph_types::{RequestRootProcess, SnapshotSelectionMode};
 
@@ -35,6 +36,15 @@ pub struct SnapshotBuildConfig {
     /// Optional `user_id` inclusion in process selection.
     #[serde(default)]
     pub include_user_id: Option<Uuid>,
+    /// Named versioned visibility scope, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_scope: Option<String>,
+    /// Canonical visibility manifest binding, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_manifest_sha256: Option<String>,
+    /// Exact database method/factor snapshot proof used by the build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lcia_method_factor_source: Option<LcaMethodFactorSourceSnapshot>,
     /// Snapshot selection mode (`filtered_library` / `request_roots_closure`).
     #[serde(default)]
     pub selection_mode: SnapshotSelectionMode,
@@ -462,6 +472,9 @@ mod tests {
         let config = SnapshotBuildConfig {
             process_states: crate::default_snapshot_process_states_arg(),
             include_user_id: None,
+            data_scope: None,
+            scope_manifest_sha256: None,
+            lcia_method_factor_source: None,
             selection_mode: SnapshotSelectionMode::FilteredLibrary,
             request_roots: Vec::new(),
             process_limit: 0,

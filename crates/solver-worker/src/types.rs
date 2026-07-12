@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::calculation_evidence::LcaCalculationEvidence;
 use crate::contribution_path::ContributionPathOptions;
 use crate::graph_types::RequestRootProcess;
 
@@ -35,6 +36,9 @@ pub enum JobPayload {
         /// Numeric print level.
         #[serde(default)]
         print_level: Option<f64>,
+        /// Exact method/factor and coverage binding for versioned scoped snapshots.
+        #[serde(default)]
+        calculation_evidence_binding: Option<LcaCalculationEvidence>,
     },
     /// Solve multiple RHS vectors.
     SolveBatch {
@@ -51,6 +55,9 @@ pub enum JobPayload {
         /// Numeric print level.
         #[serde(default)]
         print_level: Option<f64>,
+        /// Exact method/factor and coverage binding for versioned scoped snapshots.
+        #[serde(default)]
+        calculation_evidence_binding: Option<LcaCalculationEvidence>,
     },
     /// Solve unit demand for every process in current snapshot.
     SolveAllUnit {
@@ -71,6 +78,9 @@ pub enum JobPayload {
         /// Numeric print level.
         #[serde(default)]
         print_level: Option<f64>,
+        /// Exact method/factor and coverage binding for versioned scoped snapshots.
+        #[serde(default)]
+        calculation_evidence_binding: Option<LcaCalculationEvidence>,
     },
     /// Analyze one process + one impact into a contribution path result.
     AnalyzeContributionPath {
@@ -96,6 +106,9 @@ pub enum JobPayload {
         /// Numeric print level.
         #[serde(default)]
         print_level: Option<f64>,
+        /// Exact method/factor and coverage binding for versioned scoped snapshots.
+        #[serde(default)]
+        calculation_evidence_binding: Option<LcaCalculationEvidence>,
     },
     /// Mark cached factorization stale.
     InvalidateFactorization {
@@ -125,12 +138,39 @@ pub enum JobPayload {
         /// Active scope pointer to update after build.
         #[serde(default)]
         scope: Option<String>,
+        /// Whether all process states are requested.
+        #[serde(default)]
+        all_states: Option<bool>,
         /// Process state filter, e.g. `100` or `100,200`.
         #[serde(default)]
         process_states: Option<String>,
         /// Optional `user_id` inclusion.
         #[serde(default)]
         include_user_id: Option<Uuid>,
+        /// Owner-only state filter for the versioned private-incubation scope.
+        #[serde(default)]
+        include_user_state_codes: Option<String>,
+        /// Require owner drafts to have no team assignment.
+        #[serde(default)]
+        include_user_unassigned_only: Option<bool>,
+        /// Require owner drafts to have no active review assignment.
+        #[serde(default)]
+        include_user_review_free_only: Option<bool>,
+        /// Named versioned data scope.
+        #[serde(default)]
+        data_scope: Option<String>,
+        /// Frozen visibility predicate manifest.
+        #[serde(default)]
+        scope_manifest: Option<Value>,
+        /// Canonical SHA-256 of `scope_manifest`.
+        #[serde(default)]
+        scope_manifest_sha256: Option<String>,
+        /// Required database LCIA method/factor source contract.
+        #[serde(default)]
+        lcia_method_factor_source: Option<Value>,
+        /// Required factor-coverage evidence contract.
+        #[serde(default)]
+        lcia_factor_coverage_contract: Option<Value>,
         /// Explicit request roots (`<process_id, version>`) for request-scoped graph builds.
         #[serde(default)]
         request_roots: Option<Vec<RequestRootProcess>>,
