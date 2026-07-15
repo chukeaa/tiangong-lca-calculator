@@ -38,9 +38,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-07-12
-lastReviewedCommit: 9b66c8714fbbe15c7e25418ac963dc2c764ed8e1
-lastReviewedNote: "Added release-bundle, per-method coverage, worker-only projection, and exact diagnostic-scope proof for Issues #116/#118."
+lastReviewedAt: 2026-07-15
+lastReviewedCommit: 19c4ddbf18a8792c939341ba97ab8393112b7be3
+lastReviewedNote: "Reviewed bounded targetless allocation compatibility and successful-task replay proof for Issue #121."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml

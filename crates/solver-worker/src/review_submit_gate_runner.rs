@@ -888,6 +888,14 @@ fn build_review_process_record(
 ) -> ReviewProcessRecord {
     let exchange_items = process_exchange_items(&revision.json_ordered);
     let reference_exchange_id = reference_exchange_id(&revision.json_ordered);
+    let output_exchange_count = exchange_items
+        .iter()
+        .filter(|exchange| {
+            value_at_path(exchange, &["exchangeDirection"])
+                .and_then(value_to_trimmed_string)
+                .is_some_and(|direction| direction.eq_ignore_ascii_case("output"))
+        })
+        .count();
     let valid_output_internal_ids = exchange_items
         .iter()
         .filter(|exchange| {
@@ -911,6 +919,7 @@ fn build_review_process_record(
                     exchange,
                     reference_exchange_id.as_deref(),
                     &valid_output_internal_ids,
+                    output_exchange_count,
                 )
             })
             .collect(),
@@ -947,6 +956,7 @@ fn review_exchange_record(
     exchange_json: &Value,
     reference_exchange_id: Option<&str>,
     valid_output_internal_ids: &HashSet<String>,
+    output_exchange_count: usize,
 ) -> Option<ReviewExchangeRecord> {
     Some(ReviewExchangeRecord {
         exchange_id: exchange_id(exchange_json),
@@ -959,6 +969,7 @@ fn review_exchange_record(
             exchange_json,
             reference_exchange_id,
             valid_output_internal_ids,
+            output_exchange_count,
         ),
     })
 }
@@ -983,6 +994,7 @@ fn allocation_fraction(
     exchange_json: &Value,
     reference_exchange_id: Option<&str>,
     valid_output_internal_ids: &HashSet<String>,
+    output_exchange_count: usize,
 ) -> Option<String> {
     exchange_json.get("allocations")?;
     let Some(reference_exchange_id) = reference_exchange_id else {
@@ -992,11 +1004,18 @@ fn allocation_fraction(
         exchange_json,
         reference_exchange_id,
         valid_output_internal_ids,
+        output_exchange_count,
     ) {
-        Ok(crate::tidas_process_semantics::TidasAllocationResolution::Undeclared) => None,
-        Ok(crate::tidas_process_semantics::TidasAllocationResolution::Explicit { fraction }) => {
-            Some((fraction * 100.0).to_string())
-        }
+        Ok(
+            crate::tidas_process_semantics::TidasAllocationResolution::Undeclared
+            | crate::tidas_process_semantics::TidasAllocationResolution::LegacyEmptyUndeclared,
+        ) => None,
+        Ok(
+            crate::tidas_process_semantics::TidasAllocationResolution::Explicit { fraction }
+            | crate::tidas_process_semantics::TidasAllocationResolution::LegacyInferredReference {
+                fraction,
+            },
+        ) => Some((fraction * 100.0).to_string()),
         Ok(crate::tidas_process_semantics::TidasAllocationResolution::SparseZero) => {
             Some("0".to_owned())
         }
@@ -1161,6 +1180,102 @@ mod tests {
             record.exchanges[0].allocation_fraction.as_deref(),
             Some("100")
         );
+    }
+
+    #[test]
+    fn build_review_process_record_projects_safe_legacy_allocation_fallbacks() {
+        let reference_flow = Uuid::new_v4();
+        let input_flow = Uuid::new_v4();
+        let revision = ProcessRevision {
+            process_id: Uuid::new_v4(),
+            process_version: "01.00.000".to_owned(),
+            state_code: Some(100),
+            json_ordered: json!({
+                "processDataSet": {
+                    "processInformation": {
+                        "quantitativeReference": { "referenceToReferenceFlow": "1" }
+                    },
+                    "exchanges": {
+                        "exchange": [
+                            {
+                                "@dataSetInternalID": "1",
+                                "referenceToFlowDataSet": { "@refObjectId": reference_flow },
+                                "exchangeDirection": "Output",
+                                "resultingAmount": "1",
+                                "allocations": { "allocation": {} }
+                            },
+                            {
+                                "@dataSetInternalID": "2",
+                                "referenceToFlowDataSet": { "@refObjectId": input_flow },
+                                "exchangeDirection": "Input",
+                                "resultingAmount": "5",
+                                "allocations": {
+                                    "allocation": { "@allocatedFraction": "100%" }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }),
+        };
+
+        let record = build_review_process_record(&revision, Some(0));
+        assert_eq!(record.exchanges[0].allocation_fraction, None);
+        assert_eq!(
+            record.exchanges[1].allocation_fraction.as_deref(),
+            Some("100")
+        );
+    }
+
+    #[test]
+    fn build_review_process_record_rejects_ambiguous_targetless_allocation() {
+        let reference_flow = Uuid::new_v4();
+        let coproduct_flow = Uuid::new_v4();
+        let input_flow = Uuid::new_v4();
+        let revision = ProcessRevision {
+            process_id: Uuid::new_v4(),
+            process_version: "01.00.000".to_owned(),
+            state_code: Some(100),
+            json_ordered: json!({
+                "processDataSet": {
+                    "processInformation": {
+                        "quantitativeReference": { "referenceToReferenceFlow": "1" }
+                    },
+                    "exchanges": {
+                        "exchange": [
+                            {
+                                "@dataSetInternalID": "1",
+                                "referenceToFlowDataSet": { "@refObjectId": reference_flow },
+                                "exchangeDirection": "Output",
+                                "resultingAmount": "1"
+                            },
+                            {
+                                "referenceToFlowDataSet": { "@refObjectId": coproduct_flow },
+                                "exchangeDirection": "Output",
+                                "resultingAmount": "1"
+                            },
+                            {
+                                "@dataSetInternalID": "3",
+                                "referenceToFlowDataSet": { "@refObjectId": input_flow },
+                                "exchangeDirection": "Input",
+                                "resultingAmount": "5",
+                                "allocations": {
+                                    "allocation": { "@allocatedFraction": "100" }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }),
+        };
+
+        let record = build_review_process_record(&revision, Some(0));
+        let allocation = record.exchanges[2]
+            .allocation_fraction
+            .as_deref()
+            .expect("invalid allocation projection");
+        assert!(allocation.starts_with("invalid:"));
+        assert!(allocation.contains("exactly one Output"));
     }
 
     #[test]

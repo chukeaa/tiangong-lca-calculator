@@ -7,7 +7,7 @@ use anyhow::{Context, bail};
 use serde_json::Value;
 
 /// Versioned TIDAS process semantics applied by worker calculations.
-pub const TIDAS_PROCESS_SEMANTICS_VERSION: &str = "tidas-quantitative-reference-v1";
+pub const TIDAS_PROCESS_SEMANTICS_VERSION: &str = "tidas-quantitative-reference-v2";
 
 // TIDAS `Perc` permits at most three decimal places. Allow a one-unit difference
 // in the least-significant percentage digit when checking a closed allocation
@@ -19,8 +19,12 @@ const ALLOCATION_SUM_TOLERANCE: f64 = 0.000_010_000_001;
 pub enum TidasAllocationResolution {
     /// The exchange has no `allocations` container.
     Undeclared,
+    /// A legacy scalar `allocation: {}` placeholder is treated as undeclared.
+    LegacyEmptyUndeclared,
     /// The allocation vector explicitly contains the quantitative reference.
     Explicit { fraction: f64 },
+    /// A single targetless full allocation was safely inferred for the only output.
+    LegacyInferredReference { fraction: f64 },
     /// The closed sparse vector omits the quantitative reference, implying zero.
     SparseZero,
 }
@@ -31,11 +35,15 @@ pub enum TidasAllocationResolution {
 /// are interpreted as percentages and divided by 100. A declared allocation is
 /// accepted only when its object/array is non-empty, every target is a unique
 /// known output, every fraction is finite and within 0..=100, and the complete
-/// vector sums to 100% within the three-decimal `Perc` tolerance.
+/// vector sums to 100% within the three-decimal `Perc` tolerance. Two bounded
+/// legacy shapes are normalized: a scalar empty object is undeclared, and one
+/// targetless full allocation is attributed to the quantitative reference only
+/// when the Process has exactly one Output and that Output is the reference.
 pub fn resolve_tidas_exchange_allocation<S: BuildHasher>(
     exchange: &Value,
     reference_internal_id: &str,
     valid_output_internal_ids: &HashSet<String, S>,
+    output_exchange_count: usize,
 ) -> anyhow::Result<TidasAllocationResolution> {
     let reference_internal_id = reference_internal_id.trim();
     if reference_internal_id.is_empty() {
@@ -52,12 +60,42 @@ pub fn resolve_tidas_exchange_allocation<S: BuildHasher>(
         .get("allocation")
         .context("allocations.allocation is missing")?;
 
+    if allocation
+        .as_object()
+        .is_some_and(serde_json::Map::is_empty)
+    {
+        return Ok(TidasAllocationResolution::LegacyEmptyUndeclared);
+    }
+
     let entries = match allocation {
         Value::Object(_) => vec![allocation],
         Value::Array(entries) if !entries.is_empty() => entries.iter().collect(),
         Value::Array(_) => bail!("allocations.allocation must not be an empty array"),
         _ => bail!("allocations.allocation must be an object or array"),
     };
+
+    if entries.len() == 1 {
+        let entry = entries[0]
+            .as_object()
+            .context("allocations.allocation[0] must be an object")?;
+        if !entry.contains_key("@internalReferenceToCoProduct") {
+            if output_exchange_count != 1
+                || valid_output_internal_ids.len() != 1
+                || !valid_output_internal_ids.contains(reference_internal_id)
+            {
+                bail!(
+                    "targetless allocation can only be inferred when the Process has exactly one Output and it is the quantitative reference"
+                );
+            }
+            let raw_fraction = entry.get("@allocatedFraction").context(
+                "allocations.allocation[0].@allocatedFraction is missing for targetless allocation",
+            )?;
+            let fraction = parse_legacy_targetless_full_fraction(raw_fraction).context(
+                "invalid allocations.allocation[0].@allocatedFraction for targetless allocation",
+            )?;
+            return Ok(TidasAllocationResolution::LegacyInferredReference { fraction });
+        }
+    }
 
     let mut seen_targets = HashSet::with_capacity(entries.len());
     let mut selected_fraction = None;
@@ -153,6 +191,18 @@ fn parse_tidas_perc(value: &Value) -> anyhow::Result<f64> {
     Ok(percentage / 100.0)
 }
 
+fn parse_legacy_targetless_full_fraction(value: &Value) -> anyhow::Result<f64> {
+    if value.as_str().is_some_and(|text| text.trim() == "100%") {
+        return Ok(1.0);
+    }
+
+    let fraction = parse_tidas_perc(value)?;
+    if fraction.to_bits() != 1.0_f64.to_bits() {
+        bail!("targetless allocation fraction must be exactly 100%");
+    }
+    Ok(1.0)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -161,11 +211,25 @@ mod tests {
 
     use super::{
         TIDAS_PROCESS_SEMANTICS_VERSION, TidasAllocationResolution,
-        preferred_calculation_amount_value, resolve_tidas_exchange_allocation,
+        preferred_calculation_amount_value,
+        resolve_tidas_exchange_allocation as resolve_tidas_exchange_allocation_with_count,
     };
 
     fn outputs(ids: &[&str]) -> HashSet<String> {
         ids.iter().map(|id| (*id).to_owned()).collect()
+    }
+
+    fn resolve_tidas_exchange_allocation(
+        exchange: &Value,
+        reference_internal_id: &str,
+        valid_output_internal_ids: &HashSet<String>,
+    ) -> anyhow::Result<TidasAllocationResolution> {
+        resolve_tidas_exchange_allocation_with_count(
+            exchange,
+            reference_internal_id,
+            valid_output_internal_ids,
+            valid_output_internal_ids.len(),
+        )
     }
 
     fn assert_fraction(resolution: TidasAllocationResolution, expected: f64) {
@@ -179,7 +243,7 @@ mod tests {
     fn semantics_version_is_stable() {
         assert_eq!(
             TIDAS_PROCESS_SEMANTICS_VERSION,
-            "tidas-quantitative-reference-v1"
+            "tidas-quantitative-reference-v2"
         );
     }
 
@@ -188,6 +252,125 @@ mod tests {
         let resolution = resolve_tidas_exchange_allocation(&json!({}), "1", &outputs(&["1"]))
             .expect("resolve undeclared");
         assert_eq!(resolution, TidasAllocationResolution::Undeclared);
+    }
+
+    #[test]
+    fn scalar_empty_allocation_is_legacy_undeclared() {
+        let resolution = resolve_tidas_exchange_allocation(
+            &json!({ "allocations": { "allocation": {} } }),
+            "1",
+            &outputs(&["1"]),
+        )
+        .expect("resolve legacy empty placeholder");
+        assert_eq!(resolution, TidasAllocationResolution::LegacyEmptyUndeclared);
+    }
+
+    #[test]
+    fn targetless_full_allocation_is_inferred_for_the_only_reference_output() {
+        for fraction in [json!("100"), json!("100.000"), json!(100), json!("100%")] {
+            let exchange = json!({
+                "allocations": {
+                    "allocation": { "@allocatedFraction": fraction }
+                }
+            });
+            let resolution = resolve_tidas_exchange_allocation(&exchange, "1", &outputs(&["1"]))
+                .expect("infer targetless full allocation");
+            let TidasAllocationResolution::LegacyInferredReference { fraction } = resolution else {
+                panic!("expected legacy inferred allocation, got {resolution:?}");
+            };
+            assert!((fraction - 1.0).abs() <= f64::EPSILON);
+        }
+    }
+
+    #[test]
+    fn one_element_targetless_array_is_inferred_when_unambiguous() {
+        let exchange = json!({
+            "allocations": {
+                "allocation": [{ "@allocatedFraction": "100" }]
+            }
+        });
+        let resolution = resolve_tidas_exchange_allocation(&exchange, "1", &outputs(&["1"]))
+            .expect("infer one targetless array entry");
+        assert_eq!(
+            resolution,
+            TidasAllocationResolution::LegacyInferredReference { fraction: 1.0 }
+        );
+    }
+
+    #[test]
+    fn targetless_allocation_requires_exactly_one_physical_reference_output() {
+        let exchange = json!({
+            "allocations": {
+                "allocation": { "@allocatedFraction": "100" }
+            }
+        });
+        let valid_outputs = outputs(&["1"]);
+
+        for output_exchange_count in [0, 2] {
+            let error = resolve_tidas_exchange_allocation_with_count(
+                &exchange,
+                "1",
+                &valid_outputs,
+                output_exchange_count,
+            )
+            .expect_err("reject non-single physical output");
+            assert!(error.to_string().contains("exactly one Output"));
+        }
+
+        let error = resolve_tidas_exchange_allocation_with_count(&exchange, "2", &valid_outputs, 1)
+            .expect_err("reject unique output that is not the reference");
+        assert!(error.to_string().contains("quantitative reference"));
+    }
+
+    #[test]
+    fn targetless_non_full_or_malformed_allocations_are_rejected() {
+        for fraction in [
+            Some(json!("0")),
+            Some(json!("1.5")),
+            Some(json!("60")),
+            Some(json!("94%")),
+            Some(json!("99.999")),
+            Some(json!("")),
+            None,
+        ] {
+            let mut entry = serde_json::Map::new();
+            if let Some(fraction) = fraction {
+                entry.insert("@allocatedFraction".to_owned(), fraction);
+            } else {
+                entry.insert("legacyNote".to_owned(), json!(true));
+            }
+            let exchange = json!({
+                "allocations": {
+                    "allocation": Value::Object(entry)
+                }
+            });
+            assert!(resolve_tidas_exchange_allocation(&exchange, "1", &outputs(&["1"])).is_err());
+        }
+    }
+
+    #[test]
+    fn targetless_entries_remain_invalid_for_multiple_outputs_or_entries() {
+        let multiple_outputs = json!({
+            "allocations": {
+                "allocation": { "@allocatedFraction": "100" }
+            }
+        });
+        assert!(
+            resolve_tidas_exchange_allocation(&multiple_outputs, "1", &outputs(&["1", "2"]),)
+                .is_err()
+        );
+
+        let multiple_entries = json!({
+            "allocations": {
+                "allocation": [
+                    { "@allocatedFraction": "60" },
+                    { "@allocatedFraction": "40" }
+                ]
+            }
+        });
+        assert!(
+            resolve_tidas_exchange_allocation(&multiple_entries, "1", &outputs(&["1"])).is_err()
+        );
     }
 
     #[test]
@@ -406,9 +589,21 @@ mod tests {
         let cases = [
             json!({ "allocations": {} }),
             json!({ "allocations": { "allocation": "100" } }),
+            json!({ "allocations": { "allocation": [{}] } }),
             json!({
                 "allocations": {
-                    "allocation": { "@allocatedFraction": "100" }
+                    "allocation": {
+                        "@internalReferenceToCoProduct": null,
+                        "@allocatedFraction": "100"
+                    }
+                }
+            }),
+            json!({
+                "allocations": {
+                    "allocation": {
+                        "@internalReferenceToCoProduct": "",
+                        "@allocatedFraction": "100"
+                    }
                 }
             }),
             json!({

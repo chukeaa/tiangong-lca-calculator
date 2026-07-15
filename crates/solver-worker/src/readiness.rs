@@ -160,6 +160,10 @@ pub struct GraphReadinessMetrics {
     pub reference_invalid_count: i64,
     pub allocation_fraction_missing_count: i64,
     pub allocation_fraction_invalid_count: i64,
+    #[serde(default)]
+    pub legacy_empty_allocation_as_undeclared_count: i64,
+    #[serde(default)]
+    pub legacy_single_output_target_inferred_count: i64,
     pub singular_risk_level: String,
     pub m_zero_diagonal_count: i64,
     pub m_min_abs_diagonal: f64,
@@ -300,6 +304,14 @@ pub fn verify_matrix_readiness(input: &MatrixReadinessInput) -> MatrixReadinessR
                 .coverage
                 .allocation
                 .allocation_fraction_invalid_count,
+            legacy_empty_allocation_as_undeclared_count: input
+                .coverage
+                .allocation
+                .legacy_empty_allocation_as_undeclared_count,
+            legacy_single_output_target_inferred_count: input
+                .coverage
+                .allocation
+                .legacy_single_output_target_inferred_count,
             singular_risk_level: input.coverage.singular_risk.risk_level.clone(),
             m_zero_diagonal_count: input.coverage.singular_risk.m_zero_diagonal_count,
             m_min_abs_diagonal: input.coverage.singular_risk.m_min_abs_diagonal,
@@ -1059,6 +1071,14 @@ mod tests {
         let mut input = fixture_input(snapshot_id, provider_id, consumer_id, flow_id, true);
         input.coverage.allocation.allocation_fraction_missing_count = 2;
         input.coverage.allocation.allocation_fraction_present_pct = 0.0;
+        input
+            .coverage
+            .allocation
+            .legacy_empty_allocation_as_undeclared_count = 2;
+        input
+            .coverage
+            .allocation
+            .legacy_single_output_target_inferred_count = 1;
 
         let report = verify_matrix_readiness(&input);
 
@@ -1076,6 +1096,20 @@ mod tests {
                 .graph_readiness
                 .allocation_fraction_missing_count,
             2
+        );
+        assert_eq!(
+            report
+                .metrics
+                .graph_readiness
+                .legacy_empty_allocation_as_undeclared_count,
+            2
+        );
+        assert_eq!(
+            report
+                .metrics
+                .graph_readiness
+                .legacy_single_output_target_inferred_count,
+            1
         );
     }
 
@@ -1168,6 +1202,8 @@ mod tests {
                     allocation_fraction_present_pct: 100.0,
                     allocation_fraction_missing_count: 0,
                     allocation_fraction_invalid_count: 0,
+                    legacy_empty_allocation_as_undeclared_count: 0,
+                    legacy_single_output_target_inferred_count: 0,
                 },
                 singular_risk: SnapshotSingularRisk {
                     risk_level: "low".to_owned(),

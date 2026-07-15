@@ -1642,6 +1642,8 @@ mod tests {
                 allocation_fraction_present_pct: 100.0,
                 allocation_fraction_missing_count: 0,
                 allocation_fraction_invalid_count: 0,
+                legacy_empty_allocation_as_undeclared_count: 0,
+                legacy_single_output_target_inferred_count: 0,
             },
             singular_risk: SnapshotSingularRisk {
                 risk_level: "low".to_owned(),

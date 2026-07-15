@@ -246,6 +246,10 @@ pub struct SnapshotAllocationCoverage {
     pub allocation_fraction_present_pct: f64,
     pub allocation_fraction_missing_count: i64,
     pub allocation_fraction_invalid_count: i64,
+    #[serde(default)]
+    pub legacy_empty_allocation_as_undeclared_count: i64,
+    #[serde(default)]
+    pub legacy_single_output_target_inferred_count: i64,
 }
 
 /// Singular risk diagnostics.
@@ -490,7 +494,7 @@ mod tests {
             provider_candidate_eligibility_mode: "reference_output_only".to_owned(),
             reference_normalization_mode: "strict".to_owned(),
             allocation_fraction_mode: "strict".to_owned(),
-            allocation_semantics_version: "tidas-quantitative-reference-v1".to_owned(),
+            allocation_semantics_version: "tidas-quantitative-reference-v2".to_owned(),
             biosphere_sign_mode: "gross".to_owned(),
             self_loop_cutoff: 0.999_999,
             singular_eps: 1e-12,
@@ -548,6 +552,8 @@ mod tests {
                 allocation_fraction_present_pct: 100.0,
                 allocation_fraction_missing_count: 0,
                 allocation_fraction_invalid_count: 0,
+                legacy_empty_allocation_as_undeclared_count: 2,
+                legacy_single_output_target_inferred_count: 1,
             },
             singular_risk: SnapshotSingularRisk {
                 risk_level: "low".to_owned(),
@@ -638,7 +644,11 @@ mod tests {
             technosphere_edges: Vec::new(),
             biosphere_edges: Vec::new(),
             reference_stats: CompiledReferenceStats::default(),
-            allocation_stats: CompiledAllocationStats::default(),
+            allocation_stats: CompiledAllocationStats {
+                legacy_empty_allocation_as_undeclared_count: 2,
+                legacy_single_output_target_inferred_count: 1,
+                ..CompiledAllocationStats::default()
+            },
             matching_stats: CompiledMatchingStats::default(),
         };
         let encoded_with_graph = encode_snapshot_artifact_with_graph(
@@ -655,6 +665,18 @@ mod tests {
         assert_eq!(decoded_graph.flows.len(), 1);
         assert_eq!(decoded_graph.flows[0].flow_id, product_flow_id);
         assert_eq!(decoded_graph.flows[0].kind, CompiledFlowKind::Product);
+        assert_eq!(
+            decoded_graph
+                .allocation_stats
+                .legacy_empty_allocation_as_undeclared_count,
+            2
+        );
+        assert_eq!(
+            decoded_graph
+                .allocation_stats
+                .legacy_single_output_target_inferred_count,
+            1
+        );
     }
 
     #[test]
@@ -680,6 +702,20 @@ mod tests {
             SnapshotSelectionMode::FilteredLibrary
         );
         assert!(parsed.request_roots.is_empty());
+    }
+
+    #[test]
+    fn allocation_coverage_defaults_legacy_fallback_counts_to_zero() {
+        let parsed: SnapshotAllocationCoverage = serde_json::from_value(json!({
+            "exchange_total": 4,
+            "allocation_fraction_present_pct": 50.0,
+            "allocation_fraction_missing_count": 2,
+            "allocation_fraction_invalid_count": 0
+        }))
+        .expect("parse legacy allocation coverage");
+
+        assert_eq!(parsed.legacy_empty_allocation_as_undeclared_count, 0);
+        assert_eq!(parsed.legacy_single_output_target_inferred_count, 0);
     }
 
     fn write_and_open_hdf5(bytes: &[u8]) -> File {
