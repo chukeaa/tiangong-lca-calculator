@@ -388,7 +388,11 @@ fn check_exchanges(
             }
         }
 
-        if !reference_is_valid(process, input.policy.zero_diagonal_epsilon) {
+        if !reference_is_valid(
+            process,
+            input.compiled_graph.as_ref(),
+            input.policy.zero_diagonal_epsilon,
+        ) {
             invalid_references.push(process_detail(process));
         }
     }
@@ -815,18 +819,34 @@ fn run_target_probe(
     }
 }
 
-fn reference_is_valid(process: &ReviewProcessRecord, epsilon: f64) -> bool {
+fn reference_is_valid(
+    process: &ReviewProcessRecord,
+    compiled_graph: Option<&CompiledGraph>,
+    epsilon: f64,
+) -> bool {
     let Some(reference_exchange_id) = process.reference_exchange_id.as_deref() else {
         return false;
     };
-    let Some(exchange) = process
+    let mut matching_exchanges = process
         .exchanges
         .iter()
-        .find(|exchange| exchange.exchange_id.as_deref() == Some(reference_exchange_id))
-    else {
+        .filter(|exchange| exchange.exchange_id.as_deref() == Some(reference_exchange_id));
+    let Some(exchange) = matching_exchanges.next() else {
         return false;
     };
-    parse_numeric_text(exchange.amount.as_deref()).is_ok_and(|amount| amount.abs() > epsilon)
+    if matching_exchanges.next().is_some()
+        || normalized_direction(&exchange.direction).as_deref() != Some("output")
+        || !parse_numeric_text(exchange.amount.as_deref()).is_ok_and(|amount| amount > epsilon)
+    {
+        return false;
+    }
+
+    compiled_graph.is_some_and(|graph| {
+        graph
+            .flows
+            .iter()
+            .any(|flow| flow.flow_id == exchange.flow_id && flow.kind == CompiledFlowKind::Product)
+    })
 }
 
 fn parse_numeric_text(value: Option<&str>) -> Result<f64, ()> {
@@ -1206,6 +1226,85 @@ mod tests {
     }
 
     #[test]
+    fn blocks_duplicate_quantitative_reference_exchange_ids() {
+        let mut input = clean_input();
+        let duplicate_reference = input.process_records[1].exchanges[0].clone();
+        input.process_records[1].exchanges.push(duplicate_reference);
+
+        let report = verify_review_submit_gate(&input);
+
+        assert!(has_blocker(&report, "missing_or_zero_reference"));
+        assert!(!report.metrics.probe.factorization_checked);
+    }
+
+    #[test]
+    fn blocks_quantitative_reference_that_is_not_an_output() {
+        let mut input = clean_input();
+        input.process_records[1].exchanges[0].direction = "Input".to_owned();
+
+        let report = verify_review_submit_gate(&input);
+
+        assert!(has_blocker(&report, "missing_or_zero_reference"));
+        assert!(!report.metrics.probe.factorization_checked);
+    }
+
+    #[test]
+    fn blocks_quantitative_reference_to_non_product_flow() {
+        let mut input = clean_input();
+        let elementary_flow_id = input
+            .compiled_graph
+            .as_ref()
+            .and_then(|graph| {
+                graph
+                    .flows
+                    .iter()
+                    .find(|flow| flow.kind == CompiledFlowKind::Elementary)
+            })
+            .map(|flow| flow.flow_id)
+            .expect("elementary flow fixture");
+        input.process_records[1].exchanges[0].flow_id = elementary_flow_id;
+
+        let report = verify_review_submit_gate(&input);
+
+        assert!(has_blocker(&report, "missing_or_zero_reference"));
+        assert!(!report.metrics.probe.factorization_checked);
+    }
+
+    #[test]
+    fn blocks_non_positive_quantitative_reference_amount() {
+        let mut input = clean_input();
+        input.process_records[1].exchanges[0].amount = Some("-1.0".to_owned());
+
+        let report = verify_review_submit_gate(&input);
+
+        assert!(has_blocker(&report, "missing_or_zero_reference"));
+        assert!(!report.metrics.probe.factorization_checked);
+    }
+
+    #[test]
+    fn blocks_quantitative_reference_without_compiled_flow_metadata() {
+        let mut input = clean_input();
+        input.compiled_graph = None;
+
+        let report = verify_review_submit_gate(&input);
+
+        assert!(has_blocker(&report, "missing_or_zero_reference"));
+        assert!(!report.metrics.probe.factorization_checked);
+    }
+
+    #[test]
+    fn blocks_invalid_allocation_resolution_sentinel() {
+        let mut input = clean_input();
+        input.process_records[1].exchanges[1].allocation_fraction =
+            Some("invalid:target_missing".to_owned());
+
+        let report = verify_review_submit_gate(&input);
+
+        assert!(has_blocker(&report, "invalid_allocation_fraction"));
+        assert!(!report.metrics.probe.factorization_checked);
+    }
+
+    #[test]
     fn blocks_duplicate_exchange_fingerprint_and_service_loop() {
         let mut input = clean_input();
         let product_flow = input.process_records[0].exchanges[0].flow_id;
@@ -1543,6 +1642,8 @@ mod tests {
                 allocation_fraction_present_pct: 100.0,
                 allocation_fraction_missing_count: 0,
                 allocation_fraction_invalid_count: 0,
+                legacy_empty_allocation_as_undeclared_count: 0,
+                legacy_single_output_target_inferred_count: 0,
             },
             singular_risk: SnapshotSingularRisk {
                 risk_level: "low".to_owned(),

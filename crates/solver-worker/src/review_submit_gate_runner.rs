@@ -6,6 +6,7 @@
     clippy::too_many_lines
 )]
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -22,8 +23,9 @@ use crate::{
     pgbouncer_sqlx::{self as sqlx, PgPool, Row},
     readiness::{FindingSeverity, ReadinessFinding},
     review_submit_gate::{
-        ReviewExchangeRecord, ReviewProcessRecord, ReviewSubmitGateInput, ReviewSubmitGatePolicy,
-        ReviewSubmitGateReport, ReviewSubmitGateStatus, verify_review_submit_gate,
+        ReviewExchangeRecord, ReviewProcessRecord, ReviewSubmitGateInput, ReviewSubmitGateMetrics,
+        ReviewSubmitGatePolicy, ReviewSubmitGateReport, ReviewSubmitGateStatus,
+        verify_review_submit_gate,
     },
     snapshot_index::SnapshotIndexDocument,
     worker_jobs::{
@@ -372,6 +374,27 @@ async fn execute_claimed_gate_run(
         .revision_checksum
         .clone()
         .unwrap_or_else(|| actual_revision_checksum.clone());
+    let mut process_record = build_review_process_record(&revision, None);
+    if let Some(report) = allocation_preflight_report(
+        run,
+        &process_record,
+        &expected_revision_checksum,
+        &actual_revision_checksum,
+    ) {
+        let blocking_reasons = blocking_reasons_for_report(&report)?;
+        let calculator_report = serde_json::to_value(&report)?;
+        return Ok(GateExecutionOutcome {
+            status: RecordedGateStatus::Blocked,
+            calculator_report,
+            blocking_reasons,
+            audit: json!({
+                "runner": RUNNER_NAME,
+                "phase": "process_allocation_preflight",
+                "blocker_count": report.blockers.len()
+            }),
+            authoritative_revision_checksum: Some(actual_revision_checksum),
+        });
+    }
     let request_roots = vec![RequestRootProcess::new(
         run.dataset_id,
         run.dataset_version.clone(),
@@ -419,7 +442,7 @@ async fn execute_claimed_gate_run(
         .context("failed to fetch review-submit gate snapshot index")?;
     let target_process_idx =
         find_process_index(&snapshot_index, run.dataset_id, &run.dataset_version);
-    let process_record = build_review_process_record(&revision, target_process_idx);
+    process_record.process_idx = target_process_idx;
 
     let mut policy = ReviewSubmitGatePolicy::default();
     policy.policy_profile.clone_from(&run.policy_profile);
@@ -432,7 +455,7 @@ async fn execute_claimed_gate_run(
         config: Some(artifact.config),
         coverage: artifact.coverage,
         payload: artifact.payload,
-        compiled_graph: None,
+        compiled_graph: artifact.compiled_graph,
         target_process_indices: target_process_idx.into_iter().collect(),
         process_records: vec![process_record],
         policy,
@@ -779,6 +802,72 @@ fn synthetic_blocker(code: &str, message: &str, details: Value) -> ReadinessFind
     }
 }
 
+fn allocation_preflight_report(
+    run: &ReviewSubmitGateRun,
+    process_record: &ReviewProcessRecord,
+    expected_revision_checksum: &str,
+    actual_revision_checksum: &str,
+) -> Option<ReviewSubmitGateReport> {
+    let invalid_allocations = process_record
+        .exchanges
+        .iter()
+        .filter(|exchange| {
+            exchange
+                .allocation_fraction
+                .as_deref()
+                .is_some_and(|fraction| fraction.starts_with("invalid:"))
+        })
+        .map(|exchange| {
+            json!({
+                "exchange_id": exchange.exchange_id,
+                "flow_id": exchange.flow_id,
+                "allocation_error": exchange.allocation_fraction
+            })
+        })
+        .collect::<Vec<_>>();
+    if invalid_allocations.is_empty() {
+        return None;
+    }
+
+    let mut policy = ReviewSubmitGatePolicy::default();
+    policy.policy_profile.clone_from(&run.policy_profile);
+    let mut metrics = ReviewSubmitGateMetrics::default();
+    metrics.revision.checksum_checked = true;
+    metrics.revision.checksum_matched = expected_revision_checksum == actual_revision_checksum;
+    metrics.process_scan.process_records_total = 1;
+    metrics.process_scan.invalid_allocation_fraction_count = invalid_allocations.len();
+    let mut blockers = vec![synthetic_blocker(
+        "invalid_allocation_fraction",
+        "review-submit scope contains invalid target-aware allocation fractions",
+        json!({
+            "invalid_allocation_fraction_count": invalid_allocations.len(),
+            "examples": invalid_allocations
+        }),
+    )];
+    if !metrics.revision.checksum_matched {
+        blockers.push(synthetic_blocker(
+            "revision_report_stale",
+            "review-submit gate input is not tied to the current dataset revision checksum",
+            json!({
+                "dataset_revision_id": run.dataset_id,
+                "expected_revision_checksum": expected_revision_checksum,
+                "actual_revision_checksum": actual_revision_checksum
+            }),
+        ));
+    }
+
+    Some(ReviewSubmitGateReport {
+        schema_version: REVIEW_SUBMIT_GATE_REPORT_SCHEMA_VERSION.to_owned(),
+        generated_at_utc: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        dataset_revision_id: Some(run.dataset_id),
+        snapshot_id: None,
+        status: ReviewSubmitGateStatus::Blocked,
+        policy,
+        metrics,
+        blockers,
+    })
+}
+
 fn find_process_index(
     snapshot_index: &SnapshotIndexDocument,
     process_id: Uuid,
@@ -797,16 +886,42 @@ fn build_review_process_record(
     revision: &ProcessRevision,
     process_idx: Option<i32>,
 ) -> ReviewProcessRecord {
+    let exchange_items = process_exchange_items(&revision.json_ordered);
+    let reference_exchange_id = reference_exchange_id(&revision.json_ordered);
+    let output_exchange_count = exchange_items
+        .iter()
+        .filter(|exchange| {
+            value_at_path(exchange, &["exchangeDirection"])
+                .and_then(value_to_trimmed_string)
+                .is_some_and(|direction| direction.eq_ignore_ascii_case("output"))
+        })
+        .count();
+    let valid_output_internal_ids = exchange_items
+        .iter()
+        .filter(|exchange| {
+            value_at_path(exchange, &["exchangeDirection"])
+                .and_then(value_to_trimmed_string)
+                .is_some_and(|direction| direction.eq_ignore_ascii_case("output"))
+        })
+        .filter_map(|exchange| exchange_id(exchange))
+        .collect::<HashSet<_>>();
     ReviewProcessRecord {
         process_idx,
         process_id: revision.process_id,
         process_version: revision.process_version.clone(),
         process_name: parse_process_name(&revision.json_ordered),
         state_code: revision.state_code,
-        reference_exchange_id: reference_exchange_id(&revision.json_ordered),
-        exchanges: process_exchange_items(&revision.json_ordered)
+        reference_exchange_id: reference_exchange_id.clone(),
+        exchanges: exchange_items
             .into_iter()
-            .filter_map(review_exchange_record)
+            .filter_map(|exchange| {
+                review_exchange_record(
+                    exchange,
+                    reference_exchange_id.as_deref(),
+                    &valid_output_internal_ids,
+                    output_exchange_count,
+                )
+            })
             .collect(),
     }
 }
@@ -837,7 +952,12 @@ fn process_exchange_items(process_json: &Value) -> Vec<&Value> {
     }
 }
 
-fn review_exchange_record(exchange_json: &Value) -> Option<ReviewExchangeRecord> {
+fn review_exchange_record(
+    exchange_json: &Value,
+    reference_exchange_id: Option<&str>,
+    valid_output_internal_ids: &HashSet<String>,
+    output_exchange_count: usize,
+) -> Option<ReviewExchangeRecord> {
     Some(ReviewExchangeRecord {
         exchange_id: exchange_id(exchange_json),
         flow_id: flow_id(exchange_json)?,
@@ -845,7 +965,12 @@ fn review_exchange_record(exchange_json: &Value) -> Option<ReviewExchangeRecord>
             .and_then(value_to_trimmed_string)
             .unwrap_or_default(),
         amount: exchange_amount(exchange_json),
-        allocation_fraction: allocation_fraction(exchange_json),
+        allocation_fraction: allocation_fraction(
+            exchange_json,
+            reference_exchange_id,
+            valid_output_internal_ids,
+            output_exchange_count,
+        ),
     })
 }
 
@@ -861,21 +986,40 @@ fn flow_id(exchange_json: &Value) -> Option<Uuid> {
 }
 
 fn exchange_amount(exchange_json: &Value) -> Option<String> {
-    ["meanAmount", "resultingAmount", "meanValue"]
-        .iter()
-        .find_map(|key| value_at_path(exchange_json, &[*key]).and_then(value_to_trimmed_string))
+    crate::tidas_process_semantics::preferred_calculation_amount_value(exchange_json)
+        .and_then(value_to_trimmed_string)
 }
 
-fn allocation_fraction(exchange_json: &Value) -> Option<String> {
-    let allocation = value_at_path(exchange_json, &["allocations", "allocation"])?;
-    match allocation {
-        Value::Array(items) => items.iter().find_map(|item| {
-            value_at_path(item, &["@allocatedFraction"]).and_then(value_to_trimmed_string)
-        }),
-        Value::Object(_) => {
-            value_at_path(allocation, &["@allocatedFraction"]).and_then(value_to_trimmed_string)
+fn allocation_fraction(
+    exchange_json: &Value,
+    reference_exchange_id: Option<&str>,
+    valid_output_internal_ids: &HashSet<String>,
+    output_exchange_count: usize,
+) -> Option<String> {
+    exchange_json.get("allocations")?;
+    let Some(reference_exchange_id) = reference_exchange_id else {
+        return Some("invalid:missing quantitative reference".to_owned());
+    };
+    match crate::tidas_process_semantics::resolve_tidas_exchange_allocation(
+        exchange_json,
+        reference_exchange_id,
+        valid_output_internal_ids,
+        output_exchange_count,
+    ) {
+        Ok(
+            crate::tidas_process_semantics::TidasAllocationResolution::Undeclared
+            | crate::tidas_process_semantics::TidasAllocationResolution::LegacyEmptyUndeclared,
+        ) => None,
+        Ok(
+            crate::tidas_process_semantics::TidasAllocationResolution::Explicit { fraction }
+            | crate::tidas_process_semantics::TidasAllocationResolution::LegacyInferredReference {
+                fraction,
+            },
+        ) => Some((fraction * 100.0).to_string()),
+        Ok(crate::tidas_process_semantics::TidasAllocationResolution::SparseZero) => {
+            Some("0".to_owned())
         }
-        _ => None,
+        Err(error) => Some(format!("invalid:{error}")),
     }
 }
 
@@ -954,7 +1098,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        GateExecutionOutcome, ProcessRevision, RecordedGateStatus, ReviewSubmitGateRun,
+        GateExecutionOutcome, ProcessRevision, RecordedGateStatus, ReviewExchangeRecord,
+        ReviewProcessRecord, ReviewSubmitGateRun, ReviewSubmitGateStatus,
         build_review_process_record, stable_json_sha256, worker_job_result_for_outcome,
     };
 
@@ -1010,7 +1155,10 @@ mod tests {
                             "exchangeDirection": "Output",
                             "meanAmount": "1.5",
                             "allocations": {
-                                "allocation": { "@allocatedFraction": "0.75" }
+                                "allocation": {
+                                    "@internalReferenceToCoProduct": "1",
+                                    "@allocatedFraction": "100"
+                                }
                             }
                         }
                     }
@@ -1030,8 +1178,225 @@ mod tests {
         assert_eq!(record.exchanges[0].amount.as_deref(), Some("1.5"));
         assert_eq!(
             record.exchanges[0].allocation_fraction.as_deref(),
-            Some("0.75")
+            Some("100")
         );
+    }
+
+    #[test]
+    fn build_review_process_record_projects_safe_legacy_allocation_fallbacks() {
+        let reference_flow = Uuid::new_v4();
+        let input_flow = Uuid::new_v4();
+        let revision = ProcessRevision {
+            process_id: Uuid::new_v4(),
+            process_version: "01.00.000".to_owned(),
+            state_code: Some(100),
+            json_ordered: json!({
+                "processDataSet": {
+                    "processInformation": {
+                        "quantitativeReference": { "referenceToReferenceFlow": "1" }
+                    },
+                    "exchanges": {
+                        "exchange": [
+                            {
+                                "@dataSetInternalID": "1",
+                                "referenceToFlowDataSet": { "@refObjectId": reference_flow },
+                                "exchangeDirection": "Output",
+                                "resultingAmount": "1",
+                                "allocations": { "allocation": {} }
+                            },
+                            {
+                                "@dataSetInternalID": "2",
+                                "referenceToFlowDataSet": { "@refObjectId": input_flow },
+                                "exchangeDirection": "Input",
+                                "resultingAmount": "5",
+                                "allocations": {
+                                    "allocation": { "@allocatedFraction": "100%" }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }),
+        };
+
+        let record = build_review_process_record(&revision, Some(0));
+        assert_eq!(record.exchanges[0].allocation_fraction, None);
+        assert_eq!(
+            record.exchanges[1].allocation_fraction.as_deref(),
+            Some("100")
+        );
+    }
+
+    #[test]
+    fn build_review_process_record_rejects_ambiguous_targetless_allocation() {
+        let reference_flow = Uuid::new_v4();
+        let coproduct_flow = Uuid::new_v4();
+        let input_flow = Uuid::new_v4();
+        let revision = ProcessRevision {
+            process_id: Uuid::new_v4(),
+            process_version: "01.00.000".to_owned(),
+            state_code: Some(100),
+            json_ordered: json!({
+                "processDataSet": {
+                    "processInformation": {
+                        "quantitativeReference": { "referenceToReferenceFlow": "1" }
+                    },
+                    "exchanges": {
+                        "exchange": [
+                            {
+                                "@dataSetInternalID": "1",
+                                "referenceToFlowDataSet": { "@refObjectId": reference_flow },
+                                "exchangeDirection": "Output",
+                                "resultingAmount": "1"
+                            },
+                            {
+                                "referenceToFlowDataSet": { "@refObjectId": coproduct_flow },
+                                "exchangeDirection": "Output",
+                                "resultingAmount": "1"
+                            },
+                            {
+                                "@dataSetInternalID": "3",
+                                "referenceToFlowDataSet": { "@refObjectId": input_flow },
+                                "exchangeDirection": "Input",
+                                "resultingAmount": "5",
+                                "allocations": {
+                                    "allocation": { "@allocatedFraction": "100" }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }),
+        };
+
+        let record = build_review_process_record(&revision, Some(0));
+        let allocation = record.exchanges[2]
+            .allocation_fraction
+            .as_deref()
+            .expect("invalid allocation projection");
+        assert!(allocation.starts_with("invalid:"));
+        assert!(allocation.contains("exactly one Output"));
+    }
+
+    #[test]
+    fn build_review_process_record_selects_targeted_allocation_and_sparse_zero() {
+        let flow_a = Uuid::new_v4();
+        let flow_b = Uuid::new_v4();
+        let input_flow = Uuid::new_v4();
+        let revision = ProcessRevision {
+            process_id: Uuid::new_v4(),
+            process_version: "01.00.000".to_owned(),
+            state_code: Some(100),
+            json_ordered: json!({
+                "processDataSet": {
+                    "processInformation": {
+                        "quantitativeReference": { "referenceToReferenceFlow": "2" }
+                    },
+                    "exchanges": {
+                        "exchange": [
+                            {
+                                "@dataSetInternalID": "1",
+                                "referenceToFlowDataSet": { "@refObjectId": flow_a },
+                                "exchangeDirection": "Output",
+                                "resultingAmount": "1"
+                            },
+                            {
+                                "@dataSetInternalID": "2",
+                                "referenceToFlowDataSet": { "@refObjectId": flow_b },
+                                "exchangeDirection": "Output",
+                                "resultingAmount": "1"
+                            },
+                            {
+                                "@dataSetInternalID": "3",
+                                "referenceToFlowDataSet": { "@refObjectId": input_flow },
+                                "exchangeDirection": "Input",
+                                "resultingAmount": "5",
+                                "allocations": {
+                                    "allocation": [
+                                        {
+                                            "@internalReferenceToCoProduct": "1",
+                                            "@allocatedFraction": "60"
+                                        },
+                                        {
+                                            "@internalReferenceToCoProduct": "2",
+                                            "@allocatedFraction": "40"
+                                        }
+                                    ]
+                                }
+                            },
+                            {
+                                "@dataSetInternalID": "4",
+                                "referenceToFlowDataSet": { "@refObjectId": input_flow },
+                                "exchangeDirection": "Input",
+                                "resultingAmount": "2",
+                                "allocations": {
+                                    "allocation": {
+                                        "@internalReferenceToCoProduct": "1",
+                                        "@allocatedFraction": "100"
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }),
+        };
+
+        let record = build_review_process_record(&revision, Some(4));
+
+        assert_eq!(
+            record.exchanges[2].allocation_fraction.as_deref(),
+            Some("40")
+        );
+        assert_eq!(
+            record.exchanges[3].allocation_fraction.as_deref(),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn allocation_preflight_blocks_invalid_declared_vector_before_snapshot_build() {
+        let flow_id = Uuid::new_v4();
+        let run = ReviewSubmitGateRun {
+            id: Uuid::new_v4(),
+            dataset_table: "processes".to_owned(),
+            dataset_id: Uuid::new_v4(),
+            dataset_version: "01.00.000".to_owned(),
+            revision_checksum: Some("a".repeat(64)),
+            policy_profile: super::REVIEW_SUBMIT_GATE_POLICY_PROFILE.to_owned(),
+            report_schema_version: super::REVIEW_SUBMIT_GATE_REPORT_SCHEMA_VERSION.to_owned(),
+            requested_by: Uuid::new_v4(),
+        };
+        let record = ReviewProcessRecord {
+            process_idx: None,
+            process_id: run.dataset_id,
+            process_version: run.dataset_version.clone(),
+            process_name: None,
+            state_code: Some(0),
+            reference_exchange_id: Some("1".to_owned()),
+            exchanges: vec![ReviewExchangeRecord {
+                exchange_id: Some("2".to_owned()),
+                flow_id,
+                direction: "Input".to_owned(),
+                amount: Some("1".to_owned()),
+                allocation_fraction: Some("invalid:duplicate allocation target".to_owned()),
+            }],
+        };
+
+        let report =
+            super::allocation_preflight_report(&run, &record, &"a".repeat(64), &"a".repeat(64))
+                .expect("preflight blocker");
+
+        assert_eq!(report.status, ReviewSubmitGateStatus::Blocked);
+        assert_eq!(
+            report
+                .metrics
+                .process_scan
+                .invalid_allocation_fraction_count,
+            1
+        );
+        assert_eq!(report.blockers[0].code, "invalid_allocation_fraction");
+        assert!(report.snapshot_id.is_none());
     }
 
     #[test]

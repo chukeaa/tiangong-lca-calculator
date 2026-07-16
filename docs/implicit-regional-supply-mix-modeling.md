@@ -271,15 +271,28 @@ fallback `1.0` 用于 annual volume 缺失、非法、非有限或非正的 prov
 
 ## Allocation Fraction 与 Provider Eligibility 的边界
 
-`allocation_fraction` 用于 exchange amount attribution：
+一个完整 TIDAS Process 只代表其 `quantitativeReference.referenceToReferenceFlow`，并且在 snapshot 中只形成一个 process index / 矩阵列。Process 中的其他 co-product outputs 不形成派生列，也不获得 provider eligibility。如果 co-product `B` 需要独立参与计算或供应其他 Process，上游必须提供另一个完整、独立、以 `B` 为 quantitative reference 的 TIDAS Process。
+
+`allocation_fraction` 用于当前 quantitative reference 的 exchange amount attribution：
 
 ```text
-normalized exchange amount = raw amount * reference_scale * allocation_fraction
+normalized exchange amount = calculation amount * reference_scale * selected allocation fraction
 ```
 
-它可以继续缩放 input、output 或 elementary exchange 的归属量，但它不授予 provider eligibility。一个非 reference output 即使有 amount 与 allocation fraction，也只说明该 exchange 参与当前 process dataset 的分摊核算；它不等于该 process 可以自动供应这个 output flow 的 product input demand。
+其中 calculation amount 按 `resultingAmount -> meanAmount -> meanValue` 选择。`allocations.allocation` 可以是 object 或 array；worker 按 `@internalReferenceToCoProduct == quantitativeReference.referenceToReferenceFlow` 选择目标 fraction。`@allocatedFraction` 是 TIDAS `Perc`，string 和 number 都按百分数除以 `100`，带 `%` 后缀不合法。
 
-若未来需要支持 allocated co-product provider linking，应作为显式规则实现，并要求独立的产品语义、allocation、output amount 和 diagnostics 证据，而不是从同 `flow_id` 自动推断。
+若一个已声明的 allocation vector 的非零项闭合为 `100%`，但没有当前 reference target，则该缺项表示稀疏零，selected fraction 为 `0`。若 exchange 完全未声明 `allocations`，selected fraction 为 `1`。
+
+为了兼容旧数据，worker 只接受两个有界 fallback：
+
+- scalar `allocations.allocation = {}` 视为 legacy undeclared，selected fraction 为 `1`；空数组、`[{}]`、缺少 `allocation` 字段或非空但缺少 target/fraction 的 object 不属于该 fallback；
+- 单个 targetless entry 仅在 Process 的物理 `Output` exchange 恰好为 `1`、该 Output 的唯一有效 internal ID 等于 quantitative reference、且 fraction 是 canonical full `100` 或 legacy string 精确为 `"100%"` 时，推断 target 为当前 reference，selected fraction 为 `1`。
+
+其他 targetless 声明仍然有歧义：multiple Output、multiple entry、非 full fraction、无效 Output ID 或无法命中 quantitative reference 都必须 fail closed。重复或未知 target、非有限或越界 fraction、总和不闭合以及其他坏结构同样不能回退为 `1`。这些限制保证 compatibility normalization 不会把一个 co-product 的 allocation 静默归给另一个 quantitative reference。
+
+Allocation 可以缩放 input、output 或 elementary exchange 的归属量，但不授予 provider eligibility。一个非 reference output 即使有 amount 与 allocation fraction，也只说明该 exchange 参与当前 Process 的分摊核算；它不等于该 Process 可以自动供应这个 output flow 的 product input demand。
+
+Snapshot build config 记录 `allocation_semantics_version = tidas-quantitative-reference-v2`，并将其纳入 source fingerprint 以阻止 v1 或更早语义 snapshot reuse。Coverage schema 仍为 `snapshot_coverage.v2`，但 allocation summary 增加 `legacy_empty_allocation_as_undeclared_count` 与 `legacy_single_output_target_inferred_count` 两个 default-zero 兼容计数，使 fallback 使用情况可审计；旧 artifact 缺少字段时按 `0` 读取。
 
 ## 与显式 Market Process 的关系
 

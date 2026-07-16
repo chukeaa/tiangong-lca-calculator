@@ -64,6 +64,9 @@ pub struct SnapshotBuildConfig {
     /// Allocation fraction mode (`strict`/`lenient`).
     #[serde(default = "default_strict_mode")]
     pub allocation_fraction_mode: String,
+    /// Versioned TIDAS allocation/reference semantics used by matrix compilation.
+    #[serde(default = "default_legacy_allocation_semantics_version")]
+    pub allocation_semantics_version: String,
     /// Biosphere sign convention (`signed`/`gross`).
     #[serde(default = "default_biosphere_sign_mode")]
     pub biosphere_sign_mode: String,
@@ -243,6 +246,10 @@ pub struct SnapshotAllocationCoverage {
     pub allocation_fraction_present_pct: f64,
     pub allocation_fraction_missing_count: i64,
     pub allocation_fraction_invalid_count: i64,
+    #[serde(default)]
+    pub legacy_empty_allocation_as_undeclared_count: i64,
+    #[serde(default)]
+    pub legacy_single_output_target_inferred_count: i64,
 }
 
 /// Singular risk diagnostics.
@@ -288,6 +295,10 @@ fn default_coverage_schema_version() -> String {
 
 fn default_strict_mode() -> String {
     "strict".to_owned()
+}
+
+fn default_legacy_allocation_semantics_version() -> String {
+    "legacy-unscoped-v0".to_owned()
 }
 
 fn default_biosphere_sign_mode() -> String {
@@ -452,7 +463,8 @@ mod tests {
     use tempfile::Builder;
 
     use crate::compiled_graph::{
-        CompiledAllocationStats, CompiledGraph, CompiledMatchingStats, CompiledReferenceStats,
+        CompiledAllocationStats, CompiledFlow, CompiledFlowKind, CompiledGraph,
+        CompiledMatchingStats, CompiledReferenceStats,
     };
 
     use super::{
@@ -482,6 +494,7 @@ mod tests {
             provider_candidate_eligibility_mode: "reference_output_only".to_owned(),
             reference_normalization_mode: "strict".to_owned(),
             allocation_fraction_mode: "strict".to_owned(),
+            allocation_semantics_version: "tidas-quantitative-reference-v2".to_owned(),
             biosphere_sign_mode: "gross".to_owned(),
             self_loop_cutoff: 0.999_999,
             singular_eps: 1e-12,
@@ -539,6 +552,8 @@ mod tests {
                 allocation_fraction_present_pct: 100.0,
                 allocation_fraction_missing_count: 0,
                 allocation_fraction_invalid_count: 0,
+                legacy_empty_allocation_as_undeclared_count: 2,
+                legacy_single_output_target_inferred_count: 1,
             },
             singular_risk: SnapshotSingularRisk {
                 risk_level: "low".to_owned(),
@@ -616,15 +631,24 @@ mod tests {
         assert_eq!(decoded.payload, payload);
         assert!(decoded.compiled_graph.is_none());
 
+        let product_flow_id = uuid::Uuid::new_v4();
         let graph = CompiledGraph {
             processes: Vec::new(),
-            flows: Vec::new(),
+            flows: vec![CompiledFlow {
+                flow_idx: 0,
+                flow_id: product_flow_id,
+                kind: CompiledFlowKind::Product,
+            }],
             provider_outputs: Vec::new(),
             provider_decisions: Vec::new(),
             technosphere_edges: Vec::new(),
             biosphere_edges: Vec::new(),
             reference_stats: CompiledReferenceStats::default(),
-            allocation_stats: CompiledAllocationStats::default(),
+            allocation_stats: CompiledAllocationStats {
+                legacy_empty_allocation_as_undeclared_count: 2,
+                legacy_single_output_target_inferred_count: 1,
+                ..CompiledAllocationStats::default()
+            },
             matching_stats: CompiledMatchingStats::default(),
         };
         let encoded_with_graph = encode_snapshot_artifact_with_graph(
@@ -637,7 +661,22 @@ mod tests {
         .expect("encode with graph");
         let decoded_with_graph =
             decode_snapshot_artifact(encoded_with_graph.bytes.as_slice()).expect("decode graph");
-        assert!(decoded_with_graph.compiled_graph.is_some());
+        let decoded_graph = decoded_with_graph.compiled_graph.expect("compiled graph");
+        assert_eq!(decoded_graph.flows.len(), 1);
+        assert_eq!(decoded_graph.flows[0].flow_id, product_flow_id);
+        assert_eq!(decoded_graph.flows[0].kind, CompiledFlowKind::Product);
+        assert_eq!(
+            decoded_graph
+                .allocation_stats
+                .legacy_empty_allocation_as_undeclared_count,
+            2
+        );
+        assert_eq!(
+            decoded_graph
+                .allocation_stats
+                .legacy_single_output_target_inferred_count,
+            1
+        );
     }
 
     #[test]
@@ -656,12 +695,27 @@ mod tests {
         });
         let parsed: SnapshotBuildConfig = serde_json::from_value(legacy).expect("parse legacy");
         assert_eq!(parsed.biosphere_sign_mode, "signed");
+        assert_eq!(parsed.allocation_semantics_version, "legacy-unscoped-v0");
         assert_eq!(parsed.include_user_id, None);
         assert_eq!(
             parsed.selection_mode,
             SnapshotSelectionMode::FilteredLibrary
         );
         assert!(parsed.request_roots.is_empty());
+    }
+
+    #[test]
+    fn allocation_coverage_defaults_legacy_fallback_counts_to_zero() {
+        let parsed: SnapshotAllocationCoverage = serde_json::from_value(json!({
+            "exchange_total": 4,
+            "allocation_fraction_present_pct": 50.0,
+            "allocation_fraction_missing_count": 2,
+            "allocation_fraction_invalid_count": 0
+        }))
+        .expect("parse legacy allocation coverage");
+
+        assert_eq!(parsed.legacy_empty_allocation_as_undeclared_count, 0);
+        assert_eq!(parsed.legacy_single_output_target_inferred_count, 0);
     }
 
     fn write_and_open_hdf5(bytes: &[u8]) -> File {

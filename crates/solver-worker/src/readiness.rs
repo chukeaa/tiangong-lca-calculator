@@ -27,6 +27,7 @@ use crate::snapshot_artifacts::{SnapshotBuildConfig, SnapshotCoverageReport};
 
 const REPORT_SCHEMA_VERSION: &str = "matrix_readiness_report.v1";
 const INPUT_SCHEMA_VERSION: &str = "matrix_readiness_input.v1";
+const DETAIL_LIMIT: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -159,6 +160,10 @@ pub struct GraphReadinessMetrics {
     pub reference_invalid_count: i64,
     pub allocation_fraction_missing_count: i64,
     pub allocation_fraction_invalid_count: i64,
+    #[serde(default)]
+    pub legacy_empty_allocation_as_undeclared_count: i64,
+    #[serde(default)]
+    pub legacy_single_output_target_inferred_count: i64,
     pub singular_risk_level: String,
     pub m_zero_diagonal_count: i64,
     pub m_min_abs_diagonal: f64,
@@ -299,6 +304,14 @@ pub fn verify_matrix_readiness(input: &MatrixReadinessInput) -> MatrixReadinessR
                 .coverage
                 .allocation
                 .allocation_fraction_invalid_count,
+            legacy_empty_allocation_as_undeclared_count: input
+                .coverage
+                .allocation
+                .legacy_empty_allocation_as_undeclared_count,
+            legacy_single_output_target_inferred_count: input
+                .coverage
+                .allocation
+                .legacy_single_output_target_inferred_count,
             singular_risk_level: input.coverage.singular_risk.risk_level.clone(),
             m_zero_diagonal_count: input.coverage.singular_risk.m_zero_diagonal_count,
             m_min_abs_diagonal: input.coverage.singular_risk.m_min_abs_diagonal,
@@ -361,6 +374,7 @@ fn add_provider_findings(
             }),
         );
     }
+    add_reference_provider_missing_findings(input, blockers);
     if matching.matched_multi_unresolved > input.policy.max_multi_unresolved {
         push_blocker(
             blockers,
@@ -396,6 +410,71 @@ fn add_provider_findings(
     }
 }
 
+fn add_reference_provider_missing_findings(
+    input: &MatrixReadinessInput,
+    blockers: &mut Vec<ReadinessFinding>,
+) {
+    let Some(graph) = input.compiled_graph.as_ref() else {
+        return;
+    };
+    let processes = graph
+        .processes
+        .iter()
+        .map(|process| (process.process_idx, process))
+        .collect::<BTreeMap<_, _>>();
+    let gaps = graph
+        .provider_decisions
+        .iter()
+        .filter(|decision| {
+            decision.failure_reason == Some(CompiledProviderFailureReason::RejectedNonReferenceOnly)
+        })
+        .map(|decision| {
+            let consumer = processes.get(&decision.consumer_idx).copied();
+            let candidates = decision
+                .candidates
+                .iter()
+                .map(|candidate| {
+                    json!({
+                        "provider_idx": candidate.provider_idx,
+                        "provider_id": candidate.provider_id,
+                        "process_name": candidate.process_name,
+                        "output_exchange_internal_id": candidate.output_exchange_internal_id,
+                        "output_exchange_is_reference": candidate.output_exchange_is_reference,
+                        "output_normalized_amount": candidate.output_normalized_amount,
+                        "output_allocation_state": provider_output_allocation_state_label(candidate.output_allocation_state),
+                        "eligibility": provider_candidate_eligibility_label(candidate.eligibility),
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "consumer_idx": decision.consumer_idx,
+                "consumer_process_id": consumer.map(|process| process.process_id),
+                "consumer_process_version": consumer.map(|process| process.process_version.clone()),
+                "consumer_process_name": consumer.and_then(|process| process.process_name.clone()),
+                "flow_id": decision.flow_id,
+                "candidate_provider_count": decision.candidate_provider_count,
+                "matched_provider_count": decision.matched_provider_count,
+                "failure_reason": "rejected_non_reference_only",
+                "candidates": candidates,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if gaps.is_empty() {
+        return;
+    }
+    push_blocker(
+        blockers,
+        "provider_closure_reference_provider_missing",
+        "input flows are supplied only by non-reference outputs; publish a complete process whose quantitative reference supplies each flow"
+            .to_owned(),
+        json!({
+            "missing_reference_provider_count": gaps.len(),
+            "examples": gaps.into_iter().take(DETAIL_LIMIT).collect::<Vec<_>>()
+        }),
+    );
+}
+
 fn add_graph_findings(
     input: &MatrixReadinessInput,
     findings: &mut Vec<ReadinessFinding>,
@@ -425,17 +504,6 @@ fn add_graph_findings(
             }),
         );
     }
-    if coverage.allocation.allocation_fraction_missing_count > 0 {
-        findings.push(finding(
-            "allocation_fraction_missing",
-            FindingSeverity::Warning,
-            "some exchanges are missing explicit allocation fractions",
-            json!({
-                "allocation_fraction_missing_count": coverage.allocation.allocation_fraction_missing_count
-            }),
-        ));
-    }
-
     match coverage.singular_risk.risk_level.as_str() {
         "high" if !input.policy.allow_high_singular_risk => push_blocker(
             blockers,
@@ -929,6 +997,142 @@ mod tests {
         assert_eq!(report.provider_evidence[0].candidates.len(), 0);
     }
 
+    #[test]
+    fn blocks_missing_reference_provider_with_rejected_candidate_evidence() {
+        let snapshot_id = Uuid::new_v4();
+        let provider_id = Uuid::new_v4();
+        let consumer_id = Uuid::new_v4();
+        let flow_id = Uuid::new_v4();
+        let mut input = fixture_input(snapshot_id, provider_id, consumer_id, flow_id, false);
+        let decision = input
+            .compiled_graph
+            .as_mut()
+            .and_then(|graph| graph.provider_decisions.first_mut())
+            .expect("provider decision fixture");
+        decision.failure_reason = Some(CompiledProviderFailureReason::RejectedNonReferenceOnly);
+        decision.candidates = vec![CompiledProviderCandidate {
+            provider_idx: 0,
+            provider_id,
+            output_exchange_internal_id: Some("coproduct".to_owned()),
+            output_exchange_is_reference: false,
+            output_normalized_amount: Some(0.4),
+            output_allocation_state: CompiledProviderOutputAllocationState::Present,
+            eligibility: CompiledProviderCandidateEligibility::RejectedNonReferenceOutput,
+            process_name: Some("non-reference candidate".to_owned()),
+            location: Some("CN".to_owned()),
+            reference_year: Some(2024),
+            annual_supply_or_production_volume: Some(10.0),
+        }];
+
+        let report = verify_matrix_readiness(&input);
+
+        assert_eq!(report.status, ReadinessStatus::Failed);
+        assert!(
+            report
+                .blockers
+                .iter()
+                .any(|blocker| blocker.code == "provider_closure_unmatched")
+        );
+        let blocker = report
+            .blockers
+            .iter()
+            .find(|blocker| blocker.code == "provider_closure_reference_provider_missing")
+            .expect("reference-provider blocker");
+        assert_eq!(blocker.details["missing_reference_provider_count"], 1);
+        assert_eq!(
+            blocker.details["examples"][0]["consumer_process_id"],
+            consumer_id.to_string()
+        );
+        assert_eq!(
+            blocker.details["examples"][0]["flow_id"],
+            flow_id.to_string()
+        );
+        assert_eq!(
+            blocker.details["examples"][0]["candidates"][0]["provider_id"],
+            provider_id.to_string()
+        );
+        assert_eq!(
+            report.provider_evidence[0].failure_reason.as_deref(),
+            Some("rejected_non_reference_only")
+        );
+        assert_eq!(report.provider_evidence[0].candidates.len(), 1);
+        assert_eq!(
+            report.provider_evidence[0].candidates[0].eligibility,
+            "rejected_non_reference_output"
+        );
+    }
+
+    #[test]
+    fn undeclared_allocation_does_not_create_blanket_warning() {
+        let snapshot_id = Uuid::new_v4();
+        let provider_id = Uuid::new_v4();
+        let consumer_id = Uuid::new_v4();
+        let flow_id = Uuid::new_v4();
+        let mut input = fixture_input(snapshot_id, provider_id, consumer_id, flow_id, true);
+        input.coverage.allocation.allocation_fraction_missing_count = 2;
+        input.coverage.allocation.allocation_fraction_present_pct = 0.0;
+        input
+            .coverage
+            .allocation
+            .legacy_empty_allocation_as_undeclared_count = 2;
+        input
+            .coverage
+            .allocation
+            .legacy_single_output_target_inferred_count = 1;
+
+        let report = verify_matrix_readiness(&input);
+
+        assert_eq!(report.status, ReadinessStatus::Passed);
+        assert_eq!(report.next_action, "publish_ready");
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|finding| finding.code != "allocation_fraction_missing")
+        );
+        assert_eq!(
+            report
+                .metrics
+                .graph_readiness
+                .allocation_fraction_missing_count,
+            2
+        );
+        assert_eq!(
+            report
+                .metrics
+                .graph_readiness
+                .legacy_empty_allocation_as_undeclared_count,
+            2
+        );
+        assert_eq!(
+            report
+                .metrics
+                .graph_readiness
+                .legacy_single_output_target_inferred_count,
+            1
+        );
+    }
+
+    #[test]
+    fn invalid_allocation_fraction_remains_a_blocker() {
+        let snapshot_id = Uuid::new_v4();
+        let provider_id = Uuid::new_v4();
+        let consumer_id = Uuid::new_v4();
+        let flow_id = Uuid::new_v4();
+        let mut input = fixture_input(snapshot_id, provider_id, consumer_id, flow_id, true);
+        input.coverage.allocation.allocation_fraction_invalid_count = 1;
+
+        let report = verify_matrix_readiness(&input);
+
+        assert_eq!(report.status, ReadinessStatus::Failed);
+        assert!(
+            report
+                .blockers
+                .iter()
+                .any(|blocker| blocker.code == "allocation_fraction_invalid")
+        );
+    }
+
     fn fixture_input(
         snapshot_id: Uuid,
         provider_id: Uuid,
@@ -998,6 +1202,8 @@ mod tests {
                     allocation_fraction_present_pct: 100.0,
                     allocation_fraction_missing_count: 0,
                     allocation_fraction_invalid_count: 0,
+                    legacy_empty_allocation_as_undeclared_count: 0,
+                    legacy_single_output_target_inferred_count: 0,
                 },
                 singular_risk: SnapshotSingularRisk {
                     risk_level: "low".to_owned(),

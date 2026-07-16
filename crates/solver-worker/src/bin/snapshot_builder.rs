@@ -353,6 +353,8 @@ struct AllocationParseStats {
     fraction_present_count: i64,
     fraction_missing_count: i64,
     fraction_invalid_count: i64,
+    legacy_empty_allocation_as_undeclared_count: i64,
+    legacy_single_output_target_inferred_count: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -711,6 +713,8 @@ async fn main() -> anyhow::Result<()> {
         provider_candidate_eligibility_mode: "reference_output_only".to_owned(),
         reference_normalization_mode: cli.reference_normalization_mode.clone(),
         allocation_fraction_mode: cli.allocation_fraction_mode.clone(),
+        allocation_semantics_version:
+            solver_worker::tidas_process_semantics::TIDAS_PROCESS_SEMANTICS_VERSION.to_owned(),
         biosphere_sign_mode: "gross".to_owned(),
         self_loop_cutoff: cli.self_loop_cutoff,
         singular_eps: cli.singular_eps,
@@ -1545,7 +1549,7 @@ async fn run_review_submit_overlay_build(
         &method,
         &built,
         &overlay_config,
-        None,
+        built.compiled_graph.clone(),
         artifact_expires_in_seconds,
         &mut build_timing,
     )
@@ -1698,7 +1702,7 @@ async fn load_or_build_review_submit_baseline(
         method,
         &built,
         baseline_config,
-        Some(built.compiled_graph.clone()),
+        built.compiled_graph.clone(),
         Some(REVIEW_SUBMIT_BASELINE_TTL_SECONDS),
         build_timing,
     )
@@ -1733,7 +1737,7 @@ async fn persist_built_snapshot_artifact(
     method: &MethodSelection,
     built: &BuildOutput,
     config: &SnapshotBuildConfig,
-    compiled_graph: Option<CompiledGraph>,
+    compiled_graph: CompiledGraph,
     artifact_expires_in_seconds: Option<i64>,
     build_timing: &mut BuildTimingSec,
 ) -> anyhow::Result<String> {
@@ -1743,7 +1747,7 @@ async fn persist_built_snapshot_artifact(
         config.clone(),
         built.coverage.clone(),
         &built.data,
-        compiled_graph,
+        Some(compiled_graph),
     )?;
     build_timing.encode_artifact_sec += encode_started.elapsed().as_secs_f64();
 
@@ -1843,6 +1847,14 @@ async fn build_review_submit_overlay_graph(
     graph.allocation_stats.fraction_present_count += target_allocation.fraction_present_count;
     graph.allocation_stats.fraction_missing_count += target_allocation.fraction_missing_count;
     graph.allocation_stats.fraction_invalid_count += target_allocation.fraction_invalid_count;
+    graph
+        .allocation_stats
+        .legacy_empty_allocation_as_undeclared_count +=
+        target_allocation.legacy_empty_allocation_as_undeclared_count;
+    graph
+        .allocation_stats
+        .legacy_single_output_target_inferred_count +=
+        target_allocation.legacy_single_output_target_inferred_count;
 
     let mut flow_idx_by_id = graph
         .flows
@@ -1855,6 +1867,24 @@ async fn build_review_submit_overlay_graph(
         .filter(|flow_id| !flow_idx_by_id.contains_key(flow_id))
         .collect::<BTreeSet<_>>();
     let flow_meta = fetch_flow_meta(pool, &missing_flow_ids, None).await?;
+    let mut reference_flow_kind_by_id = graph
+        .flows
+        .iter()
+        .map(|flow| (flow.flow_id, flow.kind))
+        .collect::<HashMap<_, _>>();
+    reference_flow_kind_by_id.extend(flow_meta.iter().map(|(flow_id, meta)| {
+        let kind = if classify_flow_kind(&meta.json) == "elementary" {
+            CompiledFlowKind::Elementary
+        } else {
+            CompiledFlowKind::Product
+        };
+        (*flow_id, kind)
+    }));
+    validate_reference_product_exchanges(
+        &target_exchanges,
+        std::slice::from_ref(&target_meta),
+        &reference_flow_kind_by_id,
+    )?;
     for flow_id in missing_flow_ids {
         let flow_idx =
             i32::try_from(graph.flows.len()).map_err(|_| anyhow::anyhow!("flow idx overflow"))?;
@@ -1937,7 +1967,7 @@ async fn build_review_submit_overlay_graph(
         if ex.direction != Some(ExchangeDirection::Input) {
             continue;
         }
-        let Some(amount) = ex.amount else {
+        let Some(amount) = nonzero_attributed_input_amount(ex) else {
             continue;
         };
         let supply_region_anchor = supply_region_anchor_for_exchange(ex, &process_meta)?;
@@ -2091,10 +2121,10 @@ async fn build_review_submit_overlay_graph(
                 flow_id: ex.flow_id,
                 candidate_provider_count: 0,
                 matched_provider_count: 0,
-                candidates: Vec::new(),
+                candidates: provider_candidates,
                 decision_kind: Some(CompiledProviderDecisionKind::NoProvider),
                 resolution_strategy: None,
-                failure_reason: Some(CompiledProviderFailureReason::NoProviderCandidates),
+                failure_reason: Some(no_provider_failure_reason(provider_outputs)),
                 used_equal_fallback: false,
                 volume_fallback_to_one_count: 0,
                 geography_tier: None,
@@ -2733,10 +2763,19 @@ fn compiled_allocation_state(
     state: AllocationFractionState,
 ) -> CompiledProviderOutputAllocationState {
     match state {
-        AllocationFractionState::Present => CompiledProviderOutputAllocationState::Present,
+        AllocationFractionState::Present | AllocationFractionState::SparseZero => {
+            CompiledProviderOutputAllocationState::Present
+        }
         AllocationFractionState::Missing => CompiledProviderOutputAllocationState::Missing,
         AllocationFractionState::Invalid => CompiledProviderOutputAllocationState::Invalid,
     }
+}
+
+fn nonzero_attributed_input_amount(exchange: &ParsedExchange) -> Option<f64> {
+    if exchange.direction != Some(ExchangeDirection::Input) {
+        return None;
+    }
+    exchange.amount.filter(|amount| *amount != 0.0)
 }
 
 fn no_provider_failure_reason(
@@ -2826,6 +2865,31 @@ fn parse_process_chunk(
         &exchange_items,
         reference_normalization_mode,
     )?;
+    let reference_internal_id = reference_internal_id.ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing quantitative reference after validation for process={}",
+            proc_row.id
+        )
+    })?;
+    let mut output_internal_ids = HashSet::new();
+    let mut output_exchange_count = 0_usize;
+    for exchange in &exchange_items {
+        if parse_exchange_direction(exchange.get("exchangeDirection").and_then(Value::as_str))
+            != Some(ExchangeDirection::Output)
+        {
+            continue;
+        }
+        output_exchange_count += 1;
+        if let Some(internal_id) = parse_exchange_internal_id(exchange)
+            && !output_internal_ids.insert(internal_id.clone())
+        {
+            return Err(anyhow::anyhow!(
+                "duplicate Output exchange internal ID={} for process={}",
+                internal_id,
+                proc_row.id
+            ));
+        }
+    }
 
     for (exchange_index, ex) in exchange_items.iter().enumerate() {
         let direction_label = ex
@@ -2857,10 +2921,23 @@ fn parse_process_chunk(
             .unwrap_or("unknown")
             .to_owned();
         local_allocation.exchange_total += 1;
-        let (allocation_fraction, allocation_state) =
-            resolve_allocation_fraction(ex, allocation_mode)?;
+        let (allocation_fraction, allocation_state, allocation_fallback) =
+            resolve_allocation_fraction(
+                ex,
+                &reference_internal_id,
+                &output_internal_ids,
+                output_exchange_count,
+                allocation_mode,
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "invalid allocation for process={} exchange={}: {error}",
+                    proc_row.id,
+                    internal_id.as_deref().unwrap_or("unknown")
+                )
+            })?;
         match allocation_state {
-            AllocationFractionState::Present => {
+            AllocationFractionState::Present | AllocationFractionState::SparseZero => {
                 local_allocation.fraction_present_count += 1;
             }
             AllocationFractionState::Missing => {
@@ -2870,10 +2947,17 @@ fn parse_process_chunk(
                 local_allocation.fraction_invalid_count += 1;
             }
         }
+        match allocation_fallback {
+            AllocationFallbackState::None => {}
+            AllocationFallbackState::LegacyEmptyUndeclared => {
+                local_allocation.legacy_empty_allocation_as_undeclared_count += 1;
+            }
+            AllocationFallbackState::LegacySingleOutputTargetInferred => {
+                local_allocation.legacy_single_output_target_inferred_count += 1;
+            }
+        }
         let amount = parse_number(
-            ex.get("meanAmount")
-                .or_else(|| ex.get("resultingAmount"))
-                .or_else(|| ex.get("meanValue")),
+            solver_worker::tidas_process_semantics::preferred_calculation_amount_value(ex),
         )
         .map(|raw| raw * reference_scale * allocation_fraction)
         .filter(|normalized| normalized.is_finite());
@@ -2888,7 +2972,7 @@ fn parse_process_chunk(
             flow_version,
             is_reference_exchange: is_reference_internal_exchange(
                 internal_id.as_deref(),
-                reference_internal_id.as_deref(),
+                Some(reference_internal_id.as_str()),
             ),
             amount,
             allocation_state,
@@ -2904,6 +2988,46 @@ fn parse_process_chunk(
         local_reference,
         local_allocation,
     ))
+}
+
+fn validate_reference_product_exchanges(
+    exchanges: &[ParsedExchange],
+    processes: &[ProcessMeta],
+    flow_kind_by_id: &HashMap<Uuid, CompiledFlowKind>,
+) -> anyhow::Result<()> {
+    for process in processes {
+        let reference_exchanges = exchanges
+            .iter()
+            .filter(|exchange| {
+                exchange.process_idx == process.process_idx && exchange.is_reference_exchange
+            })
+            .collect::<Vec<_>>();
+        if reference_exchanges.len() != 1 {
+            return Err(anyhow::anyhow!(
+                "quantitative reference must resolve to exactly one exchange with a valid flow for process={} version={}; matched={}",
+                process.process_id,
+                process.process_version,
+                reference_exchanges.len()
+            ));
+        }
+        let reference_exchange = reference_exchanges[0];
+        if reference_exchange.direction != Some(ExchangeDirection::Output) {
+            return Err(anyhow::anyhow!(
+                "quantitative reference must resolve to an Output exchange for process={} version={}",
+                process.process_id,
+                process.process_version
+            ));
+        }
+        if flow_kind_by_id.get(&reference_exchange.flow_id) != Some(&CompiledFlowKind::Product) {
+            return Err(anyhow::anyhow!(
+                "quantitative reference must resolve to a Product flow for process={} version={} flow={}",
+                process.process_id,
+                process.process_version,
+                reference_exchange.flow_id
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn compile_scope_graph(
@@ -2950,6 +3074,10 @@ async fn compile_scope_graph(
         allocation_stats.fraction_present_count += chunk_allocation.fraction_present_count;
         allocation_stats.fraction_missing_count += chunk_allocation.fraction_missing_count;
         allocation_stats.fraction_invalid_count += chunk_allocation.fraction_invalid_count;
+        allocation_stats.legacy_empty_allocation_as_undeclared_count +=
+            chunk_allocation.legacy_empty_allocation_as_undeclared_count;
+        allocation_stats.legacy_single_output_target_inferred_count +=
+            chunk_allocation.legacy_single_output_target_inferred_count;
     }
 
     let mut process_meta = Vec::with_capacity(processes.len());
@@ -2996,6 +3124,17 @@ async fn compile_scope_graph(
             }
         }
     }
+    let flow_kind_by_id = flow_meta
+        .iter()
+        .map(|(flow_id, meta)| {
+            let kind = if classify_flow_kind(&meta.json) == "elementary" {
+                CompiledFlowKind::Elementary
+            } else {
+                CompiledFlowKind::Product
+            };
+            (*flow_id, kind)
+        })
+        .collect::<HashMap<_, _>>();
     let candidate_flow_ids = if versioned_scope.is_some() {
         let mut ids = flow_meta.keys().copied().collect::<Vec<_>>();
         ids.sort_unstable();
@@ -3026,6 +3165,7 @@ async fn compile_scope_graph(
             kind,
         });
     }
+    validate_reference_product_exchanges(&exchanges, &process_meta, &flow_kind_by_id)?;
 
     let mut provider_map: ProviderMap = HashMap::new();
     for ex in &exchanges {
@@ -3074,7 +3214,7 @@ async fn compile_scope_graph(
             continue;
         }
 
-        let Some(amount) = ex.amount else {
+        let Some(amount) = nonzero_attributed_input_amount(ex) else {
             continue;
         };
         let supply_region_anchor = supply_region_anchor_for_exchange(ex, &process_meta)?;
@@ -3238,7 +3378,7 @@ async fn compile_scope_graph(
                 flow_id: ex.flow_id,
                 candidate_provider_count: 0,
                 matched_provider_count: 0,
-                candidates: Vec::new(),
+                candidates: provider_candidates,
                 decision_kind: Some(CompiledProviderDecisionKind::NoProvider),
                 resolution_strategy: None,
                 failure_reason: Some(no_provider_failure_reason(provider_outputs)),
@@ -3255,18 +3395,12 @@ async fn compile_scope_graph(
 
     let lcia_exchange_observations = exchanges
         .iter()
-        .filter(|exchange| {
-            flow_idx_by_id
-                .get(&exchange.flow_id)
-                .is_some_and(|flow_idx| elementary_flow_idx.contains(flow_idx))
-        })
-        .map(|exchange| LciaExchangeObservation {
-            flow_id: exchange.flow_id,
-            flow_version: exchange.flow_version.clone(),
-            direction: exchange.direction,
-            direction_label: exchange.direction_label.clone(),
-            exchange_id: exchange.exchange_id.clone(),
-            amount: exchange.amount,
+        .filter_map(|exchange| {
+            lcia_exchange_observation_for_attributed_exchange(
+                exchange,
+                &flow_idx_by_id,
+                &elementary_flow_idx,
+            )
         })
         .collect();
 
@@ -3288,10 +3422,33 @@ async fn compile_scope_graph(
                 fraction_present_count: allocation_stats.fraction_present_count,
                 fraction_missing_count: allocation_stats.fraction_missing_count,
                 fraction_invalid_count: allocation_stats.fraction_invalid_count,
+                legacy_empty_allocation_as_undeclared_count: allocation_stats
+                    .legacy_empty_allocation_as_undeclared_count,
+                legacy_single_output_target_inferred_count: allocation_stats
+                    .legacy_single_output_target_inferred_count,
             },
             matching_stats,
         },
         lcia_exchange_observations,
+    })
+}
+
+fn lcia_exchange_observation_for_attributed_exchange(
+    exchange: &ParsedExchange,
+    flow_idx_by_id: &HashMap<Uuid, i32>,
+    elementary_flow_idx: &HashSet<i32>,
+) -> Option<LciaExchangeObservation> {
+    let flow_idx = flow_idx_by_id.get(&exchange.flow_id)?;
+    if !elementary_flow_idx.contains(flow_idx) || exchange.amount == Some(0.0) {
+        return None;
+    }
+    Some(LciaExchangeObservation {
+        flow_id: exchange.flow_id,
+        flow_version: exchange.flow_version.clone(),
+        direction: exchange.direction,
+        direction_label: exchange.direction_label.clone(),
+        exchange_id: exchange.exchange_id.clone(),
+        amount: exchange.amount,
     })
 }
 
@@ -3546,6 +3703,12 @@ fn assemble_sparse_payload(
             allocation_fraction_invalid_count: compiled_graph
                 .allocation_stats
                 .fraction_invalid_count,
+            legacy_empty_allocation_as_undeclared_count: compiled_graph
+                .allocation_stats
+                .legacy_empty_allocation_as_undeclared_count,
+            legacy_single_output_target_inferred_count: compiled_graph
+                .allocation_stats
+                .legacy_single_output_target_inferred_count,
         },
         singular_risk: SnapshotSingularRisk {
             risk_level,
@@ -3858,61 +4021,71 @@ const AUTO_LINK_TOP1_TOP2_MIN_RATIO: f64 = 1.2;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AllocationFractionState {
     Present,
+    SparseZero,
     Missing,
     Invalid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AllocationFallbackState {
+    None,
+    LegacyEmptyUndeclared,
+    LegacySingleOutputTargetInferred,
 }
 
 fn resolve_reference_normalization(
     process_id: Uuid,
     process_json: &Value,
     exchanges: &[&Value],
-    mode: NormalizationMode,
+    _mode: NormalizationMode,
 ) -> anyhow::Result<(f64, ReferenceParseStats)> {
     let mut stats = ReferenceParseStats::default();
     let reference_internal_id = parse_reference_internal_id(process_json);
 
     let Some(reference_internal_id) = reference_internal_id.as_deref() else {
-        stats.missing_reference = 1;
-        return match mode {
-            NormalizationMode::Strict => Err(anyhow::anyhow!(
-                "missing quantitativeReference.referenceToReferenceFlow for process={process_id}"
-            )),
-            NormalizationMode::Lenient => Ok((1.0, stats)),
-        };
+        return Err(anyhow::anyhow!(
+            "missing quantitativeReference.referenceToReferenceFlow for process={process_id}"
+        ));
     };
 
-    let reference_exchange = exchanges.iter().copied().find(|exchange| {
-        parse_exchange_internal_id(exchange).as_deref() == Some(reference_internal_id)
-    });
-
-    let Some(reference_exchange) = reference_exchange else {
-        stats.invalid_reference = 1;
-        return match mode {
-            NormalizationMode::Strict => Err(anyhow::anyhow!(
-                "referenceToReferenceFlow={} not found in exchanges for process={process_id}",
-                reference_internal_id
-            )),
-            NormalizationMode::Lenient => Ok((1.0, stats)),
-        };
-    };
+    let reference_exchanges = exchanges
+        .iter()
+        .copied()
+        .filter(|exchange| {
+            parse_exchange_internal_id(exchange).as_deref() == Some(reference_internal_id)
+        })
+        .collect::<Vec<_>>();
+    if reference_exchanges.len() != 1 {
+        return Err(anyhow::anyhow!(
+            "referenceToReferenceFlow={} must match exactly one exchange for process={process_id}; matched={}",
+            reference_internal_id,
+            reference_exchanges.len()
+        ));
+    }
+    let reference_exchange = reference_exchanges[0];
+    if parse_exchange_direction(
+        reference_exchange
+            .get("exchangeDirection")
+            .and_then(Value::as_str),
+    ) != Some(ExchangeDirection::Output)
+    {
+        return Err(anyhow::anyhow!(
+            "referenceToReferenceFlow={} must identify an Output exchange for process={process_id}",
+            reference_internal_id
+        ));
+    }
 
     let reference_amount = parse_number(
-        reference_exchange
-            .get("meanAmount")
-            .or_else(|| reference_exchange.get("resultingAmount"))
-            .or_else(|| reference_exchange.get("meanValue")),
+        solver_worker::tidas_process_semantics::preferred_calculation_amount_value(
+            reference_exchange,
+        ),
     )
-    .map(f64::abs)
-    .filter(|value| *value > f64::EPSILON);
+    .filter(|value| value.is_finite() && *value > f64::EPSILON);
     let Some(reference_amount) = reference_amount else {
-        stats.invalid_reference = 1;
-        return match mode {
-            NormalizationMode::Strict => Err(anyhow::anyhow!(
-                "invalid reference amount for process={process_id} reference_internal_id={}",
-                reference_internal_id
-            )),
-            NormalizationMode::Lenient => Ok((1.0, stats)),
-        };
+        return Err(anyhow::anyhow!(
+            "reference amount must be finite and positive for process={process_id} reference_internal_id={}",
+            reference_internal_id
+        ));
     };
 
     stats.normalized_processes = 1;
@@ -3921,55 +4094,53 @@ fn resolve_reference_normalization(
 
 fn resolve_allocation_fraction(
     exchange_json: &Value,
-    mode: AllocationMode,
-) -> anyhow::Result<(f64, AllocationFractionState)> {
-    let raw = exchange_json
-        .get("allocations")
-        .and_then(|v| v.get("allocation"))
-        .and_then(|v| v.get("@allocatedFraction"));
-    let Some(raw) = raw else {
-        return match mode {
-            AllocationMode::Strict => Err(anyhow::anyhow!(
-                "missing allocations.allocation.@allocatedFraction"
-            )),
-            AllocationMode::Lenient => Ok((1.0, AllocationFractionState::Missing)),
-        };
-    };
-
-    let parsed = match raw {
-        Value::Number(number) => number.as_f64(),
-        Value::String(text) => {
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                None
-            } else if let Some(without_percent) = trimmed.strip_suffix('%') {
-                without_percent
-                    .trim()
-                    .parse::<f64>()
-                    .ok()
-                    .map(|value| value / 100.0)
-            } else {
-                trimmed.parse::<f64>().ok().map(
-                    |value| {
-                        if value > 1.0 { value / 100.0 } else { value }
-                    },
-                )
-            }
+    reference_internal_id: &str,
+    valid_output_internal_ids: &HashSet<String>,
+    output_exchange_count: usize,
+    _mode: AllocationMode,
+) -> anyhow::Result<(f64, AllocationFractionState, AllocationFallbackState)> {
+    match solver_worker::tidas_process_semantics::resolve_tidas_exchange_allocation(
+        exchange_json,
+        reference_internal_id,
+        valid_output_internal_ids,
+        output_exchange_count,
+    )? {
+        solver_worker::tidas_process_semantics::TidasAllocationResolution::Undeclared => {
+            Ok((
+                1.0,
+                AllocationFractionState::Missing,
+                AllocationFallbackState::None,
+            ))
         }
-        _ => None,
-    };
-    let fraction = parsed.filter(|value| value.is_finite() && *value >= 0.0 && *value <= 1.0);
-    let Some(fraction) = fraction else {
-        return match mode {
-            AllocationMode::Strict => Err(anyhow::anyhow!(
-                "invalid allocations.allocation.@allocatedFraction={}",
-                raw
-            )),
-            AllocationMode::Lenient => Ok((1.0, AllocationFractionState::Invalid)),
-        };
-    };
-
-    Ok((fraction, AllocationFractionState::Present))
+        solver_worker::tidas_process_semantics::TidasAllocationResolution::LegacyEmptyUndeclared => {
+            Ok((
+                1.0,
+                AllocationFractionState::Missing,
+                AllocationFallbackState::LegacyEmptyUndeclared,
+            ))
+        }
+        solver_worker::tidas_process_semantics::TidasAllocationResolution::Explicit {
+            fraction,
+        } => Ok((
+            fraction,
+            AllocationFractionState::Present,
+            AllocationFallbackState::None,
+        )),
+        solver_worker::tidas_process_semantics::TidasAllocationResolution::LegacyInferredReference {
+            fraction,
+        } => Ok((
+            fraction,
+            AllocationFractionState::Present,
+            AllocationFallbackState::LegacySingleOutputTargetInferred,
+        )),
+        solver_worker::tidas_process_semantics::TidasAllocationResolution::SparseZero => {
+            Ok((
+                0.0,
+                AllocationFractionState::SparseZero,
+                AllocationFallbackState::None,
+            ))
+        }
+    }
 }
 
 fn resolve_multi_provider(
@@ -4858,6 +5029,45 @@ fn classify_scope_partition(
     }
 }
 
+fn request_root_input_allocation_state(
+    exchange: &Value,
+    reference_internal_id: Option<&str>,
+    valid_output_internal_ids: &HashSet<String>,
+    output_exchange_count: usize,
+) -> (Option<f64>, AllocationFractionState) {
+    if exchange.get("allocations").is_none() {
+        return (Some(1.0), AllocationFractionState::Missing);
+    }
+    let Some(reference_internal_id) = reference_internal_id else {
+        return (None, AllocationFractionState::Invalid);
+    };
+    match solver_worker::tidas_process_semantics::resolve_tidas_exchange_allocation(
+        exchange,
+        reference_internal_id,
+        valid_output_internal_ids,
+        output_exchange_count,
+    ) {
+        Ok(
+            solver_worker::tidas_process_semantics::TidasAllocationResolution::Undeclared
+            | solver_worker::tidas_process_semantics::TidasAllocationResolution::LegacyEmptyUndeclared,
+        ) => {
+            (Some(1.0), AllocationFractionState::Missing)
+        }
+        Ok(
+            solver_worker::tidas_process_semantics::TidasAllocationResolution::Explicit {
+                fraction,
+            }
+            | solver_worker::tidas_process_semantics::TidasAllocationResolution::LegacyInferredReference {
+                fraction,
+            },
+        ) => (Some(fraction), AllocationFractionState::Present),
+        Ok(solver_worker::tidas_process_semantics::TidasAllocationResolution::SparseZero) => {
+            (Some(0.0), AllocationFractionState::SparseZero)
+        }
+        Err(_) => (None, AllocationFractionState::Invalid),
+    }
+}
+
 fn resolve_process_selection(
     mut candidate_processes: Vec<ProcessRow>,
     all_states: bool,
@@ -4925,6 +5135,22 @@ fn resolve_process_selection(
             i32::try_from(idx).map_err(|_| anyhow::anyhow!("process index overflow"))?;
         process_lookup.insert((proc_row.id, proc_row.version.clone()), process_idx);
         let reference_internal_id = parse_reference_internal_id(&proc_row.json);
+        let exchange_items = process_exchange_items(&proc_row.json);
+        let output_exchange_count = exchange_items
+            .iter()
+            .filter(|exchange| {
+                parse_exchange_direction(exchange.get("exchangeDirection").and_then(Value::as_str))
+                    == Some(ExchangeDirection::Output)
+            })
+            .count();
+        let valid_output_internal_ids = exchange_items
+            .iter()
+            .filter(|exchange| {
+                parse_exchange_direction(exchange.get("exchangeDirection").and_then(Value::as_str))
+                    == Some(ExchangeDirection::Output)
+            })
+            .filter_map(|exchange| parse_exchange_internal_id(exchange))
+            .collect::<HashSet<_>>();
         process_meta.push(ProcessMeta {
             process_idx,
             process_id: proc_row.id,
@@ -4939,7 +5165,7 @@ fn resolve_process_selection(
         });
 
         let mut input_exchanges = Vec::new();
-        for exchange in process_exchange_items(&proc_row.json) {
+        for exchange in exchange_items {
             let direction = match exchange
                 .get("exchangeDirection")
                 .and_then(Value::as_str)
@@ -4985,6 +5211,12 @@ fn resolve_process_selection(
                     ),
                 );
             } else {
+                let (allocation_amount, allocation_state) = request_root_input_allocation_state(
+                    exchange,
+                    reference_internal_id.as_deref(),
+                    &valid_output_internal_ids,
+                    output_exchange_count,
+                );
                 input_exchanges.push(ParsedExchange {
                     process_idx,
                     flow_id,
@@ -4999,8 +5231,8 @@ fn resolve_process_selection(
                         internal_id.as_deref(),
                         reference_internal_id.as_deref(),
                     ),
-                    amount: None,
-                    allocation_state: AllocationFractionState::Missing,
+                    amount: allocation_amount,
+                    allocation_state,
                     location: parse_exchange_location(exchange),
                 });
             }
@@ -5035,6 +5267,19 @@ fn resolve_process_selection(
             .get(usize::try_from(current).map_err(|_| anyhow::anyhow!("negative process idx"))?)
             .ok_or_else(|| anyhow::anyhow!("missing input exchanges for process idx={current}"))?;
         for exchange in input_exchanges {
+            if exchange.allocation_state == AllocationFractionState::Invalid {
+                let process = process_meta_for_idx(&process_meta, current)
+                    .ok_or_else(|| anyhow::anyhow!("missing process metadata idx={current}"))?;
+                return Err(anyhow::anyhow!(
+                    "invalid allocation while resolving request-root closure for process={} version={} exchange={}",
+                    process.process_id,
+                    process.process_version,
+                    exchange.exchange_id
+                ));
+            }
+            if nonzero_attributed_input_amount(exchange).is_none() {
+                continue;
+            }
             let provider_outputs = provider_map.get(&exchange.flow_id);
             let providers = eligible_provider_indices(provider_outputs);
             let provider_cnt = providers.len();
@@ -5152,6 +5397,14 @@ async fn compute_source_fingerprint(
         lciamethod_max_modified_at_utc,
     };
 
+    let fingerprint = compute_source_fingerprint_from_summary(&summary, config)?;
+    Ok((summary, fingerprint))
+}
+
+fn compute_source_fingerprint_from_summary(
+    summary: &SourceSnapshotSummary,
+    config: &SnapshotBuildConfig,
+) -> anyhow::Result<String> {
     let body = serde_json::json!({
         "schema": "source-fingerprint:v1",
         "source": {
@@ -5173,8 +5426,7 @@ async fn compute_source_fingerprint(
 
     let mut hasher = Sha256::new();
     hasher.update(serde_json::to_vec(&body)?);
-    let fingerprint = hex::encode(hasher.finalize());
-    Ok((summary, fingerprint))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn summarize_selected_processes(processes: &[ProcessRow]) -> anyhow::Result<(i64, String)> {
@@ -6263,6 +6515,10 @@ fn write_report_files(
         config.allocation_fraction_mode
     ));
     md.push_str(&format!(
+        "- allocation_semantics_version: `{}`\n",
+        config.allocation_semantics_version
+    ));
+    md.push_str(&format!(
         "- biosphere_sign_mode: `{}`\n",
         config.biosphere_sign_mode
     ));
@@ -6538,8 +6794,20 @@ fn write_report_files(
         coverage.allocation.allocation_fraction_missing_count
     ));
     md.push_str(&format!(
-        "- allocation_fraction_invalid_count: `{}`\n\n",
+        "- allocation_fraction_invalid_count: `{}`\n",
         coverage.allocation.allocation_fraction_invalid_count
+    ));
+    md.push_str(&format!(
+        "- legacy_empty_allocation_as_undeclared_count: `{}`\n",
+        coverage
+            .allocation
+            .legacy_empty_allocation_as_undeclared_count
+    ));
+    md.push_str(&format!(
+        "- legacy_single_output_target_inferred_count: `{}`\n\n",
+        coverage
+            .allocation
+            .legacy_single_output_target_inferred_count
     ));
 
     md.push_str("## Singular Risk\n\n");
@@ -6824,25 +7092,28 @@ fn write_provider_rule_replay_report_files(
 #[cfg(test)]
 mod tests {
     use super::{
-        AllocationFractionState, AllocationMode, Cli,
+        AllocationFallbackState, AllocationFractionState, AllocationMode, Cli,
         DEFAULT_SNAPSHOT_DB_STATEMENT_TIMEOUT_SECONDS, ExchangeDirection, FlowRow, ImpactFactorSet,
         LciaExchangeObservation, MethodSelection, MultiProviderDecision, NormalizationMode,
-        ParsedExchange, ProcessMeta, ProcessRow, ProviderRule, accumulate_finite_factor,
+        ParsedExchange, ProcessMeta, ProcessRow, ProviderRule, SnapshotBuildConfig,
+        SnapshotSelectionMode, SourceSnapshotSummary, accumulate_finite_factor,
         add_technosphere_edge, assemble_sparse_payload, attach_artifact_lifecycle,
         biosphere_gross_value, build_lcia_factor_coverage, build_review_submit_overlay_graph,
-        candidate_count_bucket_label, compute_scope_hash, geo_score, location_granularity_label,
-        no_provider_failure_reason, normalize_request_roots, parse_number,
-        parse_process_annual_supply_or_production_volume, parse_process_states,
+        candidate_count_bucket_label, compute_review_submit_overlay_source_hash,
+        compute_scope_hash, compute_source_fingerprint_from_summary, geo_score,
+        location_granularity_label, no_provider_failure_reason, normalize_request_roots,
+        parse_number, parse_process_annual_supply_or_production_volume, parse_process_states,
         parse_provider_rule_list, resolve_allocation_fraction, resolve_multi_provider,
         resolve_process_selection, resolve_reference_normalization,
         review_submit_root_dependency_fingerprint, snapshot_db_statement_timeout,
         summarize_matching_diagnostics, time_score, unique_supported_direction_by_flow,
         validate_flow_row_visibility, validate_process_row_visibility,
+        validate_reference_product_exchanges,
     };
     use chrono::Utc;
     use clap::Parser;
     use serde_json::json;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use uuid::Uuid;
 
     use solver_worker::compiled_graph::{
@@ -6865,6 +7136,33 @@ mod tests {
         );
     }
 
+    fn test_snapshot_build_config(allocation_semantics_version: &str) -> SnapshotBuildConfig {
+        SnapshotBuildConfig {
+            process_states: "100".to_owned(),
+            include_user_id: None,
+            data_scope: None,
+            scope_manifest_sha256: None,
+            lcia_method_factor_source: None,
+            selection_mode: SnapshotSelectionMode::FilteredLibrary,
+            request_roots: Vec::new(),
+            process_limit: 0,
+            provider_rule: "split_by_process_volume".to_owned(),
+            provider_candidate_eligibility_mode: "reference_output_only".to_owned(),
+            reference_normalization_mode: "strict".to_owned(),
+            allocation_fraction_mode: "strict".to_owned(),
+            allocation_semantics_version: allocation_semantics_version.to_owned(),
+            biosphere_sign_mode: "gross".to_owned(),
+            self_loop_cutoff: 0.999_999,
+            singular_eps: 1e-12,
+            has_lcia: false,
+            artifact_purpose: Some("review_submit_overlay".to_owned()),
+            root_dependency_fingerprint: None,
+            root_revision_checksum: Some("a".repeat(64)),
+            method_id: None,
+            method_version: None,
+        }
+    }
+
     #[test]
     fn snapshot_db_statement_timeout_defaults_to_bounded_duration() {
         assert_eq!(
@@ -6876,6 +7174,40 @@ mod tests {
     #[test]
     fn snapshot_db_statement_timeout_allows_explicit_unbounded_recovery_mode() {
         assert_eq!(snapshot_db_statement_timeout(0), None);
+    }
+
+    #[test]
+    fn allocation_semantics_version_changes_review_submit_source_fingerprint() {
+        let mut config = test_snapshot_build_config("tidas-quantitative-reference-v1");
+        let strict_hash = compute_review_submit_overlay_source_hash("baseline", &config)
+            .expect("strict source hash");
+        config.allocation_semantics_version =
+            solver_worker::tidas_process_semantics::TIDAS_PROCESS_SEMANTICS_VERSION.to_owned();
+        let fallback_hash = compute_review_submit_overlay_source_hash("baseline", &config)
+            .expect("fallback source hash");
+
+        assert_ne!(strict_hash, fallback_hash);
+    }
+
+    #[test]
+    fn allocation_semantics_version_changes_snapshot_source_fingerprint() {
+        let summary = SourceSnapshotSummary {
+            process_count: 2,
+            process_max_modified_at_utc: "2026-07-15T00:00:00.000000Z".to_owned(),
+            flow_count: 3,
+            flow_max_modified_at_utc: "2026-07-15T00:00:00.000000Z".to_owned(),
+            lciamethod_count: 0,
+            lciamethod_max_modified_at_utc: "disabled".to_owned(),
+        };
+        let mut config = test_snapshot_build_config("tidas-quantitative-reference-v1");
+        let strict_hash = compute_source_fingerprint_from_summary(&summary, &config)
+            .expect("strict source fingerprint");
+        config.allocation_semantics_version =
+            solver_worker::tidas_process_semantics::TIDAS_PROCESS_SEMANTICS_VERSION.to_owned();
+        let fallback_hash = compute_source_fingerprint_from_summary(&summary, &config)
+            .expect("fallback source fingerprint");
+
+        assert_ne!(strict_hash, fallback_hash);
     }
 
     #[test]
@@ -7074,6 +7406,7 @@ mod tests {
         let provider_id = Uuid::new_v4();
         let target_id = Uuid::new_v4();
         let flow_id = fixed_flow_id("shared-flow");
+        let target_output_flow_id = fixed_flow_id("target-output");
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://localhost/unused")
             .expect("lazy pool");
@@ -7089,11 +7422,18 @@ mod tests {
                 annual_supply_or_production_volume: Some(10.0),
                 partition: ScopeProcessPartition::Public,
             }],
-            flows: vec![CompiledFlow {
-                flow_idx: 0,
-                flow_id,
-                kind: CompiledFlowKind::Product,
-            }],
+            flows: vec![
+                CompiledFlow {
+                    flow_idx: 0,
+                    flow_id,
+                    kind: CompiledFlowKind::Product,
+                },
+                CompiledFlow {
+                    flow_idx: 1,
+                    flow_id: target_output_flow_id,
+                    kind: CompiledFlowKind::Product,
+                },
+            ],
             provider_outputs: vec![CompiledProviderOutput {
                 flow_id,
                 provider_idx: 0,
@@ -7122,7 +7462,7 @@ mod tests {
             team_id: None,
             review_id: None,
             modified_at: Some(Utc::now()),
-            json: process_json(&[("Input", flow_id)]),
+            json: process_json(&[("Output", target_output_flow_id), ("Input", flow_id)]),
         };
 
         let overlay_graph = build_review_submit_overlay_graph(
@@ -7442,6 +7782,195 @@ mod tests {
     }
 
     #[test]
+    fn request_roots_closure_skips_sparse_zero_allocated_input() {
+        let root_process_id = Uuid::new_v4();
+        let provider_process_id = Uuid::new_v4();
+        let product_a = fixed_flow_id("product-a");
+        let product_b = fixed_flow_id("product-b");
+        let allocated_input = fixed_flow_id("allocated-input");
+        let root_json = json!({
+            "processDataSet": {
+                "processInformation": {
+                    "quantitativeReference": { "referenceToReferenceFlow": "1" }
+                },
+                "exchanges": {
+                    "exchange": [
+                        {
+                            "@dataSetInternalID": "1",
+                            "exchangeDirection": "Output",
+                            "referenceToFlowDataSet": { "@refObjectId": product_a },
+                            "resultingAmount": "1"
+                        },
+                        {
+                            "@dataSetInternalID": "2",
+                            "exchangeDirection": "Output",
+                            "referenceToFlowDataSet": { "@refObjectId": product_b },
+                            "resultingAmount": "1"
+                        },
+                        {
+                            "@dataSetInternalID": "3",
+                            "exchangeDirection": "Input",
+                            "referenceToFlowDataSet": { "@refObjectId": allocated_input },
+                            "resultingAmount": "10",
+                            "allocations": {
+                                "allocation": {
+                                    "@internalReferenceToCoProduct": "2",
+                                    "@allocatedFraction": "100"
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+        let root_row = ProcessRow {
+            id: root_process_id,
+            version: "01.00.000".to_owned(),
+            model_id: None,
+            user_id: None,
+            state_code: 100,
+            team_id: None,
+            review_id: None,
+            modified_at: Some(Utc::now()),
+            json: root_json,
+        };
+        let provider_row = ProcessRow {
+            id: provider_process_id,
+            version: "01.00.000".to_owned(),
+            model_id: None,
+            user_id: None,
+            state_code: 100,
+            team_id: None,
+            review_id: None,
+            modified_at: Some(Utc::now()),
+            json: process_json(&[("Output", allocated_input)]),
+        };
+
+        let selected = resolve_process_selection(
+            vec![root_row.clone(), provider_row],
+            false,
+            &[100],
+            None,
+            &[RequestRootProcess::new(
+                root_process_id,
+                "01.00.000".to_owned(),
+            )],
+            ProviderRule::StrictUniqueProvider,
+            0,
+        )
+        .expect("resolve sparse-zero closure");
+        assert_eq!(
+            selected
+                .processes
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![root_process_id]
+        );
+
+        let (_, exchanges, _, _, _) = super::parse_process_chunk(
+            &root_row,
+            0,
+            NormalizationMode::Strict,
+            AllocationMode::Strict,
+        )
+        .expect("parse sparse-zero root");
+        assert_eq!(exchanges[2].amount, Some(0.0));
+        assert!(super::nonzero_attributed_input_amount(&exchanges[2]).is_none());
+    }
+
+    #[test]
+    fn request_roots_closure_uses_only_safe_targetless_allocation_fallback() {
+        let root_process_id = Uuid::new_v4();
+        let provider_process_id = Uuid::new_v4();
+        let root_flow = fixed_flow_id("root-flow");
+        let input_flow = fixed_flow_id("input-flow");
+        let coproduct_flow = fixed_flow_id("coproduct-flow");
+        let root_json = json!({
+            "processDataSet": {
+                "processInformation": {
+                    "quantitativeReference": { "referenceToReferenceFlow": "1" }
+                },
+                "exchanges": {
+                    "exchange": [
+                        {
+                            "@dataSetInternalID": "1",
+                            "exchangeDirection": "Output",
+                            "referenceToFlowDataSet": { "@refObjectId": root_flow },
+                            "resultingAmount": "1"
+                        },
+                        {
+                            "@dataSetInternalID": "2",
+                            "exchangeDirection": "Input",
+                            "referenceToFlowDataSet": { "@refObjectId": input_flow },
+                            "resultingAmount": "1",
+                            "allocations": {
+                                "allocation": { "@allocatedFraction": "100%" }
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+        let row = |id, json| ProcessRow {
+            id,
+            version: "01.00.000".to_owned(),
+            model_id: None,
+            user_id: None,
+            state_code: 100,
+            team_id: None,
+            review_id: None,
+            modified_at: Some(Utc::now()),
+            json,
+        };
+        let provider = row(provider_process_id, process_json(&[("Output", input_flow)]));
+        let root = row(root_process_id, root_json.clone());
+
+        let selected = resolve_process_selection(
+            vec![root, provider.clone()],
+            false,
+            &[100],
+            None,
+            &[RequestRootProcess::new(
+                root_process_id,
+                "01.00.000".to_owned(),
+            )],
+            ProviderRule::StrictUniqueProvider,
+            0,
+        )
+        .expect("resolve safe targetless closure");
+        assert_eq!(selected.processes.len(), 2);
+
+        let mut ambiguous_json = root_json;
+        ambiguous_json["processDataSet"]["exchanges"]["exchange"]
+            .as_array_mut()
+            .expect("exchange array")
+            .insert(
+                1,
+                json!({
+                    "exchangeDirection": "Output",
+                    "referenceToFlowDataSet": { "@refObjectId": coproduct_flow },
+                    "resultingAmount": "1"
+                }),
+            );
+        let ambiguous_root = row(root_process_id, ambiguous_json);
+        let error = resolve_process_selection(
+            vec![ambiguous_root, provider],
+            false,
+            &[100],
+            None,
+            &[RequestRootProcess::new(
+                root_process_id,
+                "01.00.000".to_owned(),
+            )],
+            ProviderRule::StrictUniqueProvider,
+            0,
+        )
+        .expect_err("reject ambiguous targetless closure");
+        assert!(format!("{error:#}").contains("invalid allocation"));
+    }
+
+    #[test]
     fn time_score_handles_missing_and_thresholds() {
         assert_close(time_score(None, Some(2020)), 0.5);
         assert_close(time_score(Some(2026), Some(2026)), 1.0);
@@ -7745,12 +8274,7 @@ mod tests {
                             "referenceToFlowDataSet": {
                                 "@refObjectId": flow_id
                             },
-                            "meanAmount": 1.0,
-                            "allocations": {
-                                "allocation": {
-                                    "@allocatedFraction": 1.0
-                                }
-                            }
+                            "meanAmount": 1.0
                         })
                     }).collect::<Vec<_>>()
                 }
@@ -7808,12 +8332,7 @@ mod tests {
                             "referenceToFlowDataSet": {
                                 "@refObjectId": flow_id
                             },
-                            "meanAmount": 1.0,
-                            "allocations": {
-                                "allocation": {
-                                    "@allocatedFraction": 1.0
-                                }
-                            }
+                            "meanAmount": 1.0
                         });
                         if let Some(exchange_location) = exchange_location {
                             exchange["location"] = json!(exchange_location);
@@ -8852,27 +9371,114 @@ mod tests {
     }
 
     #[test]
-    fn allocation_fraction_parses_percent_and_numeric() {
-        let exchange_percent = json!({
-            "allocations": { "allocation": { "@allocatedFraction": "25%" } }
+    fn allocation_fraction_selects_quantitative_reference_target() {
+        let exchange = json!({
+            "allocations": {
+                "allocation": [
+                    {
+                        "@internalReferenceToCoProduct": "2",
+                        "@allocatedFraction": "40"
+                    },
+                    {
+                        "@internalReferenceToCoProduct": "1",
+                        "@allocatedFraction": "60"
+                    }
+                ]
+            }
         });
-        let exchange_numeric = json!({
-            "allocations": { "allocation": { "@allocatedFraction": "25" } }
-        });
-        let (fraction_percent, _) =
-            resolve_allocation_fraction(&exchange_percent, AllocationMode::Strict).expect("parse");
-        let (fraction_numeric, _) =
-            resolve_allocation_fraction(&exchange_numeric, AllocationMode::Strict).expect("parse");
-        assert_close(fraction_percent, 0.25);
-        assert_close(fraction_numeric, 0.25);
+        let outputs = HashSet::from(["1".to_owned(), "2".to_owned()]);
+        let (fraction, state, fallback) =
+            resolve_allocation_fraction(&exchange, "2", &outputs, 2, AllocationMode::Strict)
+                .expect("parse targeted allocation");
+        assert_close(fraction, 0.4);
+        assert_eq!(state, AllocationFractionState::Present);
+        assert_eq!(fallback, AllocationFallbackState::None);
     }
 
     #[test]
-    fn allocation_fraction_strict_fails_when_missing() {
+    fn allocation_fraction_undeclared_is_one_in_all_modes() {
         let exchange = json!({});
-        let err =
-            resolve_allocation_fraction(&exchange, AllocationMode::Strict).expect_err("expected");
-        assert!(err.to_string().contains("missing"));
+        let outputs = HashSet::from(["1".to_owned()]);
+        for mode in [AllocationMode::Strict, AllocationMode::Lenient] {
+            let (fraction, state, fallback) =
+                resolve_allocation_fraction(&exchange, "1", &outputs, 1, mode)
+                    .expect("undeclared allocation is valid");
+            assert_close(fraction, 1.0);
+            assert_eq!(state, AllocationFractionState::Missing);
+            assert_eq!(fallback, AllocationFallbackState::None);
+        }
+    }
+
+    #[test]
+    fn allocation_fraction_legacy_fallbacks_are_bounded_and_observable() {
+        let outputs = HashSet::from(["1".to_owned()]);
+        let empty = json!({ "allocations": { "allocation": {} } });
+        let (fraction, state, fallback) =
+            resolve_allocation_fraction(&empty, "1", &outputs, 1, AllocationMode::Strict)
+                .expect("empty legacy placeholder");
+        assert_close(fraction, 1.0);
+        assert_eq!(state, AllocationFractionState::Missing);
+        assert_eq!(fallback, AllocationFallbackState::LegacyEmptyUndeclared);
+
+        for raw_fraction in [json!("100"), json!("100%")] {
+            let targetless = json!({
+                "allocations": {
+                    "allocation": { "@allocatedFraction": raw_fraction }
+                }
+            });
+            let (fraction, state, fallback) =
+                resolve_allocation_fraction(&targetless, "1", &outputs, 1, AllocationMode::Lenient)
+                    .expect("safe targetless legacy allocation");
+            assert_close(fraction, 1.0);
+            assert_eq!(state, AllocationFractionState::Present);
+            assert_eq!(
+                fallback,
+                AllocationFallbackState::LegacySingleOutputTargetInferred
+            );
+
+            assert!(
+                resolve_allocation_fraction(
+                    &targetless,
+                    "1",
+                    &outputs,
+                    2,
+                    AllocationMode::Lenient,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn allocation_fraction_sparse_zero_and_invalid_declared_vector_are_fail_closed() {
+        let outputs = HashSet::from(["1".to_owned(), "2".to_owned()]);
+        let sparse = json!({
+            "allocations": {
+                "allocation": {
+                    "@internalReferenceToCoProduct": "2",
+                    "@allocatedFraction": "100"
+                }
+            }
+        });
+        let (fraction, state, fallback) =
+            resolve_allocation_fraction(&sparse, "1", &outputs, 2, AllocationMode::Lenient)
+                .expect("closed sparse vector");
+        assert_close(fraction, 0.0);
+        assert_eq!(state, AllocationFractionState::SparseZero);
+        assert_eq!(fallback, AllocationFallbackState::None);
+
+        let invalid = json!({
+            "allocations": {
+                "allocation": {
+                    "@internalReferenceToCoProduct": "2",
+                    "@allocatedFraction": "40"
+                }
+            }
+        });
+        assert!(
+            resolve_allocation_fraction(&invalid, "1", &outputs, 2, AllocationMode::Lenient)
+                .is_err()
+        );
     }
 
     #[test]
@@ -8890,11 +9496,14 @@ mod tests {
         let exchanges = [
             json!({
                 "@dataSetInternalID": "1",
+                "exchangeDirection": "Output",
                 "meanAmount": "0.2"
             }),
             json!({
                 "@dataSetInternalID": "2",
-                "meanAmount": "0.5"
+                "exchangeDirection": "Output",
+                "meanAmount": "0.5",
+                "resultingAmount": "0.25"
             }),
         ];
         let exchange_refs = exchanges.iter().collect::<Vec<_>>();
@@ -8905,10 +9514,115 @@ mod tests {
             NormalizationMode::Strict,
         )
         .expect("normalize");
-        assert_close(scale, 2.0);
+        assert_close(scale, 4.0);
         assert_eq!(stats.normalized_processes, 1);
         assert_eq!(stats.missing_reference, 0);
         assert_eq!(stats.invalid_reference, 0);
+    }
+
+    #[test]
+    fn quantitative_reference_rejects_duplicate_input_and_nonpositive_exchange() {
+        let process_id = Uuid::new_v4();
+        let process_json = json!({
+            "processDataSet": {
+                "processInformation": {
+                    "quantitativeReference": { "referenceToReferenceFlow": "1" }
+                }
+            }
+        });
+        let duplicate = [
+            json!({
+                "@dataSetInternalID": "1",
+                "exchangeDirection": "Output",
+                "resultingAmount": "1"
+            }),
+            json!({
+                "@dataSetInternalID": "1",
+                "exchangeDirection": "Output",
+                "resultingAmount": "1"
+            }),
+        ];
+        let duplicate_refs = duplicate.iter().collect::<Vec<_>>();
+        assert!(
+            resolve_reference_normalization(
+                process_id,
+                &process_json,
+                &duplicate_refs,
+                NormalizationMode::Lenient,
+            )
+            .is_err()
+        );
+
+        for exchange in [
+            json!({
+                "@dataSetInternalID": "1",
+                "exchangeDirection": "Input",
+                "resultingAmount": "1"
+            }),
+            json!({
+                "@dataSetInternalID": "1",
+                "exchangeDirection": "Output",
+                "resultingAmount": "-1"
+            }),
+            json!({
+                "@dataSetInternalID": "1",
+                "exchangeDirection": "Output",
+                "resultingAmount": "0"
+            }),
+        ] {
+            let refs = [&exchange];
+            assert!(
+                resolve_reference_normalization(
+                    process_id,
+                    &process_json,
+                    &refs,
+                    NormalizationMode::Lenient,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn quantitative_reference_must_point_to_product_flow() {
+        let flow_id = Uuid::new_v4();
+        let process = test_process_meta(0, None, None);
+        let exchange = ParsedExchange {
+            process_idx: 0,
+            flow_id,
+            direction: Some(ExchangeDirection::Output),
+            direction_label: "Output".to_owned(),
+            internal_id: Some("1".to_owned()),
+            exchange_id: "reference".to_owned(),
+            flow_version: "01.00.000".to_owned(),
+            is_reference_exchange: true,
+            amount: Some(1.0),
+            allocation_state: AllocationFractionState::Missing,
+            location: None,
+        };
+
+        validate_reference_product_exchanges(
+            std::slice::from_ref(&exchange),
+            std::slice::from_ref(&process),
+            &HashMap::from([(flow_id, CompiledFlowKind::Product)]),
+        )
+        .expect("product reference");
+        assert!(
+            validate_reference_product_exchanges(
+                std::slice::from_ref(&exchange),
+                std::slice::from_ref(&process),
+                &HashMap::from([(flow_id, CompiledFlowKind::Elementary)]),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_reference_product_exchanges(
+                std::slice::from_ref(&exchange),
+                std::slice::from_ref(&process),
+                &HashMap::new(),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -9008,6 +9722,81 @@ mod tests {
             .expect("ambiguous coverage");
         assert_eq!(coverage.counts.unsupported_direction, 2);
         assert_eq!(coverage.record_count, 2);
+    }
+
+    #[test]
+    fn sparse_zero_opposite_direction_does_not_change_lcia_direction_or_coverage() {
+        let flow_id = Uuid::new_v4();
+        let parsed_exchange =
+            |direction: ExchangeDirection, amount: Option<f64>, id: &str| ParsedExchange {
+                process_idx: 0,
+                flow_id,
+                direction: Some(direction),
+                direction_label: direction.as_str().to_owned(),
+                internal_id: Some(id.to_owned()),
+                exchange_id: id.to_owned(),
+                flow_version: "01.00.000".to_owned(),
+                is_reference_exchange: false,
+                amount,
+                allocation_state: if amount == Some(0.0) {
+                    AllocationFractionState::SparseZero
+                } else {
+                    AllocationFractionState::Present
+                },
+                location: None,
+            };
+        let exchanges = [
+            parsed_exchange(ExchangeDirection::Input, Some(2.0), "nonzero-input"),
+            parsed_exchange(ExchangeDirection::Output, Some(0.0), "sparse-zero-output"),
+        ];
+        let flow_idx_by_id = HashMap::from([(flow_id, 0)]);
+        let elementary_flow_idx = HashSet::from([0]);
+        let observations = exchanges
+            .iter()
+            .filter_map(|exchange| {
+                super::lcia_exchange_observation_for_attributed_exchange(
+                    exchange,
+                    &flow_idx_by_id,
+                    &elementary_flow_idx,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].direction, Some(ExchangeDirection::Input));
+        let directions = unique_supported_direction_by_flow(&observations);
+        assert_eq!(
+            directions.get(&flow_id),
+            Some(&Some(ExchangeDirection::Input))
+        );
+
+        let factors = vec![ImpactFactorSet {
+            impact_id: Uuid::new_v4(),
+            method_version: "01.00.000".to_owned(),
+            artifact_locator_id: Uuid::new_v4(),
+            impact_key: "method:input".to_owned(),
+            impact_name: "Input direction".to_owned(),
+            unit: "kg".to_owned(),
+            factors_by_flow: HashMap::from([(flow_id, 1.0)]),
+            factors_by_flow_direction: HashMap::from([((flow_id, ExchangeDirection::Input), 1.0)]),
+        }];
+        let coverage =
+            build_lcia_factor_coverage(&observations, &factors, &directions).expect("coverage");
+        assert_eq!(coverage.counts.matched, 1);
+        assert_eq!(coverage.counts.unmatched, 0);
+        assert_eq!(coverage.counts.unsupported_direction, 0);
+        assert_eq!(coverage.record_count, 0);
+
+        let invalid_amount =
+            parsed_exchange(ExchangeDirection::Input, None, "invalid-amount-evidence");
+        assert!(
+            super::lcia_exchange_observation_for_attributed_exchange(
+                &invalid_amount,
+                &flow_idx_by_id,
+                &elementary_flow_idx,
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -9114,6 +9903,232 @@ mod tests {
         assert_eq!(exchanges.len(), 2);
         assert!(exchanges[0].amount.is_some_and(f64::is_finite));
         assert_eq!(exchanges[1].amount, None);
+    }
+
+    #[test]
+    fn complete_processes_for_each_coproduct_apply_their_targeted_allocation() {
+        let product_a = Uuid::new_v4();
+        let product_b = Uuid::new_v4();
+        let input_flow = Uuid::new_v4();
+        let process_json = |reference: &str, allocations: serde_json::Value| {
+            json!({
+                "processDataSet": {
+                    "processInformation": {
+                        "quantitativeReference": { "referenceToReferenceFlow": reference }
+                    },
+                    "exchanges": {
+                        "exchange": [
+                            {
+                                "@dataSetInternalID": "1",
+                                "exchangeDirection": "Output",
+                                "referenceToFlowDataSet": { "@refObjectId": product_a },
+                                "resultingAmount": "1"
+                            },
+                            {
+                                "@dataSetInternalID": "2",
+                                "exchangeDirection": "Output",
+                                "referenceToFlowDataSet": { "@refObjectId": product_b },
+                                "resultingAmount": "1"
+                            },
+                            {
+                                "@dataSetInternalID": "3",
+                                "exchangeDirection": "Input",
+                                "referenceToFlowDataSet": { "@refObjectId": input_flow },
+                                "resultingAmount": "10",
+                                "allocations": { "allocation": allocations }
+                            }
+                        ]
+                    }
+                }
+            })
+        };
+        let allocation_vector = json!([
+            {
+                "@internalReferenceToCoProduct": "1",
+                "@allocatedFraction": "60"
+            },
+            {
+                "@internalReferenceToCoProduct": "2",
+                "@allocatedFraction": "40"
+            }
+        ]);
+        let row = |json| ProcessRow {
+            id: Uuid::new_v4(),
+            version: "01.00.000".to_owned(),
+            model_id: None,
+            user_id: None,
+            state_code: 100,
+            team_id: None,
+            review_id: None,
+            modified_at: None,
+            json,
+        };
+
+        let process_a = row(process_json("1", allocation_vector.clone()));
+        let process_b = row(process_json("2", allocation_vector));
+        let (_, exchanges_a, _, _, _) = super::parse_process_chunk(
+            &process_a,
+            0,
+            NormalizationMode::Strict,
+            AllocationMode::Strict,
+        )
+        .expect("parse process A");
+        let (_, exchanges_b, _, _, _) = super::parse_process_chunk(
+            &process_b,
+            1,
+            NormalizationMode::Strict,
+            AllocationMode::Strict,
+        )
+        .expect("parse process B");
+
+        assert_close(exchanges_a[2].amount.expect("A input amount"), 6.0);
+        assert_close(exchanges_b[2].amount.expect("B input amount"), 4.0);
+        assert!(exchanges_a[0].is_reference_exchange);
+        assert!(!exchanges_a[1].is_reference_exchange);
+        assert!(!exchanges_b[0].is_reference_exchange);
+        assert!(exchanges_b[1].is_reference_exchange);
+
+        let sparse_process = row(process_json(
+            "1",
+            json!({
+                "@internalReferenceToCoProduct": "2",
+                "@allocatedFraction": "100"
+            }),
+        ));
+        let (_, sparse_exchanges, _, _, _) = super::parse_process_chunk(
+            &sparse_process,
+            2,
+            NormalizationMode::Lenient,
+            AllocationMode::Lenient,
+        )
+        .expect("parse sparse-zero process");
+        assert_close(
+            sparse_exchanges[2].amount.expect("sparse input amount"),
+            0.0,
+        );
+        assert_eq!(
+            sparse_exchanges[2].allocation_state,
+            AllocationFractionState::SparseZero
+        );
+    }
+
+    #[test]
+    fn parse_process_chunk_counts_safe_legacy_allocation_fallbacks() {
+        let reference_flow = Uuid::new_v4();
+        let input_flow = Uuid::new_v4();
+        let process = ProcessRow {
+            id: Uuid::new_v4(),
+            version: "01.00.000".to_owned(),
+            model_id: None,
+            user_id: None,
+            state_code: 100,
+            team_id: None,
+            review_id: None,
+            modified_at: None,
+            json: json!({
+                "processDataSet": {
+                    "processInformation": {
+                        "quantitativeReference": { "referenceToReferenceFlow": "1" }
+                    },
+                    "exchanges": {
+                        "exchange": [
+                            {
+                                "@dataSetInternalID": "1",
+                                "exchangeDirection": "Output",
+                                "referenceToFlowDataSet": { "@refObjectId": reference_flow },
+                                "resultingAmount": "1",
+                                "allocations": { "allocation": {} }
+                            },
+                            {
+                                "@dataSetInternalID": "2",
+                                "exchangeDirection": "Input",
+                                "referenceToFlowDataSet": { "@refObjectId": input_flow },
+                                "resultingAmount": "10",
+                                "allocations": {
+                                    "allocation": { "@allocatedFraction": "100%" }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }),
+        };
+
+        let (_, exchanges, _, _, allocation_stats) = super::parse_process_chunk(
+            &process,
+            0,
+            NormalizationMode::Strict,
+            AllocationMode::Strict,
+        )
+        .expect("parse safe legacy fallbacks");
+
+        assert_close(exchanges[0].amount.expect("reference amount"), 1.0);
+        assert_close(exchanges[1].amount.expect("input amount"), 10.0);
+        assert_eq!(
+            allocation_stats.legacy_empty_allocation_as_undeclared_count,
+            1
+        );
+        assert_eq!(
+            allocation_stats.legacy_single_output_target_inferred_count,
+            1
+        );
+    }
+
+    #[test]
+    fn parse_process_chunk_does_not_infer_when_another_output_lacks_an_id() {
+        let reference_flow = Uuid::new_v4();
+        let coproduct_flow = Uuid::new_v4();
+        let input_flow = Uuid::new_v4();
+        let process = ProcessRow {
+            id: Uuid::new_v4(),
+            version: "01.00.000".to_owned(),
+            model_id: None,
+            user_id: None,
+            state_code: 100,
+            team_id: None,
+            review_id: None,
+            modified_at: None,
+            json: json!({
+                "processDataSet": {
+                    "processInformation": {
+                        "quantitativeReference": { "referenceToReferenceFlow": "1" }
+                    },
+                    "exchanges": {
+                        "exchange": [
+                            {
+                                "@dataSetInternalID": "1",
+                                "exchangeDirection": "Output",
+                                "referenceToFlowDataSet": { "@refObjectId": reference_flow },
+                                "resultingAmount": "1"
+                            },
+                            {
+                                "exchangeDirection": "Output",
+                                "referenceToFlowDataSet": { "@refObjectId": coproduct_flow },
+                                "resultingAmount": "1"
+                            },
+                            {
+                                "@dataSetInternalID": "3",
+                                "exchangeDirection": "Input",
+                                "referenceToFlowDataSet": { "@refObjectId": input_flow },
+                                "resultingAmount": "10",
+                                "allocations": {
+                                    "allocation": { "@allocatedFraction": "100" }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }),
+        };
+
+        let error = super::parse_process_chunk(
+            &process,
+            0,
+            NormalizationMode::Strict,
+            AllocationMode::Strict,
+        )
+        .expect_err("targetless allocation must stay ambiguous");
+        assert!(format!("{error:#}").contains("exactly one Output"));
     }
 
     #[test]

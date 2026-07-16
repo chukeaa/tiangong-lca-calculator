@@ -38,9 +38,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-07-12
-lastReviewedCommit: 9b66c8714fbbe15c7e25418ac963dc2c764ed8e1
-lastReviewedNote: "Added release-bundle, per-method coverage, worker-only projection, and exact diagnostic-scope proof for Issues #116/#118."
+lastReviewedAt: 2026-07-15
+lastReviewedCommit: 19c4ddbf18a8792c939341ba97ab8393112b7be3
+lastReviewedNote: "Reviewed bounded targetless allocation compatibility and successful-task replay proof for Issue #121."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -81,6 +81,26 @@ The local `pre-push` hook runs the docpact gate first and then runs `make check`
 | runtime SQL expectation docs or local migration helpers | baseline gates plus `./scripts/validate_additive_migration.sh` when the task touches migration expectations | record separately when durable schema proof is required in `database-engine` | Local migration files here are not the workspace-wide source of truth. |
 | manual debug, parity, or target-validation scripts | run the touched script with safe args or `--help` when available, plus baseline gates if code changed nearby | `./scripts/run_full_compute_debug.sh`, `./scripts/run_bw25_validation.sh`, or `./scripts/validate_lcia_targets.sh` as applicable | `bw25-validator` is manual-only and out-of-band. |
 | repo docs, `.env.example`, or docpact config only | `scripts/docpact validate-config --root . --strict`; `scripts/docpact lint --root . --worktree --mode enforce` | perform route checks for affected intent surfaces such as `solver-runtime`, `package-worker`, or `runtime-sql-boundary` | Refresh review metadata even when prose-only docs change. Keep `.env.example` secret-free. |
+
+## Replay A Previously Successful Calculation
+
+Use this acceptance flow when a matrix-build or allocation-semantics change needs proof against a previously successful calculation:
+
+1. Select a completed calculation whose resolved process closure contains at least one process with co-product allocation data affected by the change. Keep one or more unaffected processes from the same scope as controls.
+2. Capture the baseline before replay: the canonical original request and its hash; worker job ID; solve job ID; snapshot ID; result ID; result artifact URL, format, byte size, and SHA-256; and the snapshot process/flow/impact counts plus A/B/C nonzero counts.
+3. Replay the same business request with new build and solve job IDs, a new requested snapshot ID, a new result ID, and fresh idempotency/request keys. Do not mutate or reuse the completed task records.
+4. Verify that the updated `allocation_semantics_version` participates in snapshot identity/reuse decisions, and confirm that the worker's resolved snapshot ID identifies a newly built snapshot rather than the baseline snapshot or another reused pre-change artifact.
+5. Export and independently validate both results, keeping separate output paths:
+
+   ```bash
+   ./scripts/export_latest_matrices.sh --result-id <old-result-id> --base-name before --no-latest-pointers
+   ./scripts/export_latest_matrices.sh --result-id <new-result-id> --base-name after --no-latest-pointers
+   ./scripts/run_bw25_validation.sh --result-id <old-result-id>
+   ./scripts/run_bw25_validation.sh --result-id <new-result-id>
+   ```
+
+6. Compare by process and flow UUID rather than matrix index. Record the old/new A and B entries for affected processes, the old/new target LCIA values with absolute and relative deltas, and tolerance results for the unaffected control processes.
+7. Perform every replay write only in staging or a local environment with isolated database and object-storage state. Production reads may be used to select or copy an authorized baseline, but production mutation, enqueue, snapshot creation, cache invalidation, or active-pointer changes are prohibited as validation steps.
 
 ## Minimum PR Note Quality
 

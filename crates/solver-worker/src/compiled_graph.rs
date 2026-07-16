@@ -236,6 +236,10 @@ pub struct CompiledAllocationStats {
     pub fraction_present_count: i64,
     pub fraction_missing_count: i64,
     pub fraction_invalid_count: i64,
+    #[serde(default)]
+    pub legacy_empty_allocation_as_undeclared_count: i64,
+    #[serde(default)]
+    pub legacy_single_output_target_inferred_count: i64,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -266,7 +270,9 @@ pub struct CompiledGraph {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompiledEdgePartition, ScopeProcessPartition};
+    use serde_json::json;
+
+    use super::{CompiledAllocationStats, CompiledEdgePartition, ScopeProcessPartition};
 
     #[test]
     fn compiled_edge_partition_tracks_cross_partition_edges() {
@@ -284,5 +290,19 @@ mod tests {
             ),
             CompiledEdgePartition::PrivateToPublic
         );
+    }
+
+    #[test]
+    fn legacy_allocation_stats_default_fallback_counts_to_zero() {
+        let stats: CompiledAllocationStats = serde_json::from_value(json!({
+            "exchange_total": 4,
+            "fraction_present_count": 2,
+            "fraction_missing_count": 2,
+            "fraction_invalid_count": 0
+        }))
+        .expect("parse legacy allocation stats");
+
+        assert_eq!(stats.legacy_empty_allocation_as_undeclared_count, 0);
+        assert_eq!(stats.legacy_single_output_target_inferred_count, 0);
     }
 }

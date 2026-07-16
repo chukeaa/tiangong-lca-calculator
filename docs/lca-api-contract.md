@@ -236,7 +236,22 @@ legacy pgmq/debug 路径语义：
 
 `snapshot` artifact 当前格式：`snapshot-hdf5:v1`。
 
+Snapshot 的 Process 身份契约是：一个完整 TIDAS Process revision 只代表其 `quantitativeReference.referenceToReferenceFlow`，并且只对应一个 process index / 矩阵列。非 reference co-product output 不生成派生 Process、矩阵列或 eligible provider；若 co-product `B` 需要参与计算，上游必须提供另一个完整、独立、以 `B` 为 quantitative reference 的 Process revision。
+
+Snapshot build 对 exchange allocation 使用 target-aware 语义：object/array 都按 `@internalReferenceToCoProduct` 匹配当前 quantitative reference，TIDAS `Perc` 统一除以 `100`；闭合 allocation vector 中缺少当前 target 表示稀疏零，完全未声明 allocation 表示 fraction `1`。Legacy compatibility 只允许两个有界 fallback：仅 scalar `allocations.allocation = {}` 按 undeclared/fraction `1` 处理；单个 targetless full allocation 仅在 Process 的物理 `Output` 恰好为 `1`、该 Output 的唯一有效 internal ID 等于 quantitative reference、且 fraction 为 canonical `100` 或 legacy string 精确 `"100%"` 时推断 target 为当前 reference、fraction 为 `1`。空数组、`[{}]`、multiple-output / multiple-entry targetless、非 full targetless fraction、无效 Output ID、无法命中 quantitative reference 以及其他无效声明均 fail closed。
+
+当前语义通过 build config 的 `allocation_semantics_version = tidas-quantitative-reference-v2` 记录，并进入 source fingerprint，避免复用 v1 或更早语义 snapshot。
+
+显式零或稀疏零 allocation 得到的 Input 不展开 provider closure、不产生 provider-gap diagnostics，也不写入 `A`；零 attributed elementary exchange 也不写入 `B`，不参与 LCIA direction 与 factor-coverage evidence。它只表示该 exchange 对当前 quantitative reference 没有 attributed burden。
+
 snapshot coverage diagnostics 会暴露 snapshot 构建阶段的 provider linking 和矩阵写入质量统计，用于解释供应链连接完整性。当前 coverage schema 为 `snapshot_coverage.v2`，在保留 `provider_decision_diagnostics` 兼容字段的同时，新增按用途分组的 summary：
+
+`allocation_semantics_version` 属于 snapshot build config / source identity。本次语义变更不升级 `snapshot_coverage.v2`，但以 additive、default-zero 字段增加两个兼容计数；旧 artifact 缺少它们时按 `0` 读取：
+
+- `allocation.legacy_empty_allocation_as_undeclared_count`：按 scalar `{}` legacy fallback 视为 undeclared 的 exchange 数。
+- `allocation.legacy_single_output_target_inferred_count`：在唯一物理 Output 的有效 internal ID 等于 quantitative reference 时，安全推断 full targetless allocation 的 exchange 数。
+
+这两个字段用于审计 compatibility normalization，不产生新的通用 fallback，也不把其他 invalid allocation 降级为 warning。
 
 Provider-link 的运行时决策顺序、默认 provider rule、candidate eligibility 和 provider diagnostics 维护在 `docs/provider-linking.md`。本文档只定义 worker/API 消费这些 coverage 与 artifact 字段的契约边界。
 

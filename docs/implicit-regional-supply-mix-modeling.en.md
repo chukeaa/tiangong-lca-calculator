@@ -270,15 +270,28 @@ If a non-positive volume means that a provider is unavailable, that meaning shou
 
 ## Boundary Between Allocation Fraction and Provider Eligibility
 
-`allocation_fraction` is used for exchange amount attribution:
+A complete TIDAS Process represents only its `quantitativeReference.referenceToReferenceFlow` and contributes exactly one process index / matrix column to a snapshot. Other co-product outputs in that Process do not create derived columns and do not gain provider eligibility. If co-product `B` must participate independently in calculation or supply another Process, upstream must provide another complete, independent TIDAS Process whose quantitative reference is `B`.
+
+`allocation_fraction` is used to attribute exchange amounts to the current quantitative reference:
 
 ```text
-normalized exchange amount = raw amount * reference_scale * allocation_fraction
+normalized exchange amount = calculation amount * reference_scale * selected allocation fraction
 ```
 
-It may continue to scale attributed input, output, or elementary exchange amounts, but it does not grant provider eligibility. A non-reference output with an amount and allocation fraction only shows that the exchange participates in the current process dataset's allocation accounting; it does not mean that the process can automatically supply product input demand for that output flow.
+The calculation amount is selected in `resultingAmount -> meanAmount -> meanValue` order. `allocations.allocation` may be an object or an array; the worker selects the entry whose `@internalReferenceToCoProduct` equals `quantitativeReference.referenceToReferenceFlow`. `@allocatedFraction` uses TIDAS `Perc` semantics, so strings and numbers are percentages divided by `100`; a `%` suffix is invalid.
 
-If allocated co-product provider linking is needed later, it should be implemented as an explicit rule with independent product-semantics, allocation, output-amount, and diagnostics evidence, not inferred from same-`flow_id` matching alone.
+If a declared allocation vector's non-zero entries close to `100%` but omit the current reference target, the omission is a sparse zero and the selected fraction is `0`. If an exchange does not declare `allocations` at all, its selected fraction is `1`.
+
+For legacy data, the worker accepts only two bounded fallbacks:
+
+- a scalar `allocations.allocation = {}` is treated as legacy undeclared, with selected fraction `1`; an empty array, `[{}]`, a missing `allocation` field, or a non-empty object that lacks a target/fraction does not qualify;
+- one targetless entry is inferred for the current reference only when the Process has exactly one physical `Output` exchange, that Output's sole valid internal ID equals the quantitative reference, and the fraction is canonical full `100` or the exact legacy string `"100%"`; the selected fraction is then `1`.
+
+All other targetless declarations remain ambiguous and fail closed, including multiple Outputs, multiple entries, non-full fractions, invalid Output IDs, or a reference that cannot be matched. Duplicate or unknown targets, non-finite or out-of-range fractions, non-closing totals, and other malformed structures likewise cannot fall back to `1`. These bounds prevent compatibility normalization from silently attributing one co-product's allocation to another quantitative reference.
+
+Allocation may scale attributed input, output, or elementary exchange amounts, but it does not grant provider eligibility. A non-reference output with an amount and allocation fraction only shows that the exchange participates in the current Process's allocation accounting; it does not mean that the Process can automatically supply product input demand for that output flow.
+
+Snapshot build config records `allocation_semantics_version = tidas-quantitative-reference-v2` and includes it in the source fingerprint so snapshots built under v1 or earlier semantics are not reused. The coverage schema remains `snapshot_coverage.v2`, with two additive default-zero compatibility counters in its allocation summary: `legacy_empty_allocation_as_undeclared_count` and `legacy_single_output_target_inferred_count`. Older artifacts that omit them deserialize both as `0`.
 
 ## Relationship to an Explicit Market Process
 
