@@ -22,8 +22,8 @@ checkPaths:
   - docs/review-submit-fast-gate-contract.md
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
-lastReviewedAt: 2026-07-16
-lastReviewedCommit: 31f2bb4af9a73c39e548d9a0d8390ace92647ad5
+lastReviewedAt: 2026-07-17
+lastReviewedCommit: 7822f8988e0702faa745c0e97509f851450d81e7
 lastReviewedNote: "Reviewed for Issue #123: immutable Calculation Bundle v1, directional LCI, exact graph identities, and bounded all-unit result chunks."
 related:
   - AGENTS.md

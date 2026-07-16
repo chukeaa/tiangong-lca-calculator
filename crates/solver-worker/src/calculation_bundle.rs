@@ -30,6 +30,7 @@ use crate::{
 pub const CALCULATION_BUNDLE_FORMAT: &str = "tiangong.calculation-bundle.v1";
 pub const CALCULATION_BUNDLE_MANIFEST_CONTENT_TYPE: &str = "application/json";
 pub const CALCULATION_BUNDLE_CHUNK_PROCESS_COUNT: usize = 256;
+const CALCULATION_BUNDLE_GZIP_CONTENT_TYPE: &str = "application/gzip";
 const CALCULATION_CONTRACT_VERSION: &str = "1.0.0";
 const GZIP_LEVEL: u32 = 6;
 
@@ -131,10 +132,11 @@ pub async fn upload_built_calculation_bundle(
     for artifact in &bundle.artifacts {
         let relative_key = format!("{relative_prefix}/{}", artifact.metadata.path);
         let key = store.prefixed_object_key(&relative_key)?;
+        let storage_content_type = calculation_bundle_storage_content_type(&artifact.metadata)?;
         store
             .upload_object_key_file(
                 &key,
-                artifact.metadata.media_type.as_str(),
+                storage_content_type,
                 &artifact.local_path,
                 artifact.metadata.byte_size,
             )
@@ -160,6 +162,18 @@ pub async fn upload_built_calculation_bundle(
         manifest_byte_size: bundle.manifest_byte_size,
         artifact_count: bundle.artifacts.len(),
     })
+}
+
+fn calculation_bundle_storage_content_type(
+    artifact: &CalculationBundleArtifact,
+) -> anyhow::Result<&str> {
+    match artifact.compression.as_str() {
+        "gzip" => Ok(CALCULATION_BUNDLE_GZIP_CONTENT_TYPE),
+        "none" => Ok(artifact.media_type.as_str()),
+        compression => Err(anyhow::anyhow!(
+            "unsupported Calculation Bundle artifact compression: {compression}"
+        )),
+    }
 }
 
 #[derive(Debug)]
@@ -1395,6 +1409,46 @@ mod tests {
                 .iter()
                 .map(|artifact| (&artifact.path, &artifact.sha256))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn compressed_artifacts_use_gzip_storage_content_type() {
+        let mut writer = fixture_writer();
+        writer
+            .write_result_chunk(
+                0,
+                &[SolveResult {
+                    x: Some(vec![1.0]),
+                    g: None,
+                    h: Some(vec![0.0; 25]),
+                    factorization_state: FactorizationState::Ready,
+                }],
+            )
+            .unwrap();
+        let built = writer.finish().unwrap();
+        let lci = built
+            .manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == "lci")
+            .unwrap();
+        assert_eq!(lci.media_type, "application/x-ndjson");
+        assert_eq!(lci.compression, "gzip");
+        assert_eq!(
+            calculation_bundle_storage_content_type(lci).unwrap(),
+            CALCULATION_BUNDLE_GZIP_CONTENT_TYPE
+        );
+
+        let coverage = built
+            .manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == "coverage")
+            .unwrap();
+        assert_eq!(
+            calculation_bundle_storage_content_type(coverage).unwrap(),
+            "application/json"
         );
     }
 }

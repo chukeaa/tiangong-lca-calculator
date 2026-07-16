@@ -33,8 +33,8 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-07-16
-lastReviewedCommit: 31f2bb4af9a73c39e548d9a0d8390ace92647ad5
+lastReviewedAt: 2026-07-17
+lastReviewedCommit: 7822f8988e0702faa745c0e97509f851450d81e7
 lastReviewedNote: "Reviewed Calculation Bundle v1 ownership, exact release evidence in snapshot artifacts, and bounded directional LCI/LCIA chunk generation for Issue #123."
 related:
   - ../../AGENTS.md
