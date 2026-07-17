@@ -31,7 +31,8 @@ use solver_worker::calculation_evidence::{
     LciaFactorCoverageEvidence, LciaMethodFactorCoverage, LciaUncharacterizedEvidenceArtifact,
     LciaUncharacterizedRecord, MISSING_FACTOR_SEMANTICS, PUBLIC_PLUS_OWNER_DRAFT_SCOPE,
     PublicOwnerDraftBuildRequest, UNCHARACTERIZED_ARTIFACT_FORMAT, ValidatedPublicOwnerDraftScope,
-    validate_calculation_evidence, validate_public_owner_draft_build_request,
+    canonical_json_bytes, sha256_bytes, validate_calculation_evidence,
+    validate_public_owner_draft_build_request,
 };
 use solver_worker::compiled_graph::{
     CompiledAllocationStats, CompiledBiosphereEdge, CompiledEdgePartition,
@@ -41,8 +42,9 @@ use solver_worker::compiled_graph::{
     CompiledProviderFailureReason, CompiledProviderGeographyTier, CompiledProviderOutput,
     CompiledProviderOutputAllocationState, CompiledProviderResolutionStrategy,
     CompiledProviderSupplyRegionSource, CompiledReferenceStats, CompiledReleaseEvidence,
-    CompiledReleaseInventoryExchange, CompiledReleaseProcess, CompiledReleaseTechnosphereEdge,
-    CompiledTechnosphereEdge,
+    CompiledReleaseInventoryExchange, CompiledReleaseProcess, CompiledReleaseSourceDataset,
+    CompiledReleaseSourceDatasetRole, CompiledReleaseSourceDatasetType,
+    CompiledReleaseTechnosphereEdge, CompiledTechnosphereEdge,
 };
 use solver_worker::db_pool::{APP_SNAPSHOT_BUILDER, WorkerDbPoolOptions};
 use solver_worker::graph_types::{
@@ -247,6 +249,13 @@ struct MethodRow {
     id: Uuid,
     version: String,
     json: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SourceDatasetReference {
+    dataset_type: CompiledReleaseSourceDatasetType,
+    id: Uuid,
+    version: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -3138,6 +3147,8 @@ async fn compile_scope_graph(
 
     let flow_meta = fetch_flow_meta(pool, &flow_candidates, versioned_scope).await?;
     let flow_release_metadata = fetch_flow_release_metadata(pool, &flow_meta).await?;
+    let source_datasets =
+        build_frozen_source_datasets(pool, &processes, &flow_meta, impact_factor_sets).await?;
     if versioned_scope.is_some() {
         for flow_id in &exchange_flow_candidates {
             if !flow_meta.contains_key(flow_id) {
@@ -3467,6 +3478,7 @@ async fn compile_scope_graph(
         &flow_release_metadata,
         &flow_kind_by_id,
         release_technosphere_edges,
+        source_datasets,
     )?;
 
     Ok(CompiledScopeGraph {
@@ -3539,6 +3551,7 @@ fn build_compiled_release_evidence(
     flow_metadata: &HashMap<Uuid, FlowReleaseMetadata>,
     flow_kind_by_id: &HashMap<Uuid, CompiledFlowKind>,
     mut technosphere_edges: Vec<CompiledReleaseTechnosphereEdge>,
+    source_datasets: Vec<CompiledReleaseSourceDataset>,
 ) -> anyhow::Result<CompiledReleaseEvidence> {
     let mut release_processes = Vec::with_capacity(processes.len());
     for process in processes {
@@ -3629,6 +3642,7 @@ fn build_compiled_release_evidence(
         inventory_exchanges,
         technosphere_edges,
         biosphere_edges,
+        source_datasets,
     })
 }
 
@@ -6087,6 +6101,449 @@ async fn fetch_flow_meta(
     Ok(out)
 }
 
+fn source_dataset_type_from_reference(value: &str) -> Option<CompiledReleaseSourceDatasetType> {
+    match value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "contact data set" => Some(CompiledReleaseSourceDatasetType::Contact),
+        "flow data set" => Some(CompiledReleaseSourceDatasetType::Flow),
+        "flow property data set" => Some(CompiledReleaseSourceDatasetType::FlowProperty),
+        "lcia method data set" => Some(CompiledReleaseSourceDatasetType::LciaMethod),
+        "process data set" => Some(CompiledReleaseSourceDatasetType::Process),
+        "source data set" => Some(CompiledReleaseSourceDatasetType::Source),
+        "unit group data set" => Some(CompiledReleaseSourceDatasetType::UnitGroup),
+        _ => None,
+    }
+}
+
+fn valid_source_dataset_version(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 9
+        && bytes[2] == b'.'
+        && bytes[5] == b'.'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| index == 2 || index == 5 || byte.is_ascii_digit())
+}
+
+fn collect_source_dataset_references(
+    value: &Value,
+    references: &mut BTreeSet<SourceDatasetReference>,
+) -> anyhow::Result<()> {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_source_dataset_references(item, references)?;
+            }
+        }
+        Value::Object(map) => {
+            if let Some(dataset_type) = map
+                .get("@type")
+                .and_then(Value::as_str)
+                .and_then(source_dataset_type_from_reference)
+            {
+                let id_value = map
+                    .get("@refObjectId")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "source closure {} reference is missing @refObjectId",
+                            dataset_type.as_str()
+                        )
+                    })?;
+                let id = Uuid::parse_str(id_value).map_err(|_| {
+                    anyhow::anyhow!(
+                        "source closure {} reference has invalid UUID: {id_value}",
+                        dataset_type.as_str()
+                    )
+                })?;
+                let version = match map.get("@version") {
+                    None => None,
+                    Some(Value::String(value)) => {
+                        let value = value.trim();
+                        if !valid_source_dataset_version(value) {
+                            return Err(anyhow::anyhow!(
+                                "source closure {} reference has invalid version: {value}",
+                                dataset_type.as_str()
+                            ));
+                        }
+                        Some(value.to_owned())
+                    }
+                    Some(_) => {
+                        return Err(anyhow::anyhow!(
+                            "source closure {} reference version must be a string",
+                            dataset_type.as_str()
+                        ));
+                    }
+                };
+                references.insert(SourceDatasetReference {
+                    dataset_type,
+                    id,
+                    version,
+                });
+            }
+            for child in map.values() {
+                collect_source_dataset_references(child, references)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn source_reference_is_satisfied(
+    datasets: &BTreeMap<
+        (CompiledReleaseSourceDatasetType, Uuid, String),
+        CompiledReleaseSourceDataset,
+    >,
+    reference: &SourceDatasetReference,
+) -> bool {
+    datasets.keys().any(|(dataset_type, id, version)| {
+        *dataset_type == reference.dataset_type
+            && *id == reference.id
+            && reference
+                .version
+                .as_ref()
+                .is_none_or(|expected| version == expected)
+    })
+}
+
+fn insert_compiled_source_dataset(
+    datasets: &mut BTreeMap<
+        (CompiledReleaseSourceDatasetType, Uuid, String),
+        CompiledReleaseSourceDataset,
+    >,
+    dataset_type: CompiledReleaseSourceDatasetType,
+    role: CompiledReleaseSourceDatasetRole,
+    id: Uuid,
+    version: String,
+    document: &Value,
+) -> anyhow::Result<()> {
+    if !valid_source_dataset_version(&version) {
+        return Err(anyhow::anyhow!(
+            "source closure {} has invalid version for {id}: {version}",
+            dataset_type.as_str()
+        ));
+    }
+    let document_id = source_dataset_document_id(dataset_type, document)?;
+    if document_id != id {
+        return Err(anyhow::anyhow!(
+            "source closure {} document identity mismatch: expected={id} actual={document_id}",
+            dataset_type.as_str()
+        ));
+    }
+    let document = sorted_json(document);
+    let document_sha256 = sha256_bytes(&canonical_json_bytes(&document)?);
+    let key = (dataset_type, id, version.clone());
+    if let Some(existing) = datasets.get(&key) {
+        if existing.document_sha256 != document_sha256 {
+            return Err(anyhow::anyhow!(
+                "source closure document drift for {}:{id}@{version}",
+                dataset_type.as_str()
+            ));
+        }
+        return Ok(());
+    }
+    datasets.insert(
+        key,
+        CompiledReleaseSourceDataset {
+            dataset_type,
+            role,
+            dataset_id: id,
+            dataset_version: version,
+            document_sha256,
+            document,
+        },
+    );
+    Ok(())
+}
+
+fn source_dataset_query(
+    dataset_type: CompiledReleaseSourceDatasetType,
+) -> anyhow::Result<&'static str> {
+    match dataset_type {
+        CompiledReleaseSourceDatasetType::Contact => Ok(
+            "SELECT id, btrim(version::text) AS version, COALESCE(json, json_ordered::jsonb) AS json FROM public.contacts WHERE id = ANY($1)",
+        ),
+        CompiledReleaseSourceDatasetType::FlowProperty => Ok(
+            "SELECT id, btrim(version::text) AS version, COALESCE(json, json_ordered::jsonb) AS json FROM public.flowproperties WHERE id = ANY($1)",
+        ),
+        CompiledReleaseSourceDatasetType::LciaMethod => Ok(
+            "SELECT id, btrim(version::text) AS version, COALESCE(json, json_ordered::jsonb) AS json FROM public.lciamethods WHERE id = ANY($1)",
+        ),
+        CompiledReleaseSourceDatasetType::Source => Ok(
+            "SELECT id, btrim(version::text) AS version, COALESCE(json, json_ordered::jsonb) AS json FROM public.sources WHERE id = ANY($1)",
+        ),
+        CompiledReleaseSourceDatasetType::UnitGroup => Ok(
+            "SELECT id, btrim(version::text) AS version, COALESCE(json, json_ordered::jsonb) AS json FROM public.unitgroups WHERE id = ANY($1)",
+        ),
+        CompiledReleaseSourceDatasetType::Flow | CompiledReleaseSourceDatasetType::Process => {
+            Err(anyhow::anyhow!(
+                "{} closure rows must come from the exact snapshot selection",
+                dataset_type.as_str()
+            ))
+        }
+    }
+}
+
+async fn fetch_source_dataset_rows(
+    pool: &PgPool,
+    dataset_type: CompiledReleaseSourceDatasetType,
+    ids: &[Uuid],
+) -> anyhow::Result<Vec<MethodRow>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(source_dataset_query(dataset_type)?)
+        .bind(ids)
+        .fetch_all(pool)
+        .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(MethodRow {
+                id: row.try_get("id")?,
+                version: row.try_get::<String, _>("version")?.trim().to_owned(),
+                json: row.try_get("json")?,
+            })
+        })
+        .collect()
+}
+
+fn resolve_source_dataset_row<'a>(
+    dataset_type: CompiledReleaseSourceDatasetType,
+    reference: &SourceDatasetReference,
+    rows: &'a [MethodRow],
+) -> anyhow::Result<&'a MethodRow> {
+    let mut candidates = rows
+        .iter()
+        .filter(|row| {
+            row.id == reference.id
+                && reference
+                    .version
+                    .as_ref()
+                    .is_none_or(|version| row.version == *version)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| right.version.cmp(&left.version));
+    let selected = candidates.first().copied().ok_or_else(|| {
+        anyhow::anyhow!(
+            "source closure {} reference could not resolve exact dataset {}@{}",
+            dataset_type.as_str(),
+            reference.id,
+            reference.version.as_deref().unwrap_or("<omitted>")
+        )
+    })?;
+    if candidates
+        .get(1)
+        .is_some_and(|candidate| candidate.version == selected.version)
+    {
+        return Err(anyhow::anyhow!(
+            "source closure {} reference is ambiguous for {}@{}",
+            dataset_type.as_str(),
+            reference.id,
+            selected.version
+        ));
+    }
+    Ok(selected)
+}
+
+fn source_dataset_document_id(
+    dataset_type: CompiledReleaseSourceDatasetType,
+    document: &Value,
+) -> anyhow::Result<Uuid> {
+    let value = dataset_type.document_uuid(document).ok_or_else(|| {
+        anyhow::anyhow!(
+            "source closure {} document is missing its canonical common:UUID",
+            dataset_type.as_str()
+        )
+    })?;
+    Uuid::parse_str(value).map_err(|_| {
+        anyhow::anyhow!(
+            "source closure {} document has invalid common:UUID: {value}",
+            dataset_type.as_str()
+        )
+    })
+}
+
+fn resolve_lcia_method_source_row<'a>(
+    method_id: Uuid,
+    method_version: &str,
+    artifact_locator_id: Uuid,
+    rows: &'a [MethodRow],
+) -> anyhow::Result<&'a MethodRow> {
+    let lookup = SourceDatasetReference {
+        dataset_type: CompiledReleaseSourceDatasetType::LciaMethod,
+        id: artifact_locator_id,
+        version: Some(method_version.to_owned()),
+    };
+    let row =
+        resolve_source_dataset_row(CompiledReleaseSourceDatasetType::LciaMethod, &lookup, rows)?;
+    let document_id =
+        source_dataset_document_id(CompiledReleaseSourceDatasetType::LciaMethod, &row.json)?;
+    if document_id != method_id {
+        return Err(anyhow::anyhow!(
+            "source closure LCIA method identity alias mismatch: method={method_id}@{method_version} locator={artifact_locator_id} document={document_id}"
+        ));
+    }
+    Ok(row)
+}
+
+async fn build_frozen_source_datasets(
+    pool: &PgPool,
+    processes: &[ProcessRow],
+    flows: &HashMap<Uuid, FlowRow>,
+    impact_factor_sets: &[ImpactFactorSet],
+) -> anyhow::Result<Vec<CompiledReleaseSourceDataset>> {
+    let mut datasets = BTreeMap::<
+        (CompiledReleaseSourceDatasetType, Uuid, String),
+        CompiledReleaseSourceDataset,
+    >::new();
+    for process in processes {
+        insert_compiled_source_dataset(
+            &mut datasets,
+            CompiledReleaseSourceDatasetType::Process,
+            CompiledReleaseSourceDatasetRole::UnitProcess,
+            process.id,
+            process.version.clone(),
+            &process.json,
+        )?;
+    }
+    for flow in flows.values() {
+        insert_compiled_source_dataset(
+            &mut datasets,
+            CompiledReleaseSourceDatasetType::Flow,
+            CompiledReleaseSourceDatasetRole::Support,
+            flow.id,
+            flow.version.clone(),
+            &flow.json,
+        )?;
+    }
+
+    let mut method_sources = BTreeMap::<(Uuid, String), Uuid>::new();
+    for impact in impact_factor_sets {
+        let key = (impact.impact_id, impact.method_version.clone());
+        if let Some(existing_locator) =
+            method_sources.insert(key.clone(), impact.artifact_locator_id)
+            && existing_locator != impact.artifact_locator_id
+        {
+            return Err(anyhow::anyhow!(
+                "LCIA method source has conflicting artifact locators for {}@{}: {existing_locator} != {}",
+                key.0,
+                key.1,
+                impact.artifact_locator_id
+            ));
+        }
+    }
+    if !method_sources.is_empty() {
+        let method_ids = method_sources
+            .values()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let rows = fetch_source_dataset_rows(
+            pool,
+            CompiledReleaseSourceDatasetType::LciaMethod,
+            &method_ids,
+        )
+        .await?;
+        for ((method_id, method_version), artifact_locator_id) in method_sources {
+            let row = resolve_lcia_method_source_row(
+                method_id,
+                &method_version,
+                artifact_locator_id,
+                &rows,
+            )?;
+            insert_compiled_source_dataset(
+                &mut datasets,
+                CompiledReleaseSourceDatasetType::LciaMethod,
+                CompiledReleaseSourceDatasetRole::Support,
+                method_id,
+                row.version.clone(),
+                &row.json,
+            )?;
+        }
+    }
+
+    for _ in 0..16 {
+        let mut references = BTreeSet::new();
+        for dataset in datasets.values() {
+            collect_source_dataset_references(&dataset.document, &mut references)?;
+        }
+        let missing = references
+            .into_iter()
+            .filter(|reference| !source_reference_is_satisfied(&datasets, reference))
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            let mut result = datasets.into_values().collect::<Vec<_>>();
+            result.sort_by(|left, right| {
+                left.dataset_type
+                    .cmp(&right.dataset_type)
+                    .then_with(|| left.dataset_id.cmp(&right.dataset_id))
+                    .then_with(|| left.dataset_version.cmp(&right.dataset_version))
+            });
+            return Ok(result);
+        }
+        if let Some(reference) = missing.iter().find(|reference| {
+            matches!(
+                reference.dataset_type,
+                CompiledReleaseSourceDatasetType::Flow | CompiledReleaseSourceDatasetType::Process
+            )
+        }) {
+            return Err(anyhow::anyhow!(
+                "source closure {} reference is outside the exact snapshot selection: {}@{}",
+                reference.dataset_type.as_str(),
+                reference.id,
+                reference.version.as_deref().unwrap_or("<omitted>")
+            ));
+        }
+
+        for dataset_type in [
+            CompiledReleaseSourceDatasetType::Contact,
+            CompiledReleaseSourceDatasetType::FlowProperty,
+            CompiledReleaseSourceDatasetType::LciaMethod,
+            CompiledReleaseSourceDatasetType::Source,
+            CompiledReleaseSourceDatasetType::UnitGroup,
+        ] {
+            let type_references = missing
+                .iter()
+                .filter(|reference| reference.dataset_type == dataset_type)
+                .collect::<Vec<_>>();
+            if type_references.is_empty() {
+                continue;
+            }
+            let ids = type_references
+                .iter()
+                .map(|reference| reference.id)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let rows = fetch_source_dataset_rows(pool, dataset_type, &ids).await?;
+            for reference in type_references {
+                let row = resolve_source_dataset_row(dataset_type, reference, &rows)?;
+                insert_compiled_source_dataset(
+                    &mut datasets,
+                    dataset_type,
+                    CompiledReleaseSourceDatasetRole::Support,
+                    row.id,
+                    row.version.clone(),
+                    &row.json,
+                )?;
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "source closure reference graph exceeded the maximum supported depth"
+    ))
+}
+
 async fn fetch_flow_release_metadata(
     pool: &PgPool,
     flows: &HashMap<Uuid, FlowRow>,
@@ -7518,25 +7975,26 @@ mod tests {
         DEFAULT_SNAPSHOT_DB_STATEMENT_TIMEOUT_SECONDS, ExchangeDirection, FlowRow, ImpactFactorSet,
         LciaExchangeObservation, MethodSelection, MultiProviderDecision, NormalizationMode,
         ParsedExchange, ProcessMeta, ProcessRow, ProviderRule, SnapshotBuildConfig,
-        SnapshotSelectionMode, SourceSnapshotSummary, accumulate_finite_factor,
-        add_technosphere_edge, assemble_sparse_payload, attach_artifact_lifecycle,
-        biosphere_gross_value, build_compiled_release_evidence, build_lcia_factor_coverage,
-        build_review_submit_overlay_graph, candidate_count_bucket_label,
+        SnapshotSelectionMode, SourceDatasetReference, SourceSnapshotSummary,
+        accumulate_finite_factor, add_technosphere_edge, assemble_sparse_payload,
+        attach_artifact_lifecycle, biosphere_gross_value, build_compiled_release_evidence,
+        build_lcia_factor_coverage, build_review_submit_overlay_graph,
+        candidate_count_bucket_label, collect_source_dataset_references,
         compute_review_submit_overlay_source_hash, compute_scope_hash,
-        compute_source_fingerprint_from_summary, geo_score, location_granularity_label,
-        no_provider_failure_reason, normalize_request_roots, parse_number,
-        parse_process_annual_supply_or_production_volume, parse_process_states,
-        parse_provider_rule_list, resolve_allocation_fraction, resolve_multi_provider,
-        resolve_process_selection, resolve_reference_normalization,
+        compute_source_fingerprint_from_summary, geo_score, insert_compiled_source_dataset,
+        location_granularity_label, no_provider_failure_reason, normalize_request_roots,
+        parse_number, parse_process_annual_supply_or_production_volume, parse_process_states,
+        parse_provider_rule_list, resolve_allocation_fraction, resolve_lcia_method_source_row,
+        resolve_multi_provider, resolve_process_selection, resolve_reference_normalization,
         review_submit_root_dependency_fingerprint, snapshot_db_statement_timeout,
-        summarize_matching_diagnostics, time_score, unique_supported_direction_by_flow,
-        validate_flow_row_visibility, validate_process_row_visibility,
-        validate_reference_product_exchanges,
+        source_dataset_document_id, source_reference_is_satisfied, summarize_matching_diagnostics,
+        time_score, unique_supported_direction_by_flow, validate_flow_row_visibility,
+        validate_process_row_visibility, validate_reference_product_exchanges,
     };
     use chrono::Utc;
     use clap::Parser;
     use serde_json::json;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use uuid::Uuid;
 
     use solver_worker::compiled_graph::{
@@ -7546,7 +8004,9 @@ mod tests {
         CompiledProviderDecisionKind, CompiledProviderFailureReason, CompiledProviderGeographyTier,
         CompiledProviderOutput, CompiledProviderOutputAllocationState,
         CompiledProviderResolutionStrategy, CompiledProviderSupplyRegionSource,
-        CompiledReferenceStats, CompiledReleaseEvidence, CompiledReleaseTechnosphereEdge,
+        CompiledReferenceStats, CompiledReleaseEvidence, CompiledReleaseSourceDataset,
+        CompiledReleaseSourceDatasetRole, CompiledReleaseSourceDatasetType,
+        CompiledReleaseTechnosphereEdge,
     };
     use solver_worker::graph_types::{RequestRootProcess, ScopeProcessPartition};
     use solver_worker::pgbouncer_sqlx::postgres::PgPoolOptions;
@@ -8065,6 +8525,7 @@ mod tests {
             inventory_exchanges: Vec::new(),
             technosphere_edges: Vec::new(),
             biosphere_edges: Vec::new(),
+            source_datasets: Vec::new(),
         });
         let method = MethodSelection {
             has_lcia: false,
@@ -10752,6 +11213,197 @@ mod tests {
     }
 
     #[test]
+    fn source_closure_reference_scan_preserves_exact_and_omitted_versions() {
+        let flow_property_id = Uuid::new_v4();
+        let process_id = Uuid::new_v4();
+        let source_id = Uuid::new_v4();
+        let document = json!({
+            "references": [
+                {
+                    "@type": "flow property data set",
+                    "@refObjectId": flow_property_id,
+                    "@version": "01.02.003"
+                },
+                {
+                    "@type": "source data set",
+                    "@refObjectId": source_id
+                },
+                {
+                    "@type": "process data set",
+                    "@refObjectId": process_id,
+                    "@version": "01.02.003"
+                }
+            ]
+        });
+        let mut references = BTreeSet::new();
+        collect_source_dataset_references(&document, &mut references)
+            .expect("scan source references");
+
+        assert!(references.contains(&SourceDatasetReference {
+            dataset_type: CompiledReleaseSourceDatasetType::FlowProperty,
+            id: flow_property_id,
+            version: Some("01.02.003".to_owned()),
+        }));
+        assert!(references.contains(&SourceDatasetReference {
+            dataset_type: CompiledReleaseSourceDatasetType::Source,
+            id: source_id,
+            version: None,
+        }));
+        assert!(references.contains(&SourceDatasetReference {
+            dataset_type: CompiledReleaseSourceDatasetType::Process,
+            id: process_id,
+            version: Some("01.02.003".to_owned()),
+        }));
+    }
+
+    #[test]
+    fn source_closure_reference_scan_rejects_invalid_recognized_reference() {
+        let document = json!({
+            "reference": {
+                "@type": "contact data set",
+                "@refObjectId": "not-a-uuid",
+                "@version": "01.00.000"
+            }
+        });
+        let error = collect_source_dataset_references(&document, &mut BTreeSet::new())
+            .expect_err("recognized malformed reference must fail closed");
+        assert!(error.to_string().contains("invalid UUID"));
+    }
+
+    #[test]
+    fn source_closure_hashes_canonical_documents_and_rejects_same_version_drift() {
+        let process_id = Uuid::new_v4();
+        let document = json!({
+            "processDataSet": {
+                "z": 2,
+                "a": 1,
+                "processInformation": {
+                    "dataSetInformation": {
+                        "common:UUID": process_id.to_string()
+                    }
+                }
+            }
+        });
+        let mut datasets = BTreeMap::<
+            (CompiledReleaseSourceDatasetType, Uuid, String),
+            CompiledReleaseSourceDataset,
+        >::new();
+        insert_compiled_source_dataset(
+            &mut datasets,
+            CompiledReleaseSourceDatasetType::Process,
+            CompiledReleaseSourceDatasetRole::UnitProcess,
+            process_id,
+            "01.00.000".to_owned(),
+            &document,
+        )
+        .expect("insert canonical source dataset");
+        let dataset = datasets.values().next().expect("source dataset");
+        assert_eq!(
+            dataset.document, document,
+            "document keys are normalized before hashing"
+        );
+
+        let drift = insert_compiled_source_dataset(
+            &mut datasets,
+            CompiledReleaseSourceDatasetType::Process,
+            CompiledReleaseSourceDatasetRole::UnitProcess,
+            process_id,
+            "01.00.000".to_owned(),
+            &json!({
+                "processDataSet": {
+                    "a": 1,
+                    "z": 3,
+                    "processInformation": {
+                        "dataSetInformation": {
+                            "common:UUID": process_id.to_string()
+                        }
+                    }
+                }
+            }),
+        )
+        .expect_err("same identity/version content drift must fail closed");
+        assert!(drift.to_string().contains("document drift"));
+    }
+
+    #[test]
+    fn source_closure_exact_reference_does_not_accept_a_different_version() {
+        let source_id = Uuid::new_v4();
+        let mut datasets = BTreeMap::<
+            (CompiledReleaseSourceDatasetType, Uuid, String),
+            CompiledReleaseSourceDataset,
+        >::new();
+        insert_compiled_source_dataset(
+            &mut datasets,
+            CompiledReleaseSourceDatasetType::Source,
+            CompiledReleaseSourceDatasetRole::Support,
+            source_id,
+            "02.00.000".to_owned(),
+            &json!({
+                "sourceDataSet": {
+                    "sourceInformation": {
+                        "dataSetInformation": {
+                            "common:UUID": source_id.to_string()
+                        }
+                    }
+                }
+            }),
+        )
+        .expect("insert source dataset");
+
+        assert!(source_reference_is_satisfied(
+            &datasets,
+            &SourceDatasetReference {
+                dataset_type: CompiledReleaseSourceDatasetType::Source,
+                id: source_id,
+                version: None,
+            }
+        ));
+        assert!(!source_reference_is_satisfied(
+            &datasets,
+            &SourceDatasetReference {
+                dataset_type: CompiledReleaseSourceDatasetType::Source,
+                id: source_id,
+                version: Some("01.00.000".to_owned()),
+            }
+        ));
+    }
+
+    #[test]
+    fn source_closure_preserves_lcia_method_identity_when_storage_uses_a_locator_alias() {
+        let method_id = Uuid::new_v4();
+        let locator_id = Uuid::new_v4();
+        let method_version = "01.01.000";
+        let document = json!({
+            "LCIAMethodDataSet": {
+                "LCIAMethodInformation": {
+                    "dataSetInformation": {
+                        "common:UUID": method_id.to_string()
+                    }
+                }
+            }
+        });
+        let rows = vec![super::MethodRow {
+            id: locator_id,
+            version: method_version.to_owned(),
+            json: document.clone(),
+        }];
+
+        let row = resolve_lcia_method_source_row(method_id, method_version, locator_id, &rows)
+            .expect("reviewed locator alias should resolve to the semantic method identity");
+        assert_eq!(row.id, locator_id);
+        assert_eq!(
+            source_dataset_document_id(CompiledReleaseSourceDatasetType::LciaMethod, &document)
+                .expect("document method id"),
+            method_id
+        );
+
+        let mismatch =
+            resolve_lcia_method_source_row(Uuid::new_v4(), method_version, locator_id, &rows)
+                .expect_err("unreviewed locator/document identity drift must fail closed");
+        assert!(mismatch.to_string().contains("identity alias mismatch"));
+    }
+
+    #[test]
     fn release_evidence_resolves_only_omitted_flow_versions_from_metadata() {
         let process_id = Uuid::new_v4();
         let product_flow_id = Uuid::new_v4();
@@ -10834,6 +11486,7 @@ mod tests {
             &flow_metadata,
             &flow_kinds,
             technosphere_edges,
+            Vec::new(),
         )
         .expect("release evidence");
 

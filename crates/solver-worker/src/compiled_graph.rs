@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::graph_types::ScopeProcessPartition;
@@ -273,7 +274,7 @@ pub struct CompiledGraph {
     pub reference_stats: CompiledReferenceStats,
     pub allocation_stats: CompiledAllocationStats,
     pub matching_stats: CompiledMatchingStats,
-    /// Exact source identities required to materialize directional LCI and one-hop release models.
+    /// Exact source identities required to materialize directional LCI and release datasets.
     /// Older snapshot artifacts do not contain this additive field and are intentionally not
     /// eligible for canonical Calculation Bundle generation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -286,6 +287,104 @@ pub struct CompiledReleaseEvidence {
     pub inventory_exchanges: Vec<CompiledReleaseInventoryExchange>,
     pub technosphere_edges: Vec<CompiledReleaseTechnosphereEdge>,
     pub biosphere_edges: Vec<CompiledReleaseInventoryExchange>,
+    /// Exact canonical TIDAS documents selected while the snapshot was built.
+    /// Calculation Bundle generation requires this additive evidence and never
+    /// reconstructs it from mutable database state during solve execution.
+    #[serde(default)]
+    pub source_datasets: Vec<CompiledReleaseSourceDataset>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CompiledReleaseSourceDatasetType {
+    Contact,
+    Flow,
+    FlowProperty,
+    LciaMethod,
+    Process,
+    Source,
+    UnitGroup,
+}
+
+impl CompiledReleaseSourceDatasetType {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Contact => "contact",
+            Self::Flow => "flow",
+            Self::FlowProperty => "flowproperty",
+            Self::LciaMethod => "lciamethod",
+            Self::Process => "process",
+            Self::Source => "source",
+            Self::UnitGroup => "unitgroup",
+        }
+    }
+
+    #[must_use]
+    pub const fn directory(self) -> &'static str {
+        match self {
+            Self::Contact => "contacts",
+            Self::Flow => "flows",
+            Self::FlowProperty => "flowproperties",
+            Self::LciaMethod => "lciamethods",
+            Self::Process => "processes",
+            Self::Source => "sources",
+            Self::UnitGroup => "unitgroups",
+        }
+    }
+
+    #[must_use]
+    pub const fn document_identity_keys(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Contact => ("contactDataSet", "contactInformation"),
+            Self::Flow => ("flowDataSet", "flowInformation"),
+            Self::FlowProperty => ("flowPropertyDataSet", "flowPropertiesInformation"),
+            Self::LciaMethod => ("LCIAMethodDataSet", "LCIAMethodInformation"),
+            Self::Process => ("processDataSet", "processInformation"),
+            Self::Source => ("sourceDataSet", "sourceInformation"),
+            Self::UnitGroup => ("unitGroupDataSet", "unitGroupInformation"),
+        }
+    }
+
+    #[must_use]
+    pub fn document_uuid(self, document: &Value) -> Option<&str> {
+        let (root_key, information_key) = self.document_identity_keys();
+        document
+            .get(root_key)?
+            .get(information_key)?
+            .get("dataSetInformation")?
+            .get("common:UUID")?
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompiledReleaseSourceDatasetRole {
+    Support,
+    UnitProcess,
+}
+
+impl CompiledReleaseSourceDatasetRole {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Support => "support",
+            Self::UnitProcess => "unit_process",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompiledReleaseSourceDataset {
+    pub dataset_type: CompiledReleaseSourceDatasetType,
+    pub role: CompiledReleaseSourceDatasetRole,
+    pub dataset_id: Uuid,
+    pub dataset_version: String,
+    pub document_sha256: String,
+    pub document: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
