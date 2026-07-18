@@ -23,8 +23,8 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
 lastReviewedAt: 2026-07-17
-lastReviewedCommit: c17105151ed3125b2d30a66ab79d9b81a1d241a2
-lastReviewedNote: "Reviewed for Issue #123: immutable Calculation Bundle v1, directional LCI, exact graph identities, and bounded all-unit result chunks."
+lastReviewedCommit: 6d61068445ebfad0fb3e07469f6d0468d692574a
+lastReviewedNote: "Reviewed for Issue #127: frozen TIDAS source closure in Calculation Bundle v1 and exact LCIA method identity aliases."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -244,6 +244,7 @@ legacy pgmq/debug 路径语义：
 
 ```text
 calculation-bundle.json
+source/source-closure.ndjson.gz
 axes/processes-000000.ndjson.gz
 axes/inventory-000000.ndjson.gz
 graph/technosphere-000000.ndjson.gz
@@ -255,12 +256,15 @@ evidence/coverage.json
 
 - 每个 canonical chunk 固定覆盖最多 256 个连续 process index；NDJSON record 使用 canonical JSON 和单个换行，gzip 固定 level 6、mtime 0、无文件名/comment。
 - manifest 的 `artifacts[]` 按 path 排序，记录 compressed/uncompressed SHA-256、byte size、record count 与 process-index boundary；`bundleContentHash` 不包含生成时间、对象存储 URL 或自身 hash。
+- `source/source-closure.ndjson.gz` 使用 `tiangong.source-closure.bundle.v1`，每条 `tiangong.source-closure.dataset.v1` record 固化 dataset type、role、TIDAS UUID/version、目标包内 path、canonical document SHA-256 与完整 TIDAS JSON。Process role 固定为 `unit_process`，其余为 `support`；它是 Calculation Bundle 的原始输入证据，不是由结果反推的派生视图。
 - process axis 固化 Process UUID/version 和唯一 quantitative reference 的 exchange internal ID、Flow UUID/version、reference unit 与归一化 amount；inventory axis 逐 exchange 保存 allocation target 与 selected fraction。
-- 普通 fresh snapshot 与 review-submit overlay snapshot 都必须把 `compiled_graph.release_evidence` 写入 snapshot artifact。若 exchange 的 Flow 引用省略 `@version`，release evidence 使用本次 snapshot 实际选择的 Flow metadata version；若引用显式给出版本，则该版本保持绑定，且 unit metadata 只允许来自同一版本，不能静默回退到另一版本。Flow Property 或 Unit Group 引用省略版本时，使用当前可见数据中最高的规范化 ILCD version；显式版本只允许 exact match。任何未能得到合法 Flow version 或 reference unit 的情况都在 Calculation Bundle 构建时 fail closed。
+- 普通 fresh snapshot 与 review-submit overlay snapshot 都必须把 `compiled_graph.release_evidence` 及 `source_datasets` 写入 snapshot artifact。source closure 从本次 snapshot 精确选择的 Process/Flow revision 和已审 LCIA Method identity 出发，递归解析 Contact、Flow Property、Source、Unit Group 与 LCIA Method reference；显式版本只允许 exact match，省略的 support version 选择最高 fixed-width ILCD version，缺失、歧义、无效 UUID/version 或同 identity/version 内容漂移均 fail closed。Process/Flow 仍受 snapshot scope 约束；被这些可发布根文档精确引用的 support document 按 UUID/version 展开，不在 solve 时重新查询。
+- 若 exchange 的 Flow 引用省略 `@version`，release evidence 使用本次 snapshot 实际选择的 Flow metadata version；若引用显式给出版本，则该版本保持绑定，且 unit metadata 只允许来自同一版本，不能静默回退到另一版本。任何未能得到合法 Flow version 或 reference unit 的情况都在 Calculation Bundle 构建时 fail closed。
+- 已审 LCIA static-cache 中方法 UUID 与 artifact locator 不同的已知 alias，只允许 locator 用于精确读取源文档；source closure、LCIA axis 与最终发布始终使用文档内的 canonical method UUID/version。25 个方法任一 identity/locator/document UUID 不一致都 fail closed。
 - technosphere evidence 固化 consumer input / provider output exchange internal ID、provider weight、未分摊 normalized input amount、Flow UUID/version 和 location；split-provider 每个最终 provider 一条 edge。
 - directional LCI key 固定为 Flow UUID/version + Input/Output + reference unit + optional location；LCIA 固定绑定已审查 static-cache bundle 1.2.4 的 25 个 method UUID/version。
 - object path 使用 `calculation-bundles/<calculation-id>/<bundle-content-hash>/...`，先上传 sidecars，最后上传 manifest。job diagnostics 的 `calculation_bundle`（package build 中为 `artifactManifest.calculationBundle`）保存 manifest URL/hash/byte size 和 bundle content hash。
-- `hdf5:v1` 与 `all-unit-query:v1` 继续作为兼容/查询视图；它们不是 canonical release evidence。
+- `hdf5:v1` 与 `all-unit-query:v1` 继续作为兼容/查询视图；它们不是 canonical release evidence。旧 snapshot 缺少 frozen `source_datasets` 时必须重建，禁止在 solve 或 release 阶段从数据库当前态补齐。
 
 Snapshot 的 Process 身份契约是：一个完整 TIDAS Process revision 只代表其 `quantitativeReference.referenceToReferenceFlow`，并且只对应一个 process index / 矩阵列。非 reference co-product output 不生成派生 Process、矩阵列或 eligible provider；若 co-product `B` 需要参与计算，上游必须提供另一个完整、独立、以 `B` 为 quantitative reference 的 Process revision。
 

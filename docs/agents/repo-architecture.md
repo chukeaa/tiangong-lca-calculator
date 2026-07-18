@@ -34,8 +34,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-17
-lastReviewedCommit: c17105151ed3125b2d30a66ab79d9b81a1d241a2
-lastReviewedNote: "Reviewed Calculation Bundle v1 ownership, exact release evidence in snapshot artifacts, and bounded directional LCI/LCIA chunk generation for Issue #123."
+lastReviewedCommit: 6d61068445ebfad0fb3e07469f6d0468d692574a
+lastReviewedNote: "Reviewed frozen TIDAS source closure capture and Calculation Bundle materialization for Issue #127."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
@@ -144,7 +144,7 @@ It also owns package-job artifacts and diagnostics. The default `PACKAGE_QUEUE_B
 
 Result artifacts are persisted through the worker and supporting runtime storage flows instead of inlining heavy compute payloads into the API layer.
 
-`crates/solver-worker/src/calculation_bundle.rs` owns canonical `tiangong.calculation-bundle.v1` generation. Snapshot compilation stores an additive exact `release_evidence` projection beside the sparse payload: quantitative references, source inventory identities, direct directional biosphere exchanges, and resolved technosphere edges with both exchange internal IDs and provider weights. New all-unit solves temporarily retain `x` only inside one fixed 256-process artifact chunk, derive directional LCI from those exact direct exchanges, retain H for the existing query view, and upload content-addressed sidecars before the manifest. Older snapshots without that projection must be rebuilt and are never guessed from A/B.
+`crates/solver-worker/src/calculation_bundle.rs` owns canonical `tiangong.calculation-bundle.v1` generation. Snapshot compilation stores an additive exact `release_evidence` projection beside the sparse payload: quantitative references, source inventory identities, direct directional biosphere exchanges, resolved technosphere edges with both exchange internal IDs and provider weights, and the frozen canonical TIDAS source-document closure. The closure starts from the exact Process and Flow revisions selected by the snapshot plus the reviewed LCIA method identities, then resolves Contact, Flow Property, Source, Unit Group, and LCIA Method references by exact UUID/version; omitted support versions select the highest fixed-width ILCD version. The known reviewed method/artifact-locator alias remains a storage lookup only, while the TIDAS method UUID remains the released identity. New all-unit solves temporarily retain `x` only inside one fixed 256-process artifact chunk, derive directional LCI from those exact direct exchanges, retain H for the existing query view, and upload content-addressed sidecars before the manifest. Older snapshots without the exact release projection or source closure must be rebuilt and are never guessed from A/B or reconstructed from mutable database state during solve.
 
 ## Operational Baseline
 

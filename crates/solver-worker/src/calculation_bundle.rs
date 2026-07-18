@@ -18,9 +18,12 @@ use crate::{
         RELEASE_BUNDLE_MANIFEST_SHA256, RELEASE_BUNDLE_VERSION, RELEASE_FACTOR_MANIFEST_SHA256,
         RELEASE_METHOD_COUNT, RELEASE_METHOD_IDENTITIES, RELEASE_METHOD_IDENTITY_MANIFEST_SHA256,
         RELEASE_METHOD_MANIFEST_SHA256, RELEASE_SOURCE_SNAPSHOT_SHA256,
+        canonical_json_bytes as canonical_value_json_bytes,
     },
     compiled_graph::{
         CompiledExchangeDirection, CompiledReleaseEvidence, CompiledReleaseInventoryExchange,
+        CompiledReleaseSourceDataset, CompiledReleaseSourceDatasetRole,
+        CompiledReleaseSourceDatasetType,
     },
     snapshot_artifacts::{SnapshotBuildConfig, SnapshotCoverageReport},
     snapshot_index::{SnapshotImpactMapEntry, SnapshotIndexDocument},
@@ -280,6 +283,19 @@ struct TechnosphereRecord<'a> {
     location: Option<&'a str>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceClosureRecord<'a> {
+    schema_version: &'static str,
+    dataset_type: &'static str,
+    role: &'static str,
+    uuid: Uuid,
+    version: &'a str,
+    path: String,
+    sha256: &'a str,
+    document: &'a Value,
+}
+
 struct DeterministicGzipNdjsonWriter {
     encoder: GzEncoder<File>,
     plain_hasher: Sha256,
@@ -376,6 +392,7 @@ impl CalculationBundleWriter {
                 release_evidence.processes.len()
             ));
         }
+        validate_source_datasets(release_evidence)?;
 
         let mut processes = release_evidence
             .processes
@@ -713,6 +730,7 @@ impl CalculationBundleWriter {
         &mut self,
         release_evidence: &CompiledReleaseEvidence,
     ) -> anyhow::Result<()> {
+        self.write_source_closure_artifact(&release_evidence.source_datasets)?;
         for first_process_index in
             (0..self.processes.len()).step_by(CALCULATION_BUNDLE_CHUNK_PROCESS_COUNT)
         {
@@ -855,6 +873,60 @@ impl CalculationBundleWriter {
                 technosphere_writer.finish()?,
             );
         }
+        Ok(())
+    }
+
+    fn write_source_closure_artifact(
+        &mut self,
+        source_datasets: &[CompiledReleaseSourceDataset],
+    ) -> anyhow::Result<()> {
+        let relative_path = "source/source-closure.ndjson.gz";
+        let mut writer =
+            DeterministicGzipNdjsonWriter::create(&self.directory.path().join(relative_path))?;
+        let mut datasets = source_datasets.iter().collect::<Vec<_>>();
+        datasets.sort_by(|left, right| source_dataset_order(left, right));
+        for dataset in datasets {
+            validate_version(&dataset.dataset_version, "sourceClosure.dataset.version")?;
+            validate_sha256(&dataset.document_sha256, "sourceClosure.dataset.sha256")?;
+            let canonical_document = canonical_value_json_bytes(&dataset.document)?;
+            if sha256_bytes(canonical_document.as_slice()) != dataset.document_sha256 {
+                return Err(anyhow::anyhow!(
+                    "Calculation Bundle source closure document hash drift for {}:{}@{}",
+                    dataset.dataset_type.as_str(),
+                    dataset.dataset_id,
+                    dataset.dataset_version
+                ));
+            }
+            writer.write(&SourceClosureRecord {
+                schema_version: "tiangong.source-closure.dataset.v1",
+                dataset_type: dataset.dataset_type.as_str(),
+                role: dataset.role.as_str(),
+                uuid: dataset.dataset_id,
+                version: &dataset.dataset_version,
+                path: source_dataset_path(dataset),
+                sha256: &dataset.document_sha256,
+                document: &dataset.document,
+            })?;
+        }
+        let finished = writer.finish()?;
+        self.artifacts.push(LocalCalculationBundleArtifact {
+            metadata: CalculationBundleArtifact {
+                kind: "source_closure".to_owned(),
+                path: relative_path.to_owned(),
+                schema_version: "tiangong.source-closure.bundle.v1".to_owned(),
+                media_type: "application/x-ndjson".to_owned(),
+                compression: "gzip".to_owned(),
+                sha256: finished.sha256,
+                uncompressed_sha256: Some(finished.uncompressed_sha256),
+                byte_size: finished.byte_size,
+                uncompressed_byte_size: Some(finished.uncompressed_byte_size),
+                record_count: finished.record_count,
+                first_process_index: None,
+                last_process_index: None,
+                derived: Some(false),
+            },
+            local_path: finished.path,
+        });
         Ok(())
     }
 
@@ -1028,6 +1100,116 @@ fn inventory_exchange_order(
         .then_with(|| left.unit.cmp(&right.unit))
         .then_with(|| left.location.cmp(&right.location))
         .then_with(|| left.exchange_internal_id.cmp(&right.exchange_internal_id))
+}
+
+fn source_dataset_order(
+    left: &CompiledReleaseSourceDataset,
+    right: &CompiledReleaseSourceDataset,
+) -> std::cmp::Ordering {
+    left.dataset_type
+        .cmp(&right.dataset_type)
+        .then_with(|| left.dataset_id.cmp(&right.dataset_id))
+        .then_with(|| left.dataset_version.cmp(&right.dataset_version))
+}
+
+fn source_dataset_path(dataset: &CompiledReleaseSourceDataset) -> String {
+    format!(
+        "{}/{}_{}.json",
+        dataset.dataset_type.directory(),
+        dataset.dataset_id,
+        dataset.dataset_version
+    )
+}
+
+fn validate_source_datasets(release_evidence: &CompiledReleaseEvidence) -> anyhow::Result<()> {
+    if release_evidence.source_datasets.is_empty() {
+        return Err(anyhow::anyhow!(
+            "snapshot lacks frozen source closure evidence; rebuild the snapshot"
+        ));
+    }
+    let expected_processes = release_evidence
+        .processes
+        .iter()
+        .map(|process| (process.process_id, process.process_version.clone()))
+        .collect::<BTreeSet<_>>();
+    let mut observed_processes = BTreeSet::new();
+    let mut keys = BTreeSet::new();
+    for dataset in &release_evidence.source_datasets {
+        validate_version(&dataset.dataset_version, "sourceClosure.dataset.version")?;
+        validate_sha256(&dataset.document_sha256, "sourceClosure.dataset.sha256")?;
+        if !dataset.document.is_object() {
+            return Err(anyhow::anyhow!(
+                "source closure document must be an object for {}:{}@{}",
+                dataset.dataset_type.as_str(),
+                dataset.dataset_id,
+                dataset.dataset_version
+            ));
+        }
+        let document_id = dataset
+            .dataset_type
+            .document_uuid(&dataset.document)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "source closure document is missing canonical common:UUID for {}:{}@{}",
+                    dataset.dataset_type.as_str(),
+                    dataset.dataset_id,
+                    dataset.dataset_version
+                )
+            })?;
+        let document_id = Uuid::parse_str(document_id).map_err(|_| {
+            anyhow::anyhow!(
+                "source closure document has invalid common:UUID for {}:{}@{}",
+                dataset.dataset_type.as_str(),
+                dataset.dataset_id,
+                dataset.dataset_version
+            )
+        })?;
+        if document_id != dataset.dataset_id {
+            return Err(anyhow::anyhow!(
+                "source closure document identity mismatch for {}:{}@{}: document={document_id}",
+                dataset.dataset_type.as_str(),
+                dataset.dataset_id,
+                dataset.dataset_version
+            ));
+        }
+        if !keys.insert((
+            dataset.dataset_type,
+            dataset.dataset_id,
+            dataset.dataset_version.clone(),
+        )) {
+            return Err(anyhow::anyhow!(
+                "duplicate source closure dataset {}:{}@{}",
+                dataset.dataset_type.as_str(),
+                dataset.dataset_id,
+                dataset.dataset_version
+            ));
+        }
+        match (dataset.dataset_type, dataset.role) {
+            (
+                CompiledReleaseSourceDatasetType::Process,
+                CompiledReleaseSourceDatasetRole::UnitProcess,
+            ) => {
+                observed_processes.insert((dataset.dataset_id, dataset.dataset_version.clone()));
+            }
+            (CompiledReleaseSourceDatasetType::Process, _) => {
+                return Err(anyhow::anyhow!(
+                    "source closure Process must have unit_process role"
+                ));
+            }
+            (_, CompiledReleaseSourceDatasetRole::Support) => {}
+            (_, CompiledReleaseSourceDatasetRole::UnitProcess) => {
+                return Err(anyhow::anyhow!(
+                    "only source closure Process documents may have unit_process role"
+                ));
+            }
+        }
+    }
+    if observed_processes != expected_processes {
+        return Err(anyhow::anyhow!(
+            "source closure Process identities differ from the Calculation Bundle process axis"
+        ));
+    }
+    Ok(())
 }
 
 fn bundle_content_hash(manifest: &CalculationBundleManifest) -> anyhow::Result<String> {
@@ -1247,6 +1429,18 @@ mod tests {
             impact_map,
             calculation_evidence: None,
         };
+        let source_document = json!({
+            "processDataSet": {
+                "processInformation": {
+                    "dataSetInformation": { "common:UUID": process_id.to_string() }
+                }
+            }
+        });
+        let source_document_sha256 = sha256_bytes(
+            canonical_value_json_bytes(&source_document)
+                .unwrap()
+                .as_slice(),
+        );
         let evidence = CompiledReleaseEvidence {
             processes: vec![CompiledReleaseProcess {
                 process_idx: 0,
@@ -1293,6 +1487,14 @@ mod tests {
                 allocation_target_internal_id: "0".to_owned(),
                 allocation_fraction: 1.0,
             }],
+            source_datasets: vec![CompiledReleaseSourceDataset {
+                dataset_type: CompiledReleaseSourceDatasetType::Process,
+                role: CompiledReleaseSourceDatasetRole::UnitProcess,
+                dataset_id: process_id,
+                dataset_version: "01.00.000".to_owned(),
+                document_sha256: source_document_sha256,
+                document: source_document,
+            }],
         };
         CalculationBundleWriter::new(
             Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap(),
@@ -1323,7 +1525,7 @@ mod tests {
             .unwrap();
         let built = writer.finish().unwrap();
         assert_eq!(built.manifest.schema_version, CALCULATION_BUNDLE_FORMAT);
-        assert_eq!(built.manifest.artifacts.len(), 7);
+        assert_eq!(built.manifest.artifacts.len(), 8);
         assert_eq!(built.bundle_content_hash.len(), 64);
 
         let lci = built
@@ -1359,6 +1561,21 @@ mod tests {
         decoder.read_to_string(&mut body).unwrap();
         assert!(body.contains("\"allocationTargetInternalId\":\"0\""));
         assert!(body.contains("\"allocationFraction\":1.0"));
+
+        let source_closure = built
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.metadata.kind == "source_closure")
+            .unwrap();
+        let mut decoder = GzDecoder::new(File::open(&source_closure.local_path).unwrap());
+        let mut body = String::new();
+        decoder.read_to_string(&mut body).unwrap();
+        assert!(body.contains("\"schemaVersion\":\"tiangong.source-closure.dataset.v1\""));
+        assert!(body.contains("\"datasetType\":\"process\""));
+        assert!(body.contains("\"role\":\"unit_process\""));
+        assert!(body.contains(
+            "\"path\":\"processes/11111111-1111-4111-8111-111111111111_01.00.000.json\""
+        ));
     }
 
     #[test]
