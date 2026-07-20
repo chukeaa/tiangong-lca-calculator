@@ -33,9 +33,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-07-17
-lastReviewedCommit: 6d61068445ebfad0fb3e07469f6d0468d692574a
-lastReviewedNote: "Reviewed frozen TIDAS source closure capture and Calculation Bundle materialization for Issue #127."
+lastReviewedAt: 2026-07-20
+lastReviewedCommit: 7dbb9ced5ce00cec24c62334ca75cb12dbf18df8
+lastReviewedNote: "Reviewed review-submit gate ownership for Issue #133; the runtime family and crate map are unchanged."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml

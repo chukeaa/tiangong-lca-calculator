@@ -29,8 +29,9 @@ checkPaths:
   - docs/lca-api-contract.md
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
-lastReviewedAt: 2026-07-17
-lastReviewedCommit: 6d61068445ebfad0fb3e07469f6d0468d692574a
+lastReviewedAt: 2026-07-20
+lastReviewedCommit: 7dbb9ced5ce00cec24c62334ca75cb12dbf18df8
+lastReviewedNote: "Removed lifecycle state blocking from the worker-owned numerical gate for Issue #133; lifecycle eligibility remains a consumer/coordinator responsibility."
 related:
   - AGENTS.md
   - .docpact/config.yaml
@@ -182,7 +183,7 @@ worker runtime 不调用 final submit，也不直接修改 review-submit domain 
 默认策略：
 
 - 要求 `expected_revision_checksum == actual_revision_checksum`。
-- `allowed_scope_states = [0] + 100..=199`；`0` 表示提交审核前 draft root，`100..=199` 用于已审核 / 可用依赖数据兼容；`20` 等审核中状态不允许，仍会触发 `invalid_scope_state`。
+- `allowed_scope_states` 与 `metrics.process_scan.invalid_scope_state_count` 仅作为 `v1` JSON 兼容投影保留。worker 数值 gate 不解释 process lifecycle state，也不产生 `invalid_scope_state`；生命周期准入由前端、Edge 或 database submit coordinator 负责，且不应依赖 worker 数值结论替代服务端权威校验。
 - provider missing、unresolved、equal fallback、allocation conservation 和 volume evidence 只记录在 `metrics.provider_scan`，不作为提交审核 blocker。
 - legacy provider policy 字段 `block_equal_fallback` / `block_provider_volume_fallback` 默认为 `false`；即使旧请求传入 `true`，review-submit gate 也不再据此产生 provider blocker。
 - 默认不要求 LCIA factors；review-submit submit-readiness 只验证 `M` factorization 和 targeted `x/g` 稳定性。
@@ -222,7 +223,6 @@ DB runner 生成两类 review-submit artifact：
 | Code | 触发条件 | 主要修复方向 |
 | --- | --- | --- |
 | `revision_report_stale` | revision checksum 缺失或不匹配 | 基于当前 revision 重跑 gate |
-| `invalid_scope_state` | process record 的 `state_code` 不在 policy 允许范围 | 修正计算 scope 或 process lifecycle state |
 | `duplicate_process_version` | 同一 process ID 多个版本同时进入 gate scope | 去重或明确只纳入目标版本 |
 | `missing_or_zero_reference` | quantitative reference 未精确命中一个 exchange、direction 不是 Input/Output、最终 amount 非 finite 或为零、声明多个 reference flow，或 coverage 有 reference failure | 修复 reference identity、direction 和 finite non-zero amount |
 | `invalid_exchange_amount` | exchange amount 缺失、不可解析、带非法文本、NaN 或 Infinity | 修复 exchange amount / 单位转换 |
@@ -246,7 +246,7 @@ Provider 相关信号仍会保留在 `metrics.provider_scan` 中，供 UI 展示
 DB runner 先对权威 `processes.json_ordered` 执行 allocation semantics preflight；invalid allocation 在任何 snapshot build / persistence 前直接阻断。通过 preflight 后，snapshot compile fail closed 地验证 quantitative reference，随后 Gate 按便宜到昂贵的顺序执行：
 
 1. revision freshness。
-2. process record scan：scope state、精确 signed reference pivot、finite non-zero 最终 amount、target-aware allocation、duplicate fingerprint、service-loop。
+2. process record scan：精确 signed reference pivot、finite non-zero 最终 amount、target-aware allocation、duplicate fingerprint、service-loop；`state_code` 不参与 worker 数值阻断。
 3. balance/provider compatibility scan：unresolved、equal fallback、allocation conservation、volume evidence，仅记录 metrics。
 4. flow / LCIA semantic scan。
 5. sparse structure scan：diagonal、duplicate sparse column。
