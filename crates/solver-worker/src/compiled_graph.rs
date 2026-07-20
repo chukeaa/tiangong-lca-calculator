@@ -85,6 +85,8 @@ pub struct CompiledProcess {
 pub struct CompiledFlow {
     pub flow_idx: i32,
     pub flow_id: Uuid,
+    #[serde(default)]
+    pub flow_version: String,
     pub kind: CompiledFlowKind,
     #[serde(default)]
     pub space: CompiledFlowSpace,
@@ -244,6 +246,8 @@ pub enum CompiledProviderFailureReason {
 pub struct CompiledProviderDecision {
     pub consumer_idx: i32,
     pub flow_id: Uuid,
+    #[serde(default)]
+    pub flow_version: String,
     pub candidate_provider_count: i32,
     pub matched_provider_count: i32,
     #[serde(default)]

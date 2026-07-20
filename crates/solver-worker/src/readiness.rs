@@ -202,6 +202,8 @@ pub struct ProviderDecisionEvidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consumer_process_name: Option<String>,
     pub flow_id: Uuid,
+    #[serde(default)]
+    pub flow_version: String,
     pub candidate_provider_count: i32,
     pub matched_provider_count: i32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -525,6 +527,7 @@ fn add_reference_provider_missing_findings(
                 "consumer_process_version": consumer.map(|process| process.process_version.clone()),
                 "consumer_process_name": consumer.and_then(|process| process.process_name.clone()),
                 "flow_id": decision.flow_id,
+                "flow_version": decision.flow_version,
                 "candidate_provider_count": decision.candidate_provider_count,
                 "matched_provider_count": decision.matched_provider_count,
                 "failure_reason": "rejected_non_reference_only",
@@ -790,6 +793,7 @@ fn provider_decision_evidence(
         consumer_process_version: consumer.map(|process| process.process_version.clone()),
         consumer_process_name: consumer.and_then(|process| process.process_name.clone()),
         flow_id: decision.flow_id,
+        flow_version: decision.flow_version.clone(),
         candidate_provider_count: decision.candidate_provider_count,
         matched_provider_count: decision.matched_provider_count,
         decision_kind: decision.decision_kind.map(provider_decision_kind_label),
@@ -1194,6 +1198,7 @@ mod tests {
             blocker.details["examples"][0]["flow_id"],
             flow_id.to_string()
         );
+        assert_eq!(blocker.details["examples"][0]["flow_version"], "01.00.000");
         assert_eq!(
             blocker.details["examples"][0]["candidates"][0]["provider_id"],
             provider_id.to_string()
@@ -1435,6 +1440,7 @@ mod tests {
                 flows: vec![CompiledFlow {
                     flow_idx: 0,
                     flow_id,
+                    flow_version: "01.00.000".to_owned(),
                     kind: CompiledFlowKind::Product,
                     space: crate::compiled_graph::CompiledFlowSpace::Technosphere,
                     source_type: crate::compiled_graph::CompiledSourceFlowType::Product,
@@ -1464,6 +1470,7 @@ mod tests {
             CompiledProviderDecision {
                 consumer_idx: 1,
                 flow_id,
+                flow_version: "01.00.000".to_owned(),
                 candidate_provider_count: 1,
                 matched_provider_count: 1,
                 candidates: vec![CompiledProviderCandidate {
@@ -1501,6 +1508,7 @@ mod tests {
             CompiledProviderDecision {
                 consumer_idx: 1,
                 flow_id,
+                flow_version: "01.00.000".to_owned(),
                 candidate_provider_count: 0,
                 matched_provider_count: 0,
                 candidates: Vec::new(),

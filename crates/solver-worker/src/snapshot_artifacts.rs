@@ -670,6 +670,7 @@ mod tests {
             flows: vec![CompiledFlow {
                 flow_idx: 0,
                 flow_id: product_flow_id,
+                flow_version: "01.00.000".to_owned(),
                 kind: CompiledFlowKind::Product,
                 space: crate::compiled_graph::CompiledFlowSpace::Technosphere,
                 source_type: crate::compiled_graph::CompiledSourceFlowType::Product,

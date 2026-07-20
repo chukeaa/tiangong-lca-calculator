@@ -328,10 +328,22 @@ struct ReferencePortCandidate {
     allocation_state: AllocationFractionState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct FlowLinkIdentity {
     flow_id: Uuid,
     flow_version: String,
+}
+
+#[derive(Debug, Default)]
+struct FlowReferenceRequests {
+    exact: BTreeSet<FlowLinkIdentity>,
+    omitted: BTreeSet<Uuid>,
+}
+
+#[derive(Debug, Default)]
+struct ResolvedFlowMetadata {
+    by_identity: HashMap<FlowLinkIdentity, FlowRow>,
+    omitted_version_by_id: HashMap<Uuid, String>,
 }
 
 type ReferencePortMap = HashMap<FlowLinkIdentity, Vec<ReferencePortCandidate>>;
@@ -765,7 +777,7 @@ async fn main() -> anyhow::Result<()> {
         link_semantics_version:
             solver_worker::tidas_process_semantics::SIGNED_FLOW_LINK_SEMANTICS_VERSION.to_owned(),
         technosphere_boundary_policy: technosphere_boundary_policy.as_str().to_owned(),
-        flow_identity_policy: "exact-flow-version-reference-unit-v1".to_owned(),
+        flow_identity_policy: "exact-flow-version-reference-unit-v2".to_owned(),
         biosphere_sign_mode: "gross".to_owned(),
         self_loop_cutoff: cli.self_loop_cutoff,
         singular_eps: cli.singular_eps,
@@ -784,23 +796,20 @@ async fn main() -> anyhow::Result<()> {
         versioned_scope.as_ref(),
     )
     .await?;
-    let request_scope_flow_ids = candidate_processes
-        .iter()
-        .flat_map(|process| process_exchange_items(&process.json))
-        .filter_map(|exchange| parse_uuid_at(exchange, &["referenceToFlowDataSet", "@refObjectId"]))
-        .collect::<BTreeSet<_>>();
-    let request_scope_flow_meta =
-        fetch_flow_meta(&pool, &request_scope_flow_ids, versioned_scope.as_ref()).await?;
+    let request_scope_flow_requests = collect_process_flow_reference_requests(&candidate_processes);
+    let request_scope_flow_meta = fetch_flow_meta(
+        &pool,
+        &request_scope_flow_requests,
+        versioned_scope.as_ref(),
+    )
+    .await?;
     let request_scope_flow_spaces = request_scope_flow_meta
+        .by_identity
         .iter()
-        .map(|(flow_id, meta)| {
+        .map(|(identity, meta)| {
             let source_type = classify_source_flow_type(&meta.json);
-            (*flow_id, flow_space_for_source_type(source_type))
+            (identity.clone(), flow_space_for_source_type(source_type))
         })
-        .collect::<HashMap<_, _>>();
-    let request_scope_flow_versions = request_scope_flow_meta
-        .iter()
-        .map(|(flow_id, meta)| (*flow_id, meta.version.clone()))
         .collect::<HashMap<_, _>>();
     let resolved_scope = resolve_process_selection_with_flow_versions(
         candidate_processes,
@@ -811,7 +820,7 @@ async fn main() -> anyhow::Result<()> {
         provider_rule,
         cli.process_limit,
         Some(&request_scope_flow_spaces),
-        Some(&request_scope_flow_versions),
+        Some(&request_scope_flow_meta),
     )?;
     let fingerprint_started = Instant::now();
     let (source_summary, source_fingerprint) = compute_source_fingerprint(
@@ -1905,7 +1914,7 @@ async fn build_review_submit_overlay_graph(
     let mut graph = baseline_graph.clone();
     let target_idx = i32::try_from(graph.processes.len())
         .map_err(|_| anyhow::anyhow!("overlay target index overflow"))?;
-    let (target_meta, mut target_exchanges, target_flow_ids, target_reference, target_allocation) =
+    let (target_meta, mut target_exchanges, _target_flow_ids, target_reference, target_allocation) =
         parse_process_chunk(
             target_row,
             target_idx,
@@ -1940,57 +1949,68 @@ async fn build_review_submit_overlay_graph(
         .legacy_single_reference_target_inferred_count +=
         target_allocation.legacy_single_reference_target_inferred_count;
 
-    let mut flow_idx_by_id = graph
+    let mut flow_idx_by_identity = graph
         .flows
         .iter()
-        .map(|flow| (flow.flow_id, flow.flow_idx))
+        .map(|flow| (flow_link_identity_for_compiled_flow(flow), flow.flow_idx))
         .collect::<HashMap<_, _>>();
-    let missing_flow_ids = target_flow_ids
-        .iter()
-        .copied()
-        .filter(|flow_id| !flow_idx_by_id.contains_key(flow_id))
-        .collect::<BTreeSet<_>>();
-    let flow_meta = fetch_flow_meta(pool, &missing_flow_ids, None).await?;
-    let mut selected_flow_version_by_id = flow_meta
-        .iter()
-        .map(|(flow_id, meta)| (*flow_id, meta.version.clone()))
-        .collect::<HashMap<_, _>>();
-    for port in &graph.reference_ports {
-        if !port.flow_version.is_empty() {
-            selected_flow_version_by_id
-                .entry(port.flow_id)
-                .or_insert_with(|| port.flow_version.clone());
-        }
+    let baseline_flow_identities = flow_idx_by_identity
+        .keys()
+        .filter(|identity| !identity.flow_version.is_empty() && identity.flow_version != "unknown")
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut baseline_omitted_versions = HashMap::<Uuid, String>::new();
+    for identity in &baseline_flow_identities {
+        baseline_omitted_versions
+            .entry(identity.flow_id)
+            .and_modify(|version| {
+                if identity.flow_version > *version {
+                    version.clone_from(&identity.flow_version);
+                }
+            })
+            .or_insert_with(|| identity.flow_version.clone());
     }
-    if let Some(release_evidence) = graph.release_evidence.as_ref() {
-        for exchange in &release_evidence.inventory_exchanges {
-            if !exchange.flow_version.is_empty() && exchange.flow_version != "unknown" {
-                selected_flow_version_by_id
-                    .entry(exchange.flow_id)
-                    .or_insert_with(|| exchange.flow_version.clone());
-            }
-        }
-    }
-    resolve_selected_flow_versions(&mut target_exchanges, &selected_flow_version_by_id)?;
-    let mut flow_space_by_id = graph
+    let mut flow_requests = collect_exchange_flow_reference_requests(&target_exchanges);
+    flow_requests
+        .exact
+        .retain(|identity| !baseline_flow_identities.contains(identity));
+    flow_requests
+        .omitted
+        .retain(|flow_id| !baseline_omitted_versions.contains_key(flow_id));
+    let mut flow_meta = fetch_flow_meta(pool, &flow_requests, None).await?;
+    flow_meta
+        .omitted_version_by_id
+        .extend(baseline_omitted_versions);
+    resolve_requested_flow_versions_with_available(
+        &mut target_exchanges,
+        &flow_meta,
+        &baseline_flow_identities,
+    )?;
+    let mut flow_space_by_identity = graph
         .flows
         .iter()
-        .map(|flow| (flow.flow_id, flow.space))
+        .map(|flow| (flow_link_identity_for_compiled_flow(flow), flow.space))
         .collect::<HashMap<_, _>>();
-    flow_space_by_id.extend(flow_meta.iter().map(|(flow_id, meta)| {
+    flow_space_by_identity.extend(flow_meta.by_identity.iter().map(|(identity, meta)| {
         let source_type = classify_source_flow_type(&meta.json);
-        (*flow_id, flow_space_for_source_type(source_type))
+        (identity.clone(), flow_space_for_source_type(source_type))
     }));
     validate_quantitative_references(
         &target_exchanges,
         std::slice::from_ref(&target_meta),
-        &flow_space_by_id,
+        &flow_space_by_identity,
     )?;
-    for flow_id in missing_flow_ids {
+    let missing_flow_identities = target_exchanges
+        .iter()
+        .map(flow_link_identity)
+        .filter(|identity| !flow_idx_by_identity.contains_key(identity))
+        .collect::<BTreeSet<_>>();
+    for identity in &missing_flow_identities {
         let flow_idx =
             i32::try_from(graph.flows.len()).map_err(|_| anyhow::anyhow!("flow idx overflow"))?;
         let source_type = flow_meta
-            .get(&flow_id)
+            .by_identity
+            .get(identity)
             .map_or(CompiledSourceFlowType::Other, |meta| {
                 classify_source_flow_type(&meta.json)
             });
@@ -2002,12 +2022,13 @@ async fn build_review_submit_overlay_graph(
         };
         graph.flows.push(CompiledFlow {
             flow_idx,
-            flow_id,
+            flow_id: identity.flow_id,
+            flow_version: identity.flow_version.clone(),
             kind,
             space,
             source_type,
         });
-        flow_idx_by_id.insert(flow_id, flow_idx);
+        flow_idx_by_identity.insert(identity.clone(), flow_idx);
     }
     let elementary_flow_idx = graph
         .flows
@@ -2031,7 +2052,8 @@ async fn build_review_submit_overlay_graph(
     }
     for exchange in &target_exchanges {
         if exchange.is_reference_exchange
-            && flow_space_by_id.get(&exchange.flow_id) == Some(&CompiledFlowSpace::Technosphere)
+            && flow_space_by_identity.get(&flow_link_identity(exchange))
+                == Some(&CompiledFlowSpace::Technosphere)
         {
             reference_port_map
                 .entry(flow_link_identity(exchange))
@@ -2042,17 +2064,19 @@ async fn build_review_submit_overlay_graph(
     for ports in reference_port_map.values_mut() {
         sort_reference_port_candidates(ports, &process_meta);
     }
-    let source_flow_type_by_id = graph
+    let source_flow_type_by_identity = graph
         .flows
         .iter()
-        .map(|flow| (flow.flow_id, flow.source_type))
+        .map(|flow| (flow_link_identity_for_compiled_flow(flow), flow.source_type))
         .collect::<HashMap<_, _>>();
     graph.reference_ports =
-        compiled_reference_ports_from_map(&reference_port_map, &source_flow_type_by_id);
+        compiled_reference_ports_from_map(&reference_port_map, &source_flow_type_by_identity);
     graph.provider_outputs = legacy_provider_outputs_from_reference_port_map(&reference_port_map);
 
     for exchange in &target_exchanges {
-        if let Some(flow_idx) = flow_idx_by_id.get(&exchange.flow_id).copied()
+        if let Some(flow_idx) = flow_idx_by_identity
+            .get(&flow_link_identity(exchange))
+            .copied()
             && elementary_flow_idx.contains(&flow_idx)
             && let Some(amount) = exchange.amount
         {
@@ -2070,7 +2094,7 @@ async fn build_review_submit_overlay_graph(
 
     let balance_batch = compile_signed_flow_balances(
         &target_exchanges,
-        &flow_space_by_id,
+        &flow_space_by_identity,
         &reference_port_map,
         &process_meta,
         &graph.processes,
@@ -2622,7 +2646,7 @@ fn add_technosphere_edge(
 
 fn compiled_reference_ports_from_map(
     reference_port_map: &ReferencePortMap,
-    source_flow_type_by_id: &HashMap<Uuid, CompiledSourceFlowType>,
+    source_flow_type_by_identity: &HashMap<FlowLinkIdentity, CompiledSourceFlowType>,
 ) -> Vec<CompiledReferencePort> {
     let mut ports = reference_port_map
         .values()
@@ -2641,8 +2665,11 @@ fn compiled_reference_ports_from_map(
                     raw_direction: compiled_exchange_direction(candidate.raw_direction),
                     raw_amount: candidate.raw_amount,
                     signed_raw_coefficient: candidate.signed_raw_coefficient,
-                    source_flow_type: source_flow_type_by_id
-                        .get(&candidate.flow_id)
+                    source_flow_type: source_flow_type_by_identity
+                        .get(&flow_link_identity_from_parts(
+                            candidate.flow_id,
+                            &candidate.flow_version,
+                        ))
                         .copied()
                         .unwrap_or_default(),
                 })
@@ -2752,36 +2779,105 @@ fn reference_port_candidate_from_compiled_port(
 }
 
 fn flow_link_identity(exchange: &ParsedExchange) -> FlowLinkIdentity {
-    FlowLinkIdentity {
-        flow_id: exchange.flow_id,
-        flow_version: exchange.flow_version.clone(),
-    }
+    flow_link_identity_from_parts(exchange.flow_id, &exchange.flow_version)
 }
 
 fn flow_link_identity_for_port(port: &CompiledReferencePort) -> FlowLinkIdentity {
+    flow_link_identity_from_parts(port.flow_id, &port.flow_version)
+}
+
+fn flow_link_identity_for_compiled_flow(flow: &CompiledFlow) -> FlowLinkIdentity {
+    flow_link_identity_from_parts(flow.flow_id, &flow.flow_version)
+}
+
+fn flow_link_identity_from_parts(flow_id: Uuid, flow_version: &str) -> FlowLinkIdentity {
     FlowLinkIdentity {
-        flow_id: port.flow_id,
-        flow_version: port.flow_version.clone(),
+        flow_id,
+        flow_version: flow_version.to_owned(),
     }
 }
 
-fn resolve_selected_flow_versions(
+fn insert_flow_reference_request(
+    requests: &mut FlowReferenceRequests,
+    flow_id: Uuid,
+    flow_version: &str,
+) {
+    if flow_version == "unknown" || flow_version.is_empty() {
+        requests.omitted.insert(flow_id);
+    } else {
+        requests
+            .exact
+            .insert(flow_link_identity_from_parts(flow_id, flow_version));
+    }
+}
+
+fn collect_exchange_flow_reference_requests(exchanges: &[ParsedExchange]) -> FlowReferenceRequests {
+    let mut requests = FlowReferenceRequests::default();
+    for exchange in exchanges {
+        insert_flow_reference_request(&mut requests, exchange.flow_id, &exchange.flow_version);
+    }
+    requests
+}
+
+fn collect_process_flow_reference_requests(processes: &[ProcessRow]) -> FlowReferenceRequests {
+    let mut requests = FlowReferenceRequests::default();
+    for process in processes {
+        for exchange in process_exchange_items(&process.json) {
+            let Some(flow_id) =
+                parse_uuid_at(exchange, &["referenceToFlowDataSet", "@refObjectId"])
+            else {
+                continue;
+            };
+            let flow_version = exchange
+                .get("referenceToFlowDataSet")
+                .and_then(|value| value.get("@version"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("unknown");
+            insert_flow_reference_request(&mut requests, flow_id, flow_version);
+        }
+    }
+    requests
+}
+
+fn resolve_requested_flow_versions(
     exchanges: &mut [ParsedExchange],
-    selected_version_by_id: &HashMap<Uuid, String>,
+    flow_meta: &ResolvedFlowMetadata,
+) -> anyhow::Result<()> {
+    resolve_requested_flow_versions_with_available(exchanges, flow_meta, &HashSet::new())
+}
+
+fn resolve_requested_flow_versions_with_available(
+    exchanges: &mut [ParsedExchange],
+    flow_meta: &ResolvedFlowMetadata,
+    additional_exact_identities: &HashSet<FlowLinkIdentity>,
 ) -> anyhow::Result<()> {
     for exchange in exchanges {
-        let Some(selected_version) = selected_version_by_id.get(&exchange.flow_id) else {
-            continue;
-        };
         if exchange.flow_version == "unknown" {
+            let selected_version = flow_meta
+                .omitted_version_by_id
+                .get(&exchange.flow_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "exchange references a Flow without a resolvable visible revision: exchange={} flow={} referenced_version=<omitted>",
+                        exchange.exchange_id,
+                        exchange.flow_id
+                    )
+                })?;
             exchange.flow_version.clone_from(selected_version);
-        } else if exchange.flow_version != *selected_version {
+        } else {
+            let identity = flow_link_identity(exchange);
+            if flow_meta.by_identity.contains_key(&identity)
+                || additional_exact_identities.contains(&identity)
+            {
+                continue;
+            }
             return Err(anyhow::anyhow!(
-                "exchange flow version does not match the snapshot-selected exact revision: exchange={} flow={} referenced_version={} selected_version={}",
+                "exchange references a missing or invisible exact Flow revision: exchange={} flow={} referenced_version={}",
                 exchange.exchange_id,
                 exchange.flow_id,
-                exchange.flow_version,
-                selected_version
+                exchange.flow_version
             ));
         }
     }
@@ -3088,7 +3184,7 @@ fn parse_process_chunk(
 fn validate_quantitative_references(
     exchanges: &[ParsedExchange],
     processes: &[ProcessMeta],
-    flow_space_by_id: &HashMap<Uuid, CompiledFlowSpace>,
+    flow_space_by_identity: &HashMap<FlowLinkIdentity, CompiledFlowSpace>,
 ) -> anyhow::Result<()> {
     for process in processes {
         let reference_exchanges = exchanges
@@ -3106,7 +3202,7 @@ fn validate_quantitative_references(
             ));
         }
         let reference_exchange = reference_exchanges[0];
-        if !flow_space_by_id.contains_key(&reference_exchange.flow_id) {
+        if !flow_space_by_identity.contains_key(&flow_link_identity(reference_exchange)) {
             return Err(anyhow::anyhow!(
                 "quantitative reference flow metadata is unavailable for process={} version={} flow={}",
                 process.process_id,
@@ -3155,7 +3251,7 @@ struct CompiledBalanceBatch {
 
 fn compile_signed_flow_balances(
     exchanges: &[ParsedExchange],
-    flow_space_by_id: &HashMap<Uuid, CompiledFlowSpace>,
+    flow_space_by_identity: &HashMap<FlowLinkIdentity, CompiledFlowSpace>,
     reference_port_map: &ReferencePortMap,
     process_meta: &[ProcessMeta],
     compiled_processes: &[CompiledProcess],
@@ -3163,7 +3259,9 @@ fn compile_signed_flow_balances(
 ) -> anyhow::Result<CompiledBalanceBatch> {
     let mut batch = CompiledBalanceBatch::default();
     for exchange in exchanges {
-        if flow_space_by_id.get(&exchange.flow_id) != Some(&CompiledFlowSpace::Technosphere) {
+        if flow_space_by_identity.get(&flow_link_identity(exchange))
+            != Some(&CompiledFlowSpace::Technosphere)
+        {
             continue;
         }
         let Some(residual_coefficient) = nonzero_residual_coefficient(exchange) else {
@@ -3284,6 +3382,7 @@ fn compile_signed_flow_balances(
         batch.decisions.push(CompiledProviderDecision {
             consumer_idx: exchange.process_idx,
             flow_id: exchange.flow_id,
+            flow_version: exchange.flow_version.clone(),
             candidate_provider_count: candidate_count,
             matched_provider_count: i32::try_from(allocations.len())
                 .map_err(|_| anyhow::anyhow!("balance allocation count overflow"))?,
@@ -3449,14 +3548,12 @@ async fn compile_scope_graph(
 
     let mut exchanges = Vec::<ParsedExchange>::new();
     let mut process_meta_by_idx = HashMap::<i32, ProcessMeta>::with_capacity(processes.len());
-    let mut flow_candidates: BTreeSet<Uuid> = BTreeSet::new();
     let mut reference_stats = ReferenceParseStats::default();
     let mut allocation_stats = AllocationParseStats::default();
     for chunk in chunks {
-        let (meta, chunk_exchanges, chunk_flow_ids, chunk_reference, chunk_allocation) = chunk?;
+        let (meta, chunk_exchanges, _chunk_flow_ids, chunk_reference, chunk_allocation) = chunk?;
         process_meta_by_idx.insert(meta.process_idx, meta);
         exchanges.extend(chunk_exchanges);
-        flow_candidates.extend(chunk_flow_ids);
         reference_stats.missing_reference += chunk_reference.missing_reference;
         reference_stats.invalid_reference += chunk_reference.invalid_reference;
         reference_stats.normalized_processes += chunk_reference.normalized_processes;
@@ -3497,64 +3594,52 @@ async fn compile_scope_graph(
         });
     }
 
-    let exchange_flow_candidates = flow_candidates.clone();
-    for impact in impact_factor_sets {
-        for flow_id in impact.factors_by_flow.keys() {
-            flow_candidates.insert(*flow_id);
-        }
-    }
-
-    let flow_meta = fetch_flow_meta(pool, &flow_candidates, versioned_scope).await?;
-    let flow_release_metadata = fetch_flow_release_metadata(pool, &flow_meta).await?;
-    let selected_flow_version_by_id = flow_meta
-        .iter()
-        .map(|(flow_id, meta)| (*flow_id, meta.version.clone()))
-        .collect::<HashMap<_, _>>();
-    resolve_selected_flow_versions(&mut exchanges, &selected_flow_version_by_id)?;
+    let flow_requests = collect_exchange_flow_reference_requests(&exchanges);
+    let flow_meta = fetch_flow_meta(pool, &flow_requests, versioned_scope).await?;
+    resolve_requested_flow_versions(&mut exchanges, &flow_meta)?;
+    let flow_release_metadata = fetch_flow_release_metadata(pool, &flow_meta.by_identity).await?;
     let source_datasets =
-        build_frozen_source_datasets(pool, &processes, &flow_meta, impact_factor_sets).await?;
-    if versioned_scope.is_some() {
-        for flow_id in &exchange_flow_candidates {
-            if !flow_meta.contains_key(flow_id) {
-                return Err(anyhow::anyhow!(
-                    "process exchange references flow outside exact visibility scope: {flow_id}"
-                ));
-            }
+        build_frozen_source_datasets(pool, &processes, &flow_meta.by_identity, impact_factor_sets)
+            .await?;
+    for exchange in &exchanges {
+        let identity = flow_link_identity(exchange);
+        if !flow_meta.by_identity.contains_key(&identity) {
+            return Err(anyhow::anyhow!(
+                "process exchange references flow outside exact visibility scope: {}@{}",
+                identity.flow_id,
+                identity.flow_version
+            ));
         }
     }
-    let source_flow_type_by_id = flow_meta
+    let source_flow_type_by_identity = flow_meta
+        .by_identity
         .iter()
-        .map(|(flow_id, meta)| (*flow_id, classify_source_flow_type(&meta.json)))
+        .map(|(identity, meta)| (identity.clone(), classify_source_flow_type(&meta.json)))
         .collect::<HashMap<_, _>>();
-    let flow_space_by_id = source_flow_type_by_id
+    let flow_space_by_identity = source_flow_type_by_identity
         .iter()
-        .map(|(flow_id, source_type)| (*flow_id, flow_space_for_source_type(*source_type)))
+        .map(|(identity, source_type)| (identity.clone(), flow_space_for_source_type(*source_type)))
         .collect::<HashMap<_, _>>();
-    let flow_kind_by_id = source_flow_type_by_id
+    let flow_kind_by_identity = source_flow_type_by_identity
         .iter()
-        .map(|(flow_id, source_type)| {
+        .map(|(identity, source_type)| {
             let kind = if *source_type == CompiledSourceFlowType::Elementary {
                 CompiledFlowKind::Elementary
             } else {
                 CompiledFlowKind::Product
             };
-            (*flow_id, kind)
+            (identity.clone(), kind)
         })
         .collect::<HashMap<_, _>>();
-    let candidate_flow_ids = if versioned_scope.is_some() {
-        let mut ids = flow_meta.keys().copied().collect::<Vec<_>>();
-        ids.sort_unstable();
-        ids
-    } else {
-        flow_candidates.into_iter().collect::<Vec<_>>()
-    };
-    let mut flows = Vec::with_capacity(candidate_flow_ids.len());
-    let mut flow_idx_by_id = HashMap::with_capacity(candidate_flow_ids.len());
+    let mut candidate_flow_identities = flow_meta.by_identity.keys().cloned().collect::<Vec<_>>();
+    candidate_flow_identities.sort_unstable();
+    let mut flows = Vec::with_capacity(candidate_flow_identities.len());
+    let mut flow_idx_by_identity = HashMap::with_capacity(candidate_flow_identities.len());
     let mut elementary_flow_idx = HashSet::new();
-    for (idx, flow_id) in candidate_flow_ids.iter().enumerate() {
+    for (idx, identity) in candidate_flow_identities.iter().enumerate() {
         let flow_index = i32::try_from(idx).map_err(|_| anyhow::anyhow!("flow idx overflow"))?;
-        let source_type = source_flow_type_by_id
-            .get(flow_id)
+        let source_type = source_flow_type_by_identity
+            .get(identity)
             .copied()
             .unwrap_or_default();
         let space = flow_space_for_source_type(source_type);
@@ -3566,21 +3651,23 @@ async fn compile_scope_graph(
         if space == CompiledFlowSpace::Biosphere {
             elementary_flow_idx.insert(flow_index);
         }
-        flow_idx_by_id.insert(*flow_id, flow_index);
+        flow_idx_by_identity.insert(identity.clone(), flow_index);
         flows.push(CompiledFlow {
             flow_idx: flow_index,
-            flow_id: *flow_id,
+            flow_id: identity.flow_id,
+            flow_version: identity.flow_version.clone(),
             kind,
             space,
             source_type,
         });
     }
-    validate_quantitative_references(&exchanges, &process_meta, &flow_space_by_id)?;
+    validate_quantitative_references(&exchanges, &process_meta, &flow_space_by_identity)?;
 
     let mut reference_port_map: ReferencePortMap = HashMap::new();
     for exchange in &exchanges {
         if exchange.is_reference_exchange
-            && flow_space_by_id.get(&exchange.flow_id) == Some(&CompiledFlowSpace::Technosphere)
+            && flow_space_by_identity.get(&flow_link_identity(exchange))
+                == Some(&CompiledFlowSpace::Technosphere)
         {
             reference_port_map
                 .entry(flow_link_identity(exchange))
@@ -3592,12 +3679,14 @@ async fn compile_scope_graph(
         sort_reference_port_candidates(ports, &process_meta);
     }
     let reference_ports =
-        compiled_reference_ports_from_map(&reference_port_map, &source_flow_type_by_id);
+        compiled_reference_ports_from_map(&reference_port_map, &source_flow_type_by_identity);
     let provider_outputs = legacy_provider_outputs_from_reference_port_map(&reference_port_map);
 
     let mut biosphere_edges = Vec::<CompiledBiosphereEdge>::new();
     for exchange in &exchanges {
-        if let Some(flow_idx) = flow_idx_by_id.get(&exchange.flow_id).copied()
+        if let Some(flow_idx) = flow_idx_by_identity
+            .get(&flow_link_identity(exchange))
+            .copied()
             && elementary_flow_idx.contains(&flow_idx)
             && let Some(amount) = exchange.amount
         {
@@ -3624,7 +3713,7 @@ async fn compile_scope_graph(
 
     let balance_batch = compile_signed_flow_balances(
         &exchanges,
-        &flow_space_by_id,
+        &flow_space_by_identity,
         &reference_port_map,
         &process_meta,
         &compiled_processes,
@@ -3641,7 +3730,7 @@ async fn compile_scope_graph(
         .filter_map(|exchange| {
             lcia_exchange_observation_for_attributed_exchange(
                 exchange,
-                &flow_idx_by_id,
+                &flow_idx_by_identity,
                 &elementary_flow_idx,
             )
         })
@@ -3651,7 +3740,7 @@ async fn compile_scope_graph(
         &process_meta,
         &exchanges,
         &flow_release_metadata,
-        &flow_kind_by_id,
+        &flow_kind_by_identity,
         release_technosphere_edges,
         source_datasets,
     )?;
@@ -3692,10 +3781,10 @@ async fn compile_scope_graph(
 
 fn lcia_exchange_observation_for_attributed_exchange(
     exchange: &ParsedExchange,
-    flow_idx_by_id: &HashMap<Uuid, i32>,
+    flow_idx_by_identity: &HashMap<FlowLinkIdentity, i32>,
     elementary_flow_idx: &HashSet<i32>,
 ) -> Option<LciaExchangeObservation> {
-    let flow_idx = flow_idx_by_id.get(&exchange.flow_id)?;
+    let flow_idx = flow_idx_by_identity.get(&flow_link_identity(exchange))?;
     if !elementary_flow_idx.contains(flow_idx) || exchange.amount == Some(0.0) {
         return None;
     }
@@ -3712,8 +3801,8 @@ fn lcia_exchange_observation_for_attributed_exchange(
 fn build_compiled_release_evidence(
     processes: &[ProcessMeta],
     exchanges: &[ParsedExchange],
-    flow_metadata: &HashMap<Uuid, FlowReleaseMetadata>,
-    flow_kind_by_id: &HashMap<Uuid, CompiledFlowKind>,
+    flow_metadata: &HashMap<FlowLinkIdentity, FlowReleaseMetadata>,
+    flow_kind_by_identity: &HashMap<FlowLinkIdentity, CompiledFlowKind>,
     mut technosphere_edges: Vec<CompiledReleaseTechnosphereEdge>,
     source_datasets: Vec<CompiledReleaseSourceDataset>,
 ) -> anyhow::Result<CompiledReleaseEvidence> {
@@ -3733,7 +3822,7 @@ fn build_compiled_release_evidence(
             ));
         }
         let reference = reference_exchanges[0];
-        let metadata = flow_metadata.get(&reference.flow_id);
+        let metadata = flow_metadata.get(&flow_link_identity(reference));
         let (reference_flow_version, reference_unit) =
             release_flow_identity(&reference.flow_version, metadata);
         release_processes.push(CompiledReleaseProcess {
@@ -3768,7 +3857,8 @@ fn build_compiled_release_evidence(
         let Some(amount) = exchange.amount else {
             continue;
         };
-        let metadata = flow_metadata.get(&exchange.flow_id);
+        let identity = flow_link_identity(exchange);
+        let metadata = flow_metadata.get(&identity);
         let (flow_version, unit) = release_flow_identity(&exchange.flow_version, metadata);
         let release_exchange = CompiledReleaseInventoryExchange {
             process_idx: exchange.process_idx,
@@ -3786,7 +3876,7 @@ fn build_compiled_release_evidence(
                 .map(|direction| direction.signed_flow_direction().sign() * amount),
         };
         inventory_exchanges.push(release_exchange.clone());
-        if flow_kind_by_id.get(&exchange.flow_id) == Some(&CompiledFlowKind::Elementary)
+        if flow_kind_by_identity.get(&identity) == Some(&CompiledFlowKind::Elementary)
             && amount != 0.0
         {
             biosphere_edges.push(release_exchange);
@@ -3794,11 +3884,12 @@ fn build_compiled_release_evidence(
     }
     inventory_exchanges.sort_by(compiled_release_inventory_order);
     biosphere_edges.sort_by(compiled_release_inventory_order);
-    for edge in &mut technosphere_edges {
-        if edge.flow_version == "unknown"
-            && let Some(metadata) = flow_metadata.get(&edge.flow_id)
-        {
-            edge.flow_version.clone_from(&metadata.version);
+    for edge in &technosphere_edges {
+        if edge.flow_version == "unknown" {
+            return Err(anyhow::anyhow!(
+                "release technosphere edge retains an unresolved Flow version: {}",
+                edge.flow_id
+            ));
         }
     }
     technosphere_edges.sort_by(|left, right| {
@@ -3872,9 +3963,14 @@ fn assemble_sparse_payload(
         .map_err(|_| anyhow::anyhow!("process overflow"))?;
     let flow_count =
         i32::try_from(compiled_graph.flows.len()).map_err(|_| anyhow::anyhow!("flow overflow"))?;
-    let mut flow_idx_by_id = HashMap::with_capacity(compiled_graph.flows.len());
+    let mut flow_indices_by_id = HashMap::<Uuid, Vec<i32>>::new();
     for flow in &compiled_graph.flows {
-        flow_idx_by_id.insert(flow.flow_id, flow.flow_idx);
+        if flow.space == CompiledFlowSpace::Biosphere {
+            flow_indices_by_id
+                .entry(flow.flow_id)
+                .or_default()
+                .push(flow.flow_idx);
+        }
     }
 
     let mut a_map: HashMap<(i32, i32), f64> = HashMap::new();
@@ -3982,28 +4078,32 @@ fn assemble_sparse_payload(
                     else {
                         continue;
                     };
-                    if let Some(flow_idx) = flow_idx_by_id.get(flow_id).copied()
-                        && retain_sparse_value(*cf_value, true)
+                    if retain_sparse_value(*cf_value, true)
+                        && let Some(flow_indices) = flow_indices_by_id.get(flow_id)
                     {
-                        accumulate_finite_factor(
-                            &mut c_map,
-                            flow_idx,
-                            *cf_value,
-                            impact.impact_id,
-                        )?;
+                        for flow_idx in flow_indices {
+                            accumulate_finite_factor(
+                                &mut c_map,
+                                *flow_idx,
+                                *cf_value,
+                                impact.impact_id,
+                            )?;
+                        }
                     }
                 }
             } else {
                 for (flow_id, cf_value) in &impact.factors_by_flow {
-                    if let Some(flow_idx) = flow_idx_by_id.get(flow_id).copied()
-                        && cf_value.abs() > f64::EPSILON
+                    if cf_value.abs() > f64::EPSILON
+                        && let Some(flow_indices) = flow_indices_by_id.get(flow_id)
                     {
-                        accumulate_finite_factor(
-                            &mut c_map,
-                            flow_idx,
-                            *cf_value,
-                            impact.impact_id,
-                        )?;
+                        for flow_idx in flow_indices {
+                            accumulate_finite_factor(
+                                &mut c_map,
+                                *flow_idx,
+                                *cf_value,
+                                impact.impact_id,
+                            )?;
+                        }
                     }
                 }
             }
@@ -5477,7 +5577,7 @@ fn resolve_process_selection(
     request_roots: &[RequestRootProcess],
     provider_rule: ProviderRule,
     process_limit: usize,
-    flow_space_by_id: Option<&HashMap<Uuid, CompiledFlowSpace>>,
+    flow_space_by_identity: Option<&HashMap<FlowLinkIdentity, CompiledFlowSpace>>,
 ) -> anyhow::Result<ResolvedProcessSelection> {
     resolve_process_selection_with_flow_versions(
         candidate_processes,
@@ -5487,7 +5587,7 @@ fn resolve_process_selection(
         request_roots,
         provider_rule,
         process_limit,
-        flow_space_by_id,
+        flow_space_by_identity,
         None,
     )
 }
@@ -5501,8 +5601,8 @@ fn resolve_process_selection_with_flow_versions(
     request_roots: &[RequestRootProcess],
     provider_rule: ProviderRule,
     process_limit: usize,
-    flow_space_by_id: Option<&HashMap<Uuid, CompiledFlowSpace>>,
-    selected_flow_version_by_id: Option<&HashMap<Uuid, String>>,
+    flow_space_by_identity: Option<&HashMap<FlowLinkIdentity, CompiledFlowSpace>>,
+    resolved_flow_meta: Option<&ResolvedFlowMetadata>,
 ) -> anyhow::Result<ResolvedProcessSelection> {
     if request_roots.is_empty() {
         if process_limit > 0 && candidate_processes.len() > process_limit {
@@ -5590,9 +5690,8 @@ fn resolve_process_selection_with_flow_versions(
             }
             Err(error) => return Err(error),
         };
-        if let Some(selected_flow_version_by_id) = selected_flow_version_by_id {
-            if let Err(error) =
-                resolve_selected_flow_versions(&mut exchanges, selected_flow_version_by_id)
+        if let Some(resolved_flow_meta) = resolved_flow_meta {
+            if let Err(error) = resolve_requested_flow_versions(&mut exchanges, resolved_flow_meta)
             {
                 if requested_root_keys.contains(&(proc_row.id, proc_row.version.clone())) {
                     return Err(error);
@@ -5603,8 +5702,8 @@ fn resolve_process_selection_with_flow_versions(
             }
         }
         for exchange in &exchanges {
-            let is_technosphere = flow_space_by_id.is_none_or(|spaces| {
-                spaces.get(&exchange.flow_id) == Some(&CompiledFlowSpace::Technosphere)
+            let is_technosphere = flow_space_by_identity.is_none_or(|spaces| {
+                spaces.get(&flow_link_identity(exchange)) == Some(&CompiledFlowSpace::Technosphere)
             });
             if exchange.is_reference_exchange && is_technosphere {
                 reference_port_map
@@ -5619,8 +5718,9 @@ fn resolve_process_selection_with_flow_versions(
                 .into_iter()
                 .filter(|exchange| {
                     !exchange.is_reference_exchange
-                        && flow_space_by_id.is_none_or(|spaces| {
-                            spaces.get(&exchange.flow_id) == Some(&CompiledFlowSpace::Technosphere)
+                        && flow_space_by_identity.is_none_or(|spaces| {
+                            spaces.get(&flow_link_identity(exchange))
+                                == Some(&CompiledFlowSpace::Technosphere)
                         })
                 })
                 .collect(),
@@ -6169,19 +6269,82 @@ fn validate_process_row_visibility(row: &ProcessRow, actor_user_id: Uuid) -> any
 
 async fn fetch_flow_meta(
     pool: &PgPool,
-    flow_candidates: &BTreeSet<Uuid>,
+    requests: &FlowReferenceRequests,
     versioned_scope: Option<&ValidatedPublicOwnerDraftScope>,
-) -> anyhow::Result<HashMap<Uuid, FlowRow>> {
-    if flow_candidates.is_empty() {
-        return Ok(HashMap::new());
+) -> anyhow::Result<ResolvedFlowMetadata> {
+    if requests.exact.is_empty() && requests.omitted.is_empty() {
+        return Ok(ResolvedFlowMetadata::default());
     }
     let query_started = Instant::now();
-    let candidate_ids = flow_candidates.iter().copied().collect::<Vec<_>>();
-    let rows = if let Some(scope) = versioned_scope {
+    let exact_ids = requests
+        .exact
+        .iter()
+        .map(|identity| identity.flow_id)
+        .collect::<Vec<_>>();
+    let exact_versions = requests
+        .exact
+        .iter()
+        .map(|identity| identity.flow_version.clone())
+        .collect::<Vec<_>>();
+    let omitted_ids = requests.omitted.iter().copied().collect::<Vec<_>>();
+
+    let exact_rows = if exact_ids.is_empty() {
+        Vec::new()
+    } else if let Some(scope) = versioned_scope {
+        sqlx::query(
+            r#"
+            SELECT DISTINCT ON (f.id, btrim(f.version::text))
+              f.id, btrim(f.version::text) AS version, f.user_id, f.state_code,
+              f.team_id, f.review_id, f.json
+            FROM public.flows f
+            INNER JOIN unnest($1::uuid[], $2::text[]) AS requested(id, version)
+              ON requested.id = f.id
+             AND requested.version = btrim(f.version::text)
+            WHERE (
+                f.state_code = 100
+                OR (
+                  f.user_id = $3
+                  AND f.state_code = 0
+                  AND f.team_id IS NULL
+                  AND f.review_id IS NULL
+                )
+              )
+            ORDER BY f.id, btrim(f.version::text),
+                     f.modified_at DESC NULLS LAST, f.created_at DESC NULLS LAST
+            "#,
+        )
+        .bind(&exact_ids)
+        .bind(&exact_versions)
+        .bind(scope.actor_user_id)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query(
+            r#"
+            SELECT DISTINCT ON (f.id, btrim(f.version::text))
+              f.id, btrim(f.version::text) AS version, f.user_id, f.state_code,
+              f.team_id, f.review_id, f.json
+            FROM public.flows f
+            INNER JOIN unnest($1::uuid[], $2::text[]) AS requested(id, version)
+              ON requested.id = f.id
+             AND requested.version = btrim(f.version::text)
+            ORDER BY f.id, btrim(f.version::text), f.state_code DESC,
+                     f.modified_at DESC NULLS LAST, f.created_at DESC NULLS LAST
+            "#,
+        )
+        .bind(&exact_ids)
+        .bind(&exact_versions)
+        .fetch_all(pool)
+        .await?
+    };
+
+    let omitted_rows = if omitted_ids.is_empty() {
+        Vec::new()
+    } else if let Some(scope) = versioned_scope {
         sqlx::query(
             r#"
             SELECT DISTINCT ON (id)
-              id, version, user_id, state_code, team_id, review_id, json
+              id, btrim(version::text) AS version, user_id, state_code, team_id, review_id, json
             FROM public.flows
             WHERE id = ANY($1)
               AND (
@@ -6193,10 +6356,11 @@ async fn fetch_flow_meta(
                   AND review_id IS NULL
                 )
               )
-            ORDER BY id, version DESC, modified_at DESC NULLS LAST, created_at DESC NULLS LAST
+            ORDER BY id, btrim(version::text) DESC,
+                     modified_at DESC NULLS LAST, created_at DESC NULLS LAST
             "#,
         )
-        .bind(&candidate_ids)
+        .bind(&omitted_ids)
         .bind(scope.actor_user_id)
         .fetch_all(pool)
         .await?
@@ -6204,34 +6368,43 @@ async fn fetch_flow_meta(
         sqlx::query(
             r#"
             SELECT DISTINCT ON (id)
-              id, version, user_id, state_code, team_id, review_id, json
+              id, btrim(version::text) AS version, user_id, state_code, team_id, review_id, json
             FROM public.flows
             WHERE id = ANY($1)
-            ORDER BY id, state_code DESC, modified_at DESC NULLS LAST, created_at DESC NULLS LAST
+            ORDER BY id, state_code DESC, btrim(version::text) DESC,
+                     modified_at DESC NULLS LAST, created_at DESC NULLS LAST
             "#,
         )
-        .bind(&candidate_ids)
+        .bind(&omitted_ids)
         .fetch_all(pool)
         .await?
     };
 
     let elapsed = query_started.elapsed();
-    let missing_count = candidate_ids.len().saturating_sub(rows.len());
+    let missing_count = exact_ids
+        .len()
+        .saturating_sub(exact_rows.len())
+        .saturating_add(omitted_ids.len().saturating_sub(omitted_rows.len()));
     let level = if elapsed >= SLOW_QUERY_LOG_THRESHOLD {
         "warn"
     } else {
         "info"
     };
     println!(
-        "[query] level={level} name=snapshot.fetch_flow_meta candidate_count={} rows={} missing_count={} elapsed_seconds={:.3}",
-        candidate_ids.len(),
-        rows.len(),
+        "[query] level={level} name=snapshot.fetch_flow_meta exact_candidate_count={} omitted_candidate_count={} rows={} missing_count={} elapsed_seconds={:.3}",
+        exact_ids.len(),
+        omitted_ids.len(),
+        exact_rows.len() + omitted_rows.len(),
         missing_count,
         elapsed.as_secs_f64()
     );
 
-    let mut out = HashMap::<Uuid, FlowRow>::new();
-    for row in rows {
+    let mut out = ResolvedFlowMetadata::default();
+    for (row, resolves_omitted) in exact_rows
+        .into_iter()
+        .map(|row| (row, false))
+        .chain(omitted_rows.into_iter().map(|row| (row, true)))
+    {
         let flow = FlowRow {
             id: row.try_get("id")?,
             version: row.try_get::<String, _>("version")?.trim().to_owned(),
@@ -6244,7 +6417,12 @@ async fn fetch_flow_meta(
         if let Some(scope) = versioned_scope {
             validate_flow_row_visibility(&flow, scope.actor_user_id)?;
         }
-        out.insert(flow.id, flow);
+        if resolves_omitted {
+            out.omitted_version_by_id
+                .insert(flow.id, flow.version.clone());
+        }
+        out.by_identity
+            .insert(flow_link_identity_from_parts(flow.id, &flow.version), flow);
     }
     Ok(out)
 }
@@ -6546,7 +6724,7 @@ fn resolve_lcia_method_source_row<'a>(
 async fn build_frozen_source_datasets(
     pool: &PgPool,
     processes: &[ProcessRow],
-    flows: &HashMap<Uuid, FlowRow>,
+    flows: &HashMap<FlowLinkIdentity, FlowRow>,
     impact_factor_sets: &[ImpactFactorSet],
 ) -> anyhow::Result<Vec<CompiledReleaseSourceDataset>> {
     let mut datasets = BTreeMap::<
@@ -6694,12 +6872,13 @@ async fn build_frozen_source_datasets(
 
 async fn fetch_flow_release_metadata(
     pool: &PgPool,
-    flows: &HashMap<Uuid, FlowRow>,
-) -> anyhow::Result<HashMap<Uuid, FlowReleaseMetadata>> {
+    flows: &HashMap<FlowLinkIdentity, FlowRow>,
+) -> anyhow::Result<HashMap<FlowLinkIdentity, FlowReleaseMetadata>> {
     let flow_property_refs = flows
         .iter()
-        .filter_map(|(flow_id, flow)| {
-            parse_flow_reference_property(&flow.json).map(|(id, version)| (*flow_id, id, version))
+        .filter_map(|(identity, flow)| {
+            parse_flow_reference_property(&flow.json)
+                .map(|(id, version)| (identity.clone(), id, version))
         })
         .collect::<Vec<_>>();
     let flow_property_ids = flow_property_refs
@@ -6766,7 +6945,7 @@ async fn fetch_flow_release_metadata(
     }
 
     let mut out = HashMap::with_capacity(flows.len());
-    for (flow_id, flow) in flows {
+    for (identity, flow) in flows {
         let reference_unit = parse_flow_reference_property(&flow.json)
             .and_then(|(property_id, property_version)| {
                 resolve_versioned_json(&flow_properties, property_id, property_version.as_deref())
@@ -6777,7 +6956,7 @@ async fn fetch_flow_release_metadata(
             })
             .and_then(parse_unit_group_reference_unit_name);
         out.insert(
-            *flow_id,
+            identity.clone(),
             FlowReleaseMetadata {
                 version: flow.version.clone(),
                 reference_unit,
@@ -8309,7 +8488,7 @@ mod tests {
     }
 
     #[test]
-    fn link_semantics_and_boundary_policy_change_all_source_fingerprints() {
+    fn link_boundary_and_flow_identity_policy_change_source_fingerprints() {
         let summary = SourceSnapshotSummary {
             process_count: 2,
             process_max_modified_at_utc: "2026-07-15T00:00:00.000000Z".to_owned(),
@@ -8343,6 +8522,19 @@ mod tests {
             snapshot_hash,
             compute_source_fingerprint_from_summary(&summary, &config)
                 .expect("open boundary source fingerprint")
+        );
+
+        config.technosphere_boundary_policy = "closed".to_owned();
+        config.flow_identity_policy = "exact-flow-version-reference-unit-v2".to_owned();
+        assert_ne!(
+            snapshot_hash,
+            compute_source_fingerprint_from_summary(&summary, &config)
+                .expect("v2 Flow identity source fingerprint")
+        );
+        assert_ne!(
+            overlay_hash,
+            compute_review_submit_overlay_source_hash("baseline", &config)
+                .expect("v2 Flow identity overlay fingerprint")
         );
     }
 
@@ -8428,7 +8620,7 @@ mod tests {
             );
             super::compile_signed_flow_balances(
                 std::slice::from_ref(&residual),
-                &HashMap::from([(flow_id, CompiledFlowSpace::Technosphere)]),
+                &HashMap::from([(identity, CompiledFlowSpace::Technosphere)]),
                 &ports,
                 &process_meta,
                 &compiled_processes,
@@ -8479,7 +8671,10 @@ mod tests {
         )]);
         let product_batch = super::compile_signed_flow_balances(
             std::slice::from_ref(&product_input),
-            &HashMap::from([(flow_id, CompiledFlowSpace::Technosphere)]),
+            &HashMap::from([(
+                super::flow_link_identity(&product_input),
+                CompiledFlowSpace::Technosphere,
+            )]),
             &ports,
             &process_meta,
             &compiled_processes,
@@ -8491,8 +8686,11 @@ mod tests {
         let mut mismatched_version = product_input;
         mismatched_version.flow_version = "02.00.000".to_owned();
         let mismatched_batch = super::compile_signed_flow_balances(
-            &[mismatched_version],
-            &HashMap::from([(flow_id, CompiledFlowSpace::Technosphere)]),
+            std::slice::from_ref(&mismatched_version),
+            &HashMap::from([(
+                super::flow_link_identity(&mismatched_version),
+                CompiledFlowSpace::Technosphere,
+            )]),
             &ports,
             &process_meta,
             &compiled_processes,
@@ -8505,7 +8703,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_selected_flow_version_resolves_omitted_and_rejects_drift() {
+    fn requested_flow_versions_resolve_omitted_and_accept_exact_historical_revisions() {
         let flow_id = Uuid::new_v4();
         let mut exchange = ParsedExchange {
             process_idx: 0,
@@ -8524,17 +8722,93 @@ mod tests {
             allocation_target_internal_id: "1".to_owned(),
             location: None,
         };
-        let selected = HashMap::from([(flow_id, "01.00.000".to_owned())]);
+        let mut selected = super::ResolvedFlowMetadata::default();
+        selected
+            .omitted_version_by_id
+            .insert(flow_id, "01.00.002".to_owned());
+        for version in ["01.00.000", "01.00.002"] {
+            selected.by_identity.insert(
+                super::flow_link_identity_from_parts(flow_id, version),
+                super::FlowRow {
+                    id: flow_id,
+                    version: version.to_owned(),
+                    user_id: None,
+                    state_code: 100,
+                    team_id: None,
+                    review_id: None,
+                    json: serde_json::json!({}),
+                },
+            );
+        }
 
-        super::resolve_selected_flow_versions(std::slice::from_mut(&mut exchange), &selected)
+        super::resolve_requested_flow_versions(std::slice::from_mut(&mut exchange), &selected)
             .expect("omitted version resolves to snapshot selection");
-        assert_eq!(exchange.flow_version, "01.00.000");
+        assert_eq!(exchange.flow_version, "01.00.002");
+
+        exchange.flow_version = "01.00.000".to_owned();
+        super::resolve_requested_flow_versions(std::slice::from_mut(&mut exchange), &selected)
+            .expect("published historical exact revision remains valid");
 
         exchange.flow_version = "02.00.000".to_owned();
         assert!(
-            super::resolve_selected_flow_versions(std::slice::from_mut(&mut exchange), &selected)
+            super::resolve_requested_flow_versions(std::slice::from_mut(&mut exchange), &selected)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn flow_reference_requests_prune_unreferenced_historical_revisions() {
+        let shared_flow_id = Uuid::new_v4();
+        let omitted_flow_id = Uuid::new_v4();
+        let exchange = |flow_id: Uuid, flow_version: &str, exchange_id: &str| ParsedExchange {
+            process_idx: 0,
+            flow_id,
+            direction: Some(ExchangeDirection::Output),
+            direction_label: "Output".to_owned(),
+            internal_id: Some(exchange_id.to_owned()),
+            exchange_id: exchange_id.to_owned(),
+            flow_version: flow_version.to_owned(),
+            is_reference_exchange: false,
+            raw_amount: Some(1.0),
+            signed_raw_coefficient: Some(1.0),
+            amount: Some(1.0),
+            allocation_state: AllocationFractionState::Missing,
+            allocation_fraction: 1.0,
+            allocation_target_internal_id: "reference".to_owned(),
+            location: None,
+        };
+        let requests = super::collect_exchange_flow_reference_requests(&[
+            exchange(shared_flow_id, "01.00.000", "historical"),
+            exchange(shared_flow_id, "01.00.002", "latest-explicit"),
+            exchange(omitted_flow_id, "unknown", "omitted"),
+        ]);
+
+        assert_eq!(requests.exact.len(), 2);
+        assert!(
+            requests
+                .exact
+                .contains(&super::flow_link_identity_from_parts(
+                    shared_flow_id,
+                    "01.00.000",
+                ))
+        );
+        assert!(
+            requests
+                .exact
+                .contains(&super::flow_link_identity_from_parts(
+                    shared_flow_id,
+                    "01.00.002",
+                ))
+        );
+        assert!(
+            !requests
+                .exact
+                .contains(&super::flow_link_identity_from_parts(
+                    shared_flow_id,
+                    "01.00.001",
+                ))
+        );
+        assert_eq!(requests.omitted, BTreeSet::from([omitted_flow_id]));
     }
 
     #[test]
@@ -8744,6 +9018,7 @@ mod tests {
                 CompiledFlow {
                     flow_idx: 0,
                     flow_id,
+                    flow_version: "01.00.000".to_owned(),
                     kind: CompiledFlowKind::Product,
                     space: CompiledFlowSpace::Technosphere,
                     source_type: solver_worker::compiled_graph::CompiledSourceFlowType::Product,
@@ -8751,6 +9026,7 @@ mod tests {
                 CompiledFlow {
                     flow_idx: 1,
                     flow_id: target_output_flow_id,
+                    flow_version: "01.00.000".to_owned(),
                     kind: CompiledFlowKind::Product,
                     space: CompiledFlowSpace::Technosphere,
                     source_type: solver_worker::compiled_graph::CompiledSourceFlowType::Product,
@@ -8873,6 +9149,7 @@ mod tests {
             flows: vec![CompiledFlow {
                 flow_idx: 0,
                 flow_id,
+                flow_version: "01.00.000".to_owned(),
                 kind: CompiledFlowKind::Elementary,
                 space: CompiledFlowSpace::Biosphere,
                 source_type: solver_worker::compiled_graph::CompiledSourceFlowType::Elementary,
@@ -8975,6 +9252,112 @@ mod tests {
         assert_eq!(factor_coverage.counts.matched, 1);
         assert_eq!(factor_coverage.counts.invalid, 1);
         assert_eq!(factor_coverage.record_count, 1);
+    }
+
+    #[test]
+    fn matrix_axis_keeps_only_referenced_exact_revisions_of_one_flow_uuid() {
+        let process_id = Uuid::new_v4();
+        let flow_id = Uuid::new_v4();
+        let method_id = Uuid::new_v4();
+        let graph = CompiledGraph {
+            processes: vec![CompiledProcess {
+                process_idx: 0,
+                process_id,
+                process_version: "01.00.000".to_owned(),
+                process_name: None,
+                model_id: None,
+                location: None,
+                reference_year: None,
+                annual_supply_or_production_volume: None,
+                partition: ScopeProcessPartition::Public,
+            }],
+            flows: ["01.00.000", "01.00.002"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, version)| CompiledFlow {
+                    flow_idx: i32::try_from(index).expect("flow index"),
+                    flow_id,
+                    flow_version: version.to_owned(),
+                    kind: CompiledFlowKind::Elementary,
+                    space: CompiledFlowSpace::Biosphere,
+                    source_type: solver_worker::compiled_graph::CompiledSourceFlowType::Elementary,
+                })
+                .collect(),
+            reference_ports: Vec::new(),
+            balance_resolutions: Vec::new(),
+            unresolved_balances: Vec::new(),
+            provider_outputs: Vec::new(),
+            provider_decisions: Vec::new(),
+            technosphere_edges: Vec::new(),
+            biosphere_edges: vec![
+                CompiledBiosphereEdge {
+                    process_idx: 0,
+                    flow_idx: 0,
+                    amount: 1.0,
+                    process_partition: ScopeProcessPartition::Public,
+                },
+                CompiledBiosphereEdge {
+                    process_idx: 0,
+                    flow_idx: 1,
+                    amount: 2.0,
+                    process_partition: ScopeProcessPartition::Public,
+                },
+            ],
+            reference_stats: CompiledReferenceStats::default(),
+            allocation_stats: CompiledAllocationStats::default(),
+            matching_stats: CompiledMatchingStats::default(),
+            release_evidence: None,
+        };
+        let factors = vec![ImpactFactorSet {
+            impact_id: method_id,
+            method_version: "01.00.000".to_owned(),
+            artifact_locator_id: method_id,
+            impact_key: format!("method:{method_id}"),
+            impact_name: "version-independent factor".to_owned(),
+            unit: "kg".to_owned(),
+            factors_by_flow: HashMap::from([(flow_id, 3.0)]),
+            factors_by_flow_direction: HashMap::from([((flow_id, ExchangeDirection::Output), 3.0)]),
+        }];
+        let observations = ["01.00.000", "01.00.002"]
+            .into_iter()
+            .map(|version| LciaExchangeObservation {
+                flow_id,
+                flow_version: version.to_owned(),
+                direction: Some(ExchangeDirection::Output),
+                direction_label: "Output".to_owned(),
+                exchange_id: version.to_owned(),
+                amount: Some(1.0),
+            })
+            .collect::<Vec<_>>();
+        let method = MethodSelection {
+            has_lcia: true,
+            method_id: None,
+            method_version: None,
+            method_count: 1,
+            factor_count: 1,
+            source_evidence: None,
+            rows: Vec::new(),
+            static_bundle: None,
+        };
+
+        let built = assemble_sparse_payload(
+            Uuid::new_v4(),
+            &method,
+            &graph,
+            0.999_999,
+            1e-12,
+            true,
+            &factors,
+            &observations,
+            true,
+        )
+        .expect("assemble exact-revision matrix axes");
+
+        assert_eq!(built.data.flow_count, 2);
+        assert_eq!(built.data.biosphere_entries.len(), 2);
+        assert_eq!(built.data.characterization_factors.len(), 2);
+        assert_eq!(built.compiled_graph.flows[0].flow_version, "01.00.000");
+        assert_eq!(built.compiled_graph.flows[1].flow_version, "01.00.002");
     }
 
     #[test]
@@ -9322,8 +9705,14 @@ mod tests {
             ProviderRule::StrictUniqueProvider,
             0,
             Some(&HashMap::from([
-                (root_flow_id, CompiledFlowSpace::Technosphere),
-                (shared_flow_id, CompiledFlowSpace::Biosphere),
+                (
+                    super::flow_link_identity_from_parts(root_flow_id, "unknown"),
+                    CompiledFlowSpace::Technosphere,
+                ),
+                (
+                    super::flow_link_identity_from_parts(shared_flow_id, "unknown"),
+                    CompiledFlowSpace::Biosphere,
+                ),
             ])),
         )
         .expect("biosphere closure");
@@ -9338,8 +9727,14 @@ mod tests {
             ProviderRule::StrictUniqueProvider,
             0,
             Some(&HashMap::from([
-                (root_flow_id, CompiledFlowSpace::Technosphere),
-                (shared_flow_id, CompiledFlowSpace::Technosphere),
+                (
+                    super::flow_link_identity_from_parts(root_flow_id, "unknown"),
+                    CompiledFlowSpace::Technosphere,
+                ),
+                (
+                    super::flow_link_identity_from_parts(shared_flow_id, "unknown"),
+                    CompiledFlowSpace::Technosphere,
+                ),
             ])),
         )
         .expect("technosphere closure");
@@ -9505,6 +9900,7 @@ mod tests {
                 CompiledProviderDecision {
                     consumer_idx: 0,
                     flow_id: Uuid::from_u128(301),
+                    flow_version: "01.00.000".to_owned(),
                     candidate_provider_count: 1,
                     matched_provider_count: 1,
                     candidates: Vec::new(),
@@ -9527,6 +9923,7 @@ mod tests {
                 CompiledProviderDecision {
                     consumer_idx: 0,
                     flow_id: Uuid::from_u128(302),
+                    flow_version: "01.00.000".to_owned(),
                     candidate_provider_count: 3,
                     matched_provider_count: 2,
                     candidates: Vec::new(),
@@ -9557,6 +9954,7 @@ mod tests {
                 CompiledProviderDecision {
                     consumer_idx: 1,
                     flow_id: flow_without_provider,
+                    flow_version: "01.00.000".to_owned(),
                     candidate_provider_count: 0,
                     matched_provider_count: 0,
                     candidates: Vec::new(),
@@ -11199,7 +11597,7 @@ mod tests {
             validate_quantitative_references(
                 std::slice::from_ref(&exchange),
                 std::slice::from_ref(&process),
-                &HashMap::from([(flow_id, space)]),
+                &HashMap::from([(super::flow_link_identity(&exchange), space)]),
             )
             .expect("known flow space reference");
         }
@@ -11342,14 +11740,17 @@ mod tests {
             parsed_exchange(ExchangeDirection::Input, Some(2.0), "nonzero-input"),
             parsed_exchange(ExchangeDirection::Output, Some(0.0), "sparse-zero-output"),
         ];
-        let flow_idx_by_id = HashMap::from([(flow_id, 0)]);
+        let flow_idx_by_identity = HashMap::from([(
+            super::flow_link_identity_from_parts(flow_id, "01.00.000"),
+            0,
+        )]);
         let elementary_flow_idx = HashSet::from([0]);
         let observations = exchanges
             .iter()
             .filter_map(|exchange| {
                 super::lcia_exchange_observation_for_attributed_exchange(
                     exchange,
-                    &flow_idx_by_id,
+                    &flow_idx_by_identity,
                     &elementary_flow_idx,
                 )
             })
@@ -11385,7 +11786,7 @@ mod tests {
         assert!(
             super::lcia_exchange_observation_for_attributed_exchange(
                 &invalid_amount,
-                &flow_idx_by_id,
+                &flow_idx_by_identity,
                 &elementary_flow_idx,
             )
             .is_some()
@@ -12038,7 +12439,7 @@ mod tests {
     }
 
     #[test]
-    fn release_evidence_resolves_only_omitted_flow_versions_from_metadata() {
+    fn release_evidence_uses_metadata_for_each_exact_flow_identity() {
         let process_id = Uuid::new_v4();
         let product_flow_id = Uuid::new_v4();
         let co2_flow_id = Uuid::new_v4();
@@ -12072,37 +12473,46 @@ mod tests {
                 location: None,
             };
         let exchanges = vec![
-            exchange(product_flow_id, "0", "unknown", true),
-            exchange(co2_flow_id, "1", "unknown", false),
+            exchange(product_flow_id, "0", "01.01.001", true),
+            exchange(co2_flow_id, "1", "03.00.004", false),
             exchange(explicitly_versioned_flow_id, "2", "01.00.000", false),
         ];
         let flow_metadata = HashMap::from([
             (
-                product_flow_id,
+                super::flow_link_identity_from_parts(product_flow_id, "01.01.001"),
                 super::FlowReleaseMetadata {
                     version: "01.01.001".to_owned(),
                     reference_unit: Some("m3".to_owned()),
                 },
             ),
             (
-                co2_flow_id,
+                super::flow_link_identity_from_parts(co2_flow_id, "03.00.004"),
                 super::FlowReleaseMetadata {
                     version: "03.00.004".to_owned(),
                     reference_unit: Some("kg".to_owned()),
                 },
             ),
             (
-                explicitly_versioned_flow_id,
+                super::flow_link_identity_from_parts(explicitly_versioned_flow_id, "01.00.000"),
                 super::FlowReleaseMetadata {
-                    version: "02.00.000".to_owned(),
+                    version: "01.00.000".to_owned(),
                     reference_unit: Some("m2".to_owned()),
                 },
             ),
         ]);
         let flow_kinds = HashMap::from([
-            (product_flow_id, CompiledFlowKind::Product),
-            (co2_flow_id, CompiledFlowKind::Elementary),
-            (explicitly_versioned_flow_id, CompiledFlowKind::Elementary),
+            (
+                super::flow_link_identity_from_parts(product_flow_id, "01.01.001"),
+                CompiledFlowKind::Product,
+            ),
+            (
+                super::flow_link_identity_from_parts(co2_flow_id, "03.00.004"),
+                CompiledFlowKind::Elementary,
+            ),
+            (
+                super::flow_link_identity_from_parts(explicitly_versioned_flow_id, "01.00.000"),
+                CompiledFlowKind::Elementary,
+            ),
         ]);
         let technosphere_edges = vec![CompiledReleaseTechnosphereEdge {
             dependent_process_idx: 0,
@@ -12114,7 +12524,7 @@ mod tests {
             routing_weight: 1.0,
             activity_requirement: 1.0,
             flow_id: product_flow_id,
-            flow_version: "unknown".to_owned(),
+            flow_version: "01.01.001".to_owned(),
             location: None,
         }];
 
@@ -12146,7 +12556,7 @@ mod tests {
             .find(|exchange| exchange.flow_id == explicitly_versioned_flow_id)
             .expect("explicit exchange");
         assert_eq!(explicit.flow_version, "01.00.000");
-        assert!(explicit.unit.is_empty());
+        assert_eq!(explicit.unit, "m2");
         assert_eq!(evidence.technosphere_edges[0].flow_version, "01.01.001");
     }
 }

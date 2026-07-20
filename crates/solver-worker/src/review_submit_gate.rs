@@ -1484,6 +1484,7 @@ mod tests {
                     CompiledFlow {
                         flow_idx: 0,
                         flow_id: product_flow_id,
+                        flow_version: "01.00.000".to_owned(),
                         kind: CompiledFlowKind::Product,
                         space: crate::compiled_graph::CompiledFlowSpace::Technosphere,
                         source_type: crate::compiled_graph::CompiledSourceFlowType::Product,
@@ -1491,6 +1492,7 @@ mod tests {
                     CompiledFlow {
                         flow_idx: 1,
                         flow_id: elementary_flow_id,
+                        flow_version: "01.00.000".to_owned(),
                         kind: CompiledFlowKind::Elementary,
                         space: crate::compiled_graph::CompiledFlowSpace::Biosphere,
                         source_type: crate::compiled_graph::CompiledSourceFlowType::Elementary,
@@ -1503,6 +1505,7 @@ mod tests {
                 provider_decisions: vec![CompiledProviderDecision {
                     consumer_idx: 1,
                     flow_id: product_flow_id,
+                    flow_version: "01.00.000".to_owned(),
                     candidate_provider_count: 1,
                     matched_provider_count: 1,
                     candidates: Vec::new(),

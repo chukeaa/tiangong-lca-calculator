@@ -161,7 +161,7 @@ Allocation fraction 与 routing weight 不可混用：前者改变 residual magn
 
 Snapshot/release/readiness 至少保留：flow UUID/version/reference unit、flow space/source type、raw direction/amount/coefficient、normalized reference/residual coefficient、候选 eligibility、routing strategy/weight、activity requirement、closure residual、boundary policy 和 unresolved reason。
 
-Build identity 使用 `tidas-reference-allocation-v3`、`signed-flow-balance-v1` 和 `exact-flow-version-reference-unit-v1`。Coverage 为 `snapshot_coverage.v3`；readiness input/report 为 v2；calculation bundle 为 v2。
+Build identity 使用 `tidas-reference-allocation-v3`、`signed-flow-balance-v1` 和 `exact-flow-version-reference-unit-v2`。Exact Flow identity 是 `(UUID, resolved version)`；只编译最终 Process closure 实际引用的 revisions。Coverage 为 `snapshot_coverage.v3`；readiness input/report 为 v2；calculation bundle 为 v2。
 
 ## 限制
 

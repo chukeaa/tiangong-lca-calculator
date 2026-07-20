@@ -155,7 +155,7 @@ Allocation fraction and routing weight are different: the former changes residua
 
 Snapshot, release, and readiness evidence retain flow UUID/version/reference unit, flow space/source type, raw direction/amount/coefficient, normalized reference/residual coefficient, candidate eligibility, routing strategy/weight, activity requirement, closure residual, boundary policy, and unresolved reason.
 
-Build identity uses `tidas-reference-allocation-v3`, `signed-flow-balance-v1`, and `exact-flow-version-reference-unit-v1`. Coverage is `snapshot_coverage.v3`; readiness input/report are v2; calculation bundles are v2.
+Build identity uses `tidas-reference-allocation-v3`, `signed-flow-balance-v1`, and `exact-flow-version-reference-unit-v2`. Exact Flow identity is `(UUID, resolved version)`, and compilation retains only revisions referenced by the final Process closure. Coverage is `snapshot_coverage.v3`; readiness input/report are v2; calculation bundles are v2.
 
 ## Limitation
 

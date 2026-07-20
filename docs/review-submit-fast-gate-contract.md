@@ -113,7 +113,7 @@ worker_jobs payload schema version 为 `review_submit.gate.request.v1`：
 - `expected_revision_checksum` / `actual_revision_checksum`: 用于判断 report 是否绑定当前 revision。
 - `coverage`: snapshot coverage report。
 - `payload`: `ModelSparseData` sparse payload。
-- `compiled_graph`: reference ports、signed balance resolution/unresolved evidence、flow space、technosphere/biosphere edge 与 process metadata。
+- `compiled_graph`: 以 `(Flow UUID, resolved version)` 标识的 compact flow axis、reference ports、signed balance resolution/unresolved evidence、flow space、technosphere/biosphere edge 与 process metadata；provider decision 也保留 exact Flow version。
 - `target_process_indices`: 本次提交审核必须覆盖的 target / changed process index。
 - `process_records`: worker runtime 可解释的 process/exchange scan record，用于 reference、allocation、duplicate fingerprint 和 service-loop 快速检查。
 - `policy`: `review_submit_fast.v1` policy surface。
@@ -122,7 +122,7 @@ worker_jobs payload schema version 为 `review_submit.gate.request.v1`：
 
 quantitative reference 只有同时满足以下条件才有效：`referenceToReferenceFlow` 精确解析到一个 exchange internal ID；该 exchange direction 可解析为 `Input` 或 `Output`；按计算优先级解析后的最终 amount finite 且非零。Product/Waste/Elementary/Other 与 amount 正负不决定 reference 合法性。多个 quantitative reference flow 当前明确不支持；缺失、重复命中、零、NaN 或 Infinity 归入 `missing_or_zero_reference`，不得任取第一个 exchange 代替。
 
-Snapshot compile 以 `coefficient = direction_sign * amount` 形成 raw reference coefficient，再归一为 signed unit pivot。完整 snapshot 与 review-submit overlay 使用同一个 signed-flow balance compiler：technosphere residual 只能链接同 exact flow identity、不同 Process、相反 coefficient sign 的 reference port；routing weight 仅用于分配 activity requirement。
+Snapshot compile 以 `coefficient = direction_sign * amount` 形成 raw reference coefficient，再归一为 signed unit pivot。完整 snapshot 与 review-submit overlay 使用同一个 signed-flow balance compiler：technosphere residual 只能链接同 exact `(Flow UUID, version)` identity、不同 Process、相反 coefficient sign 的 reference port；routing weight 仅用于分配 activity requirement。Overlay 中省略的 Flow version 优先冻结为 baseline snapshot 已选 revision；显式版本只接受相同 exact identity，未引用的历史 revision 不进入 overlay flow axis。
 
 allocation 按 TIDAS target-aware `Perc` 语义解释：
 

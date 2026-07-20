@@ -111,7 +111,11 @@ Flow 的 ILCD/TIDAS source type 先映射到计算空间：
 - Elementary -> `biosphere`，直接写入 `B`，不参与 technosphere closure；
 - Other -> `reporting`，保留证据但不进入 `A/B`。
 
-Technosphere 候选集合按 exact flow identity 建立。当前 snapshot selection 已固定 flow revision，in-memory 索引可以使用该固定 revision 的 UUID；持久证据仍保留 flow UUID/version/reference unit，禁止跨 revision 或不兼容单位链接。
+Technosphere 候选集合按 exact flow identity `(Flow UUID, resolved version)` 建立。Exchange 显式给出 `@version` 时只查询并绑定该 revision；省略版本时才按 snapshot visibility 规则确定一个版本，并在后续 compilation、artifact 与 release evidence 中冻结。一个 snapshot 可以同时包含同一 UUID 的多个被引用 revision，reference-port lookup、flow metadata、flow axis 和 diagnostics 都不得退化为 UUID-only key，也禁止跨 revision 或不兼容单位链接。
+
+Exact identity 不表示加载数据库中的全部历史版本。Worker 先按 request/process closure 收集 exchange 实际引用的 identity；显式版本使用精确 `(UUID, version)` 查询，省略版本只查询一次 deterministic selected revision。最终 closure 确定后，仅保留其中 distinct referenced identities，再分配连续 `flow_idx`。未被 exchange 引用的历史 revision、以及只有 LCIA factor 但没有 inventory exchange 的 Flow，不进入 `B/C` axis、compiled graph、source closure 或 bundle。
+
+Reference ports 使用 `HashMap<(UUID, version), candidates>` 分桶。每条 residual 只访问同 identity 的候选列表，避免逐 residual 扫描所有 Process；矩阵 `A` 仍是 Process × Process 的稀疏矩阵，其存储与 assembly 由实际 non-zero balance edge 决定，而不是由 Flow 历史版本数决定。
 
 对同一 flow identity：
 
@@ -259,6 +263,7 @@ A[balancing_process_i, dependent_process] += activity_requirement_i
 Compiled graph 和 readiness 至少应支持解释：
 
 - `decision_kind`: unique, multi resolved, multi unresolved, no provider；
+- provider decision、reference port、balance resolution 与 unresolved evidence 中的 Flow UUID/version；
 - `resolution_strategy`: unique, split by process volume, evidence, equal fallback 等；
 - reference port 的 process/exchange identity、raw direction/amount、raw coefficient 与 normalized coefficient；
 - residual exchange identity、residual coefficient、required reference sign；
@@ -274,4 +279,4 @@ Compiled graph 和 readiness 至少应支持解释：
 
 Matrix-readiness、diagnostics export 和人工 debug 应消费这些 provider decisions，而不是在外部重写 provider resolution。
 
-Snapshot build config 记录 `allocation_semantics_version = tidas-reference-allocation-v3`、`link_semantics_version = signed-flow-balance-v1`、`technosphere_boundary_policy` 和 `flow_identity_policy = exact-flow-version-reference-unit-v1`。这些字段进入 source/review fingerprint，旧语义 snapshot 不会被复用。Coverage schema 为 `snapshot_coverage.v3`；readiness input/report 为 v2。Calculation bundle 为 `tiangong.calculation-bundle.v2`，technosphere release edge 使用 residual/balancing/reference/activity 的中性字段。
+Snapshot build config 记录 `allocation_semantics_version = tidas-reference-allocation-v3`、`link_semantics_version = signed-flow-balance-v1`、`technosphere_boundary_policy` 和 `flow_identity_policy = exact-flow-version-reference-unit-v2`。v2 表示 exact revision 可共存、按最终引用集合剪枝并进入 flow axis/diagnostics；这些字段进入 source/review fingerprint，UUID-only 旧 snapshot 不会被复用。Coverage schema 为 `snapshot_coverage.v3`；readiness input/report 为 v2。Calculation bundle 为 `tiangong.calculation-bundle.v2`，technosphere release edge 使用 residual/balancing/reference/activity 的中性字段。
