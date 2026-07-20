@@ -22,9 +22,9 @@ checkPaths:
   - docs/review-submit-fast-gate-contract.md
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
-lastReviewedAt: 2026-07-17
-lastReviewedCommit: 6d61068445ebfad0fb3e07469f6d0468d692574a
-lastReviewedNote: "Reviewed for Issue #127: frozen TIDAS source closure in Calculation Bundle v1 and exact LCIA method identity aliases."
+lastReviewedAt: 2026-07-20
+lastReviewedCommit: 7dbb9ced5ce00cec24c62334ca75cb12dbf18df8
+lastReviewedNote: "Reviewed shared job/result/status semantics for Issue #133; lifecycle eligibility remains outside the worker numerical report contract."
 related:
   - AGENTS.md
   - .docpact/config.yaml

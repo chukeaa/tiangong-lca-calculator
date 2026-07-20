@@ -38,9 +38,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-07-17
-lastReviewedCommit: 6d61068445ebfad0fb3e07469f6d0468d692574a
-lastReviewedNote: "Reviewed frozen source-closure proof and reviewed LCIA method locator aliases for Issue #127."
+lastReviewedAt: 2026-07-20
+lastReviewedCommit: 7dbb9ced5ce00cec24c62334ca75cb12dbf18df8
+lastReviewedNote: "Reviewed proof requirements for Issue #133; the existing review-submit and hard gate validation matrix remains sufficient."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml

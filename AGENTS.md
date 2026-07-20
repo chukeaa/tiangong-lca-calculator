@@ -41,8 +41,8 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-20
-lastReviewedCommit: 4001a5f367ba1eb3a2405e71042d1fe0987acf88
-lastReviewedNote: "Reviewed worker ownership, validation, and governance boundaries for the signed-flow linking redesign in Issue #131; boundaries are unchanged."
+lastReviewedCommit: 7dbb9ced5ce00cec24c62334ca75cb12dbf18df8
+lastReviewedNote: "Reviewed worker ownership and lifecycle-versus-numerical gate boundaries for Issue #133; repo boundaries are unchanged."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md

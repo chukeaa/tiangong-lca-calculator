@@ -39,6 +39,8 @@ pub struct ReviewSubmitGatePolicy {
     pub policy_profile: String,
     #[serde(default = "default_true")]
     pub require_revision_checksum_match: bool,
+    /// Compatibility-only lifecycle policy projection. The worker numerical gate does not
+    /// evaluate process state codes.
     #[serde(default = "default_allowed_scope_states")]
     pub allowed_scope_states: Vec<i32>,
     #[serde(default = "default_false")]
@@ -169,6 +171,8 @@ pub struct RevisionGateMetrics {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ProcessScanMetrics {
     pub process_records_total: usize,
+    /// Compatibility-only report projection. Lifecycle states are not evaluated by the worker
+    /// numerical gate, so this remains zero.
     pub invalid_scope_state_count: usize,
     pub duplicate_process_version_groups: usize,
     pub invalid_exchange_amount_count: usize,
@@ -273,61 +277,10 @@ fn check_process_records(
     blockers: &mut Vec<ReadinessFinding>,
 ) {
     metrics.process_scan.process_records_total = input.process_records.len();
-    check_scope_states(input, metrics, blockers);
     check_duplicate_process_versions(input, metrics, blockers);
     check_exchanges(input, metrics, blockers);
     check_duplicate_exchange_fingerprints(input, metrics, blockers);
     check_service_loops(input, metrics, blockers);
-}
-
-fn check_scope_states(
-    input: &ReviewSubmitGateInput,
-    metrics: &mut ReviewSubmitGateMetrics,
-    blockers: &mut Vec<ReadinessFinding>,
-) {
-    if input.policy.allowed_scope_states.is_empty() {
-        return;
-    }
-    let allowed = input
-        .policy
-        .allowed_scope_states
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    let invalid = input
-        .process_records
-        .iter()
-        .filter(|record| {
-            record
-                .state_code
-                .is_none_or(|state_code| !allowed.contains(&state_code))
-        })
-        .take(DETAIL_LIMIT)
-        .map(process_detail)
-        .collect::<Vec<_>>();
-
-    metrics.process_scan.invalid_scope_state_count = input
-        .process_records
-        .iter()
-        .filter(|record| {
-            record
-                .state_code
-                .is_none_or(|state_code| !allowed.contains(&state_code))
-        })
-        .count();
-
-    if metrics.process_scan.invalid_scope_state_count > 0 {
-        push_blocker(
-            blockers,
-            "invalid_scope_state",
-            "dataset revision contains processes outside the review-submit scope states",
-            json!({
-                "invalid_scope_state_count": metrics.process_scan.invalid_scope_state_count,
-                "allowed_scope_states": input.policy.allowed_scope_states,
-                "examples": invalid
-            }),
-        );
-    }
 }
 
 fn check_duplicate_process_versions(
@@ -1120,29 +1073,19 @@ mod tests {
     }
 
     #[test]
-    fn default_policy_allows_draft_and_reviewed_scope_states() {
+    fn lifecycle_scope_states_do_not_block_numerical_gate() {
         let mut input = clean_input();
-        input.process_records[0].state_code = Some(0);
+        input.process_records[0].state_code = Some(20);
         input.process_records[1].state_code = Some(100);
+        input.policy.allowed_scope_states = vec![0, 100];
 
         let report = verify_review_submit_gate(&input);
 
         assert_eq!(report.status, ReviewSubmitGateStatus::Passed);
         assert!(!has_blocker(&report, "invalid_scope_state"));
         assert_eq!(report.metrics.process_scan.invalid_scope_state_count, 0);
-    }
-
-    #[test]
-    fn default_policy_blocks_under_review_scope_state() {
-        let mut input = clean_input();
-        input.process_records[0].state_code = Some(20);
-
-        let report = verify_review_submit_gate(&input);
-
-        assert_eq!(report.status, ReviewSubmitGateStatus::Blocked);
-        assert!(has_blocker(&report, "invalid_scope_state"));
-        assert_eq!(report.metrics.process_scan.invalid_scope_state_count, 1);
-        assert!(!report.metrics.probe.factorization_checked);
+        assert!(report.metrics.probe.factorization_checked);
+        assert_eq!(report.policy.allowed_scope_states, vec![0, 100]);
     }
 
     #[test]
@@ -1208,7 +1151,7 @@ mod tests {
         let report = verify_review_submit_gate(&input);
 
         assert_eq!(report.status, ReviewSubmitGateStatus::Blocked);
-        assert!(has_blocker(&report, "invalid_scope_state"));
+        assert!(!has_blocker(&report, "invalid_scope_state"));
         assert!(has_blocker(&report, "duplicate_process_version"));
         assert!(has_blocker(&report, "missing_or_zero_reference"));
         assert!(has_blocker(&report, "invalid_allocation_fraction"));
