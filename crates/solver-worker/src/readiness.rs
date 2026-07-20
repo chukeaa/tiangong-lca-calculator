@@ -23,10 +23,11 @@ use crate::compiled_graph::{
     CompiledProviderGeographyTier, CompiledProviderOutputAllocationState,
     CompiledProviderResolutionStrategy, CompiledProviderSupplyRegionSource,
 };
+use crate::signed_flow::TechnosphereBoundaryPolicy;
 use crate::snapshot_artifacts::{SnapshotBuildConfig, SnapshotCoverageReport};
 
-const REPORT_SCHEMA_VERSION: &str = "matrix_readiness_report.v1";
-const INPUT_SCHEMA_VERSION: &str = "matrix_readiness_input.v1";
+const REPORT_SCHEMA_VERSION: &str = "matrix_readiness_report.v2";
+const INPUT_SCHEMA_VERSION: &str = "matrix_readiness_input.v2";
 const DETAIL_LIMIT: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +124,10 @@ pub struct MatrixReadinessReport {
     pub policy: MatrixReadinessPolicy,
     pub metrics: MatrixReadinessMetrics,
     pub provider_evidence: Vec<ProviderDecisionEvidence>,
+    #[serde(default)]
+    pub balance_evidence: Vec<crate::compiled_graph::CompiledBalanceResolution>,
+    #[serde(default)]
+    pub unresolved_balances: Vec<crate::compiled_graph::CompiledUnresolvedBalance>,
     pub findings: Vec<ReadinessFinding>,
     pub blockers: Vec<ReadinessFinding>,
 }
@@ -138,6 +143,10 @@ pub struct MatrixReadinessMetrics {
 pub struct ProviderClosureMetrics {
     pub input_edges_total: i64,
     pub a_input_edges_written: i64,
+    #[serde(default)]
+    pub residual_edges_total: i64,
+    #[serde(default)]
+    pub a_balance_edges_written: i64,
     pub a_write_pct: f64,
     pub provider_present_resolved_pct: f64,
     pub unmatched_no_provider: i64,
@@ -164,6 +173,8 @@ pub struct GraphReadinessMetrics {
     pub legacy_empty_allocation_as_undeclared_count: i64,
     #[serde(default)]
     pub legacy_single_output_target_inferred_count: i64,
+    #[serde(default)]
+    pub legacy_single_reference_target_inferred_count: i64,
     pub singular_risk_level: String,
     pub m_zero_diagonal_count: i64,
     pub m_min_abs_diagonal: f64,
@@ -230,6 +241,10 @@ pub struct ProviderCandidateEvidence {
     pub reference_year: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annual_supply_or_production_volume: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_exchange_internal_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_coefficient: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -256,6 +271,14 @@ pub fn verify_matrix_readiness(input: &MatrixReadinessInput) -> MatrixReadinessR
         .compiled_graph
         .as_ref()
         .map_or_else(Vec::new, provider_evidence_from_graph);
+    let balance_evidence = input
+        .compiled_graph
+        .as_ref()
+        .map_or_else(Vec::new, |graph| graph.balance_resolutions.clone());
+    let unresolved_balances = input
+        .compiled_graph
+        .as_ref()
+        .map_or_else(Vec::new, |graph| graph.unresolved_balances.clone());
 
     add_provider_findings(input, &mut findings, &mut blockers);
     add_graph_findings(input, &mut findings, &mut blockers);
@@ -278,6 +301,8 @@ pub fn verify_matrix_readiness(input: &MatrixReadinessInput) -> MatrixReadinessR
         provider_closure: ProviderClosureMetrics {
             input_edges_total: input.coverage.matching.input_edges_total,
             a_input_edges_written: input.coverage.matching.a_input_edges_written,
+            residual_edges_total: input.coverage.matching.residual_edges_total,
+            a_balance_edges_written: input.coverage.matching.a_balance_edges_written,
             a_write_pct: input.coverage.matching.a_write_pct,
             provider_present_resolved_pct: input.coverage.matching.provider_present_resolved_pct,
             unmatched_no_provider: input.coverage.matching.unmatched_no_provider,
@@ -312,6 +337,10 @@ pub fn verify_matrix_readiness(input: &MatrixReadinessInput) -> MatrixReadinessR
                 .coverage
                 .allocation
                 .legacy_single_output_target_inferred_count,
+            legacy_single_reference_target_inferred_count: input
+                .coverage
+                .allocation
+                .legacy_single_reference_target_inferred_count,
             singular_risk_level: input.coverage.singular_risk.risk_level.clone(),
             m_zero_diagonal_count: input.coverage.singular_risk.m_zero_diagonal_count,
             m_min_abs_diagonal: input.coverage.singular_risk.m_min_abs_diagonal,
@@ -335,6 +364,8 @@ pub fn verify_matrix_readiness(input: &MatrixReadinessInput) -> MatrixReadinessR
         policy: input.policy,
         metrics,
         provider_evidence,
+        balance_evidence,
+        unresolved_balances,
         findings,
         blockers,
     }
@@ -346,7 +377,25 @@ fn add_provider_findings(
     blockers: &mut Vec<ReadinessFinding>,
 ) {
     let matching = &input.coverage.matching;
-    if matching.a_write_pct < input.policy.min_provider_write_pct {
+    let boundary_policy_label = input.config.as_ref().map_or("closed", |config| {
+        config.technosphere_boundary_policy.as_str()
+    });
+    let boundary_policy = match TechnosphereBoundaryPolicy::parse(boundary_policy_label) {
+        Ok(policy) => policy,
+        Err(error) => {
+            push_blocker(
+                blockers,
+                "technosphere_boundary_policy_unsupported",
+                error.to_string(),
+                json!({ "technosphere_boundary_policy": boundary_policy_label }),
+            );
+            TechnosphereBoundaryPolicy::Closed
+        }
+    };
+
+    if boundary_policy.requires_closure()
+        && matching.a_write_pct < input.policy.min_provider_write_pct
+    {
         push_blocker(
             blockers,
             "provider_closure_write_pct_below_policy",
@@ -360,7 +409,9 @@ fn add_provider_findings(
             }),
         );
     }
-    if matching.unmatched_no_provider > input.policy.max_unmatched_no_provider {
+    if boundary_policy.requires_closure()
+        && matching.unmatched_no_provider > input.policy.max_unmatched_no_provider
+    {
         push_blocker(
             blockers,
             "provider_closure_unmatched",
@@ -374,8 +425,12 @@ fn add_provider_findings(
             }),
         );
     }
-    add_reference_provider_missing_findings(input, blockers);
-    if matching.matched_multi_unresolved > input.policy.max_multi_unresolved {
+    if boundary_policy.requires_closure() {
+        add_reference_provider_missing_findings(input, blockers);
+    }
+    if boundary_policy.requires_closure()
+        && matching.matched_multi_unresolved > input.policy.max_multi_unresolved
+    {
         push_blocker(
             blockers,
             "provider_closure_multi_unresolved",
@@ -399,6 +454,24 @@ fn add_provider_findings(
             ),
             json!({ "matched_multi_fallback_equal": matching.matched_multi_fallback_equal }),
         );
+    }
+    if !boundary_policy.requires_closure()
+        && (matching.unmatched_no_provider > 0 || matching.matched_multi_unresolved > 0)
+    {
+        findings.push(finding(
+            "technosphere_boundary_unresolved_permitted",
+            FindingSeverity::Warning,
+            format!(
+                "{} technosphere boundary permits unresolved non-zero balance coefficients",
+                boundary_policy.as_str()
+            ),
+            json!({
+                "technosphere_boundary_policy": boundary_policy.as_str(),
+                "unmatched_no_provider": matching.unmatched_no_provider,
+                "matched_multi_unresolved": matching.matched_multi_unresolved,
+                "unresolved_balance_evidence_count": input.compiled_graph.as_ref().map_or(0, |graph| graph.unresolved_balances.len())
+            }),
+        ));
     }
     if matching.input_edges_total == 0 {
         findings.push(finding(
@@ -761,6 +834,8 @@ fn candidate_evidence(candidate: &CompiledProviderCandidate) -> ProviderCandidat
         location: candidate.location.clone(),
         reference_year: candidate.reference_year,
         annual_supply_or_production_volume: candidate.annual_supply_or_production_volume,
+        reference_exchange_internal_id: candidate.reference_exchange_internal_id.clone(),
+        reference_coefficient: candidate.reference_coefficient,
     }
 }
 
@@ -862,6 +937,7 @@ fn provider_failure_reason_label(reason: CompiledProviderFailureReason) -> Strin
         CompiledProviderFailureReason::Top1BelowTop1MinScore => "top1_below_top1_min_score",
         CompiledProviderFailureReason::Top1Top2RatioTooClose => "top1_top2_ratio_too_close",
         CompiledProviderFailureReason::ScoreSumNonPositive => "score_sum_non_positive",
+        CompiledProviderFailureReason::NoOppositeSignReference => "no_opposite_sign_reference",
     }
     .to_owned()
 }
@@ -876,6 +952,12 @@ fn provider_candidate_eligibility_label(
         }
         CompiledProviderCandidateEligibility::RejectedNonReferenceOutput => {
             "rejected_non_reference_output"
+        }
+        CompiledProviderCandidateEligibility::AcceptedOppositeSignReference => {
+            "accepted_opposite_sign_reference"
+        }
+        CompiledProviderCandidateEligibility::RejectedSameSignReference => {
+            "rejected_same_sign_reference"
         }
     }
     .to_owned()
@@ -998,6 +1080,69 @@ mod tests {
     }
 
     #[test]
+    fn open_and_cutoff_boundaries_preserve_unresolved_balance_as_auditable_warning() {
+        let snapshot_id = Uuid::new_v4();
+        let provider_id = Uuid::new_v4();
+        let consumer_id = Uuid::new_v4();
+        let flow_id = Uuid::new_v4();
+        let mut input = fixture_input(snapshot_id, provider_id, consumer_id, flow_id, false);
+        input.config = Some(
+            serde_json::from_value(json!({
+                "process_states": "20,40",
+                "process_limit": 0,
+                "provider_rule": "split_by_process_volume",
+                "technosphere_boundary_policy": "open",
+                "self_loop_cutoff": 0.999_999,
+                "singular_eps": 1.0e-12,
+                "has_lcia": true,
+                "method_id": null,
+                "method_version": null
+            }))
+            .expect("minimal snapshot config"),
+        );
+        input
+            .compiled_graph
+            .as_mut()
+            .expect("compiled graph")
+            .unresolved_balances
+            .push(crate::compiled_graph::CompiledUnresolvedBalance {
+                dependent_process_idx: 1,
+                residual_exchange_internal_id: "input".to_owned(),
+                flow_id,
+                flow_version: "01.00.000".to_owned(),
+                residual_coefficient: -1.0,
+                required_reference_sign: 1.0,
+                candidate_count: 0,
+                opposite_sign_candidate_count: 0,
+            });
+
+        let report = verify_matrix_readiness(&input);
+
+        assert_eq!(report.status, ReadinessStatus::Passed);
+        assert_eq!(report.unresolved_balances.len(), 1);
+        assert!(report.blockers.iter().all(|blocker| {
+            blocker.code != "provider_closure_unmatched"
+                && blocker.code != "provider_closure_write_pct_below_policy"
+        }));
+        assert!(report.findings.iter().any(|finding| {
+            finding.code == "technosphere_boundary_unresolved_permitted"
+                && finding.details["technosphere_boundary_policy"] == "open"
+        }));
+
+        input
+            .config
+            .as_mut()
+            .expect("snapshot config")
+            .technosphere_boundary_policy = "cutoff".to_owned();
+        let cutoff_report = verify_matrix_readiness(&input);
+        assert_eq!(cutoff_report.status, ReadinessStatus::Passed);
+        assert!(cutoff_report.findings.iter().any(|finding| {
+            finding.code == "technosphere_boundary_unresolved_permitted"
+                && finding.details["technosphere_boundary_policy"] == "cutoff"
+        }));
+    }
+
+    #[test]
     fn blocks_missing_reference_provider_with_rejected_candidate_evidence() {
         let snapshot_id = Uuid::new_v4();
         let provider_id = Uuid::new_v4();
@@ -1022,6 +1167,8 @@ mod tests {
             location: Some("CN".to_owned()),
             reference_year: Some(2024),
             annual_supply_or_production_volume: Some(10.0),
+            reference_exchange_internal_id: Some("coproduct".to_owned()),
+            reference_coefficient: Some(1.0),
         }];
 
         let report = verify_matrix_readiness(&input);
@@ -1150,6 +1297,8 @@ mod tests {
                 matched_multi_unresolved: 0,
                 matched_multi_fallback_equal: 0,
                 a_input_edges_written: 1,
+                residual_edges_total: 1,
+                a_balance_edges_written: 1,
                 a_write_pct: 100.0,
                 provider_present_resolved_pct: 100.0,
                 unique_provider_match_pct: 100.0,
@@ -1171,6 +1320,8 @@ mod tests {
                 matched_multi_unresolved: 0,
                 matched_multi_fallback_equal: 0,
                 a_input_edges_written: 0,
+                residual_edges_total: 1,
+                a_balance_edges_written: 0,
                 a_write_pct: 0.0,
                 provider_present_resolved_pct: 0.0,
                 unique_provider_match_pct: 0.0,
@@ -1204,6 +1355,7 @@ mod tests {
                     allocation_fraction_invalid_count: 0,
                     legacy_empty_allocation_as_undeclared_count: 0,
                     legacy_single_output_target_inferred_count: 0,
+                    legacy_single_reference_target_inferred_count: 0,
                 },
                 singular_risk: SnapshotSingularRisk {
                     risk_level: "low".to_owned(),
@@ -1284,7 +1436,12 @@ mod tests {
                     flow_idx: 0,
                     flow_id,
                     kind: CompiledFlowKind::Product,
+                    space: crate::compiled_graph::CompiledFlowSpace::Technosphere,
+                    source_type: crate::compiled_graph::CompiledSourceFlowType::Product,
                 }],
+                reference_ports: Vec::new(),
+                balance_resolutions: Vec::new(),
+                unresolved_balances: Vec::new(),
                 provider_outputs: Vec::new(),
                 provider_decisions: vec![provider_decision(provider_id, flow_id, provider_closed)],
                 technosphere_edges: Vec::new(),
@@ -1321,6 +1478,8 @@ mod tests {
                     location: Some("CN".to_owned()),
                     reference_year: Some(2024),
                     annual_supply_or_production_volume: Some(10.0),
+                    reference_exchange_internal_id: Some("1".to_owned()),
+                    reference_coefficient: Some(1.0),
                 }],
                 decision_kind: Some(CompiledProviderDecisionKind::UniqueProvider),
                 resolution_strategy: Some(CompiledProviderResolutionStrategy::UniqueProvider),

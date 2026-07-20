@@ -112,33 +112,35 @@ worker_jobs payload schema version 为 `review_submit.gate.request.v1`：
 - `expected_revision_checksum` / `actual_revision_checksum`: 用于判断 report 是否绑定当前 revision。
 - `coverage`: snapshot coverage report。
 - `payload`: `ModelSparseData` sparse payload。
-- `compiled_graph`: provider decision、flow kind、technosphere/biosphere edge 与 process metadata；reference identity 校验依赖其中的 Product flow kind。
+- `compiled_graph`: reference ports、signed balance resolution/unresolved evidence、flow space、technosphere/biosphere edge 与 process metadata。
 - `target_process_indices`: 本次提交审核必须覆盖的 target / changed process index。
 - `process_records`: worker runtime 可解释的 process/exchange scan record，用于 reference、allocation、duplicate fingerprint 和 service-loop 快速检查。
 - `policy`: `review_submit_fast.v1` policy surface。
 
-`process_records` 是提交审核快速 gate 的可选增强输入。没有它时，gate 仍可根据 `coverage`、`payload` 与 `compiled_graph` 执行 provider、sparse structure 和 probe 检查，但无法发现所有 JSON/process-level 历史事故模式。DB runner 在 snapshot 构造前对 `processes.json_ordered` 执行 allocation preflight；quantitative-reference 的完整 Output + Product 校验由 snapshot compile 与随后消费 compiled graph 的 gate 共同执行。gate library 为兼容文件调用方保留可选 `process_records`，不改变 DB runner 的上述顺序。
+`process_records` 是提交审核快速 gate 的可选增强输入。没有它时，gate 仍可根据 `coverage`、`payload` 与 `compiled_graph` 执行 balance、sparse structure 和 probe 检查，但无法发现所有 JSON/process-level 历史事故模式。DB runner 在 snapshot 构造前对 `processes.json_ordered` 执行 allocation preflight；quantitative-reference 的完整 signed pivot 校验由 snapshot compile 与 gate 共同执行。
 
-quantitative reference 只有同时满足以下条件才有效：`referenceToReferenceFlow` 精确解析到一个 exchange internal ID；该 exchange 的 direction 是 `Output`；compiled flow metadata 将其识别为 `Product`；按计算优先级解析后的最终 amount 是 finite 且严格大于零。缺失、重复命中、指向 input、指向 elementary flow，或 amount 为零、负数、NaN、Infinity，均归入 `missing_or_zero_reference`，不得用任意第一个 output 或 co-product 代替。
+quantitative reference 只有同时满足以下条件才有效：`referenceToReferenceFlow` 精确解析到一个 exchange internal ID；该 exchange direction 可解析为 `Input` 或 `Output`；按计算优先级解析后的最终 amount finite 且非零。Product/Waste/Elementary/Other 与 amount 正负不决定 reference 合法性。多个 quantitative reference flow 当前明确不支持；缺失、重复命中、零、NaN 或 Infinity 归入 `missing_or_zero_reference`，不得任取第一个 exchange 代替。
+
+Snapshot compile 以 `coefficient = direction_sign * amount` 形成 raw reference coefficient，再归一为 signed unit pivot。完整 snapshot 与 review-submit overlay 使用同一个 signed-flow balance compiler：technosphere residual 只能链接同 exact flow identity、不同 Process、相反 coefficient sign 的 reference port；routing weight 仅用于分配 activity requirement。
 
 allocation 按 TIDAS target-aware `Perc` 语义解释：
 
 - `@allocatedFraction` 表示百分数，解析后除以 `100`；因此 `"1"` 表示 `1%`，计算 factor 为 `0.01`。canonical string 不带 `%` 后缀。
 - `allocation` 可为 object 或 array。worker 必须按 `@internalReferenceToCoProduct` 选择指向 quantitative reference 的 entry，不能按数组顺序或第一个 entry 选择。
-- 每个已声明 target 必须唯一并指向当前 Process 中有效的 output internal ID；fraction 必须 finite、位于 `0..=100`，且完整 vector 在 `Perc` 精度容差内守恒为 `100%`。
+- 每个已声明 target 必须唯一并指向当前 Process 中有效的 exchange internal ID；fraction 必须 finite、位于 `0..=100`，且完整 vector 在 `Perc` 精度容差内守恒为 `100%`。
 - 如果 quantitative-reference target 没有列出，但其他 target 唯一、有效且合计为 `100%`，这是合法 sparse vector，当前 target 的 allocation factor 为 `0`。
 - 整个 `allocations` 容器缺失表示 allocation 未声明，是合法状态，当前 quantitative reference 的默认 factor 为 `1.0`。
 - 仅 scalar `allocations.allocation = {}` 作为 legacy undeclared 兼容，factor 为 `1.0`；空数组、`[{}]`、缺少 `allocation` 字段或非空但缺少 target/fraction 的 object 不属于该例外。
-- 单个 targetless full allocation 仅在 Process 的物理 `Output` exchange 恰好为 `1`、该 Output 的唯一有效 internal ID 等于 quantitative reference、且 fraction 为 canonical `100` 或 legacy string 精确 `"100%"` 时，推断 target 为当前 reference，factor 为 `1.0`。
-- malformed container / entry、multiple-output 或 multiple-entry targetless、非 full targetless fraction、无效 Output ID、无法命中 quantitative reference、duplicate 或 unknown target、fraction 缺失/不可解析/非 finite/越界、vector 不守恒，或无法证明安全 sparse-zero 的 target omission，都是 invalid allocation declaration。
+- 单个 targetless full allocation 仅在 Process 有唯一 reference exchange、其唯一有效 internal ID 等于 quantitative reference、且 fraction 为 canonical `100` 或 legacy string 精确 `"100%"` 时，推断 target 为当前 reference，factor 为 `1.0`。方向不参与判断。
+- malformed container / entry、multiple-entry targetless、非 full targetless fraction、无效 exchange ID、无法命中 quantitative reference、duplicate 或 unknown target、fraction 缺失/不可解析/非 finite/越界、vector 不守恒，或无法证明安全 sparse-zero 的 target omission，都是 invalid allocation declaration。
 
 DB runner 必须在 snapshot build 前验证上述 allocation 声明。两个有界 legacy fallback 使用与 snapshot compile 相同的 shared semantics，不产生 blocker；任一其他 invalid declaration 直接产出 `invalid_allocation_fraction` blocker，且不得持久化一个按错误 factor 构造的 snapshot，也不得在 runtime 静默回退到 `1.0`。
 
-Snapshot build config 记录 `allocation_semantics_version = tidas-quantitative-reference-v2` 并将其纳入 source fingerprint，因此 review-submit baseline / overlay 不会复用 v1 或更早语义 snapshot。Fallback 使用量保存在 snapshot coverage / compiled graph 的 default-zero 字段 `legacy_empty_allocation_as_undeclared_count` 与 `legacy_single_output_target_inferred_count` 中；它们用于审计兼容路径，不扩大 review-submit gate 的通过条件。
+Snapshot build config 记录 `allocation_semantics_version = tidas-reference-allocation-v3`、`link_semantics_version = signed-flow-balance-v1`、boundary 与 exact flow identity policy，并将其纳入 source/review fingerprint，因此 baseline / overlay 不会复用旧语义 snapshot。Fallback 使用量保存在 default-zero 字段 `legacy_empty_allocation_as_undeclared_count` 与 `legacy_single_reference_target_inferred_count` 中；旧 output 命名字段仅为兼容投影。
 
 DB runner 当前支持 `dataset_table = processes`。它使用 gate run 的 `dataset_id + dataset_version` 作为 request root，使用 `requested_by` 作为 snapshot builder 的 `include_user_id`，并以 gate run ID 作为请求 snapshot ID。runner 从 `processes.json_ordered` 计算稳定 SHA-256，与 gate run 的 `revision_checksum` 对比；不匹配会形成 `revision_report_stale` blocker。
 
-普通计算 snapshot artifact 仍以 `coverage + payload + config` 为主。review-submit baseline 和最终 overlay artifact 都必须额外持久化各自的 `compiled_graph`：baseline graph 用于 draft overlay 复用 provider 输出、flow kind 和 process metadata，overlay graph 由 DB runner 与 coverage/payload 一起传给 gate。不得把 overlay graph 丢弃或以 `None` 降级，否则 Product flow identity 无法验证，合法 quantitative reference 会被误判为 invalid。runner 同时传递单个提交 Process 的 `process_records`，使 reference 的 Output + Product identity 在 DB 路径和文件 CLI / library 路径保持一致。
+普通计算 snapshot artifact 仍以 `coverage + payload + config` 为主。review-submit baseline 和最终 overlay artifact 都必须额外持久化各自的 `compiled_graph`：baseline graph 用于 draft overlay 复用 reference ports、flow space 和 process metadata，overlay graph 与 coverage/payload 一起传给 gate。不得把 overlay graph 丢弃或降级，否则 signed balance 证据和 exact flow identity 无法验证。
 
 DB runner 默认通过 snapshot_builder 的 no-LCIA baseline + draft overlay fast path 构造 review-submit snapshot。该路径不加载 `lciamethods` factors，不要求 `C` 矩阵非空，并把最终提交审核 artifact 标记为 `artifact_purpose = review_submit_overlay`，避免与普通计算 snapshot 共享 source hash 语义。
 
@@ -222,7 +224,7 @@ DB runner 生成两类 review-submit artifact：
 | `revision_report_stale` | revision checksum 缺失或不匹配 | 基于当前 revision 重跑 gate |
 | `invalid_scope_state` | process record 的 `state_code` 不在 policy 允许范围 | 修正计算 scope 或 process lifecycle state |
 | `duplicate_process_version` | 同一 process ID 多个版本同时进入 gate scope | 去重或明确只纳入目标版本 |
-| `missing_or_zero_reference` | quantitative reference 未精确命中一个 exchange、命中的 exchange 不是 Output Product、最终 amount 非 finite 或不大于零，或 coverage 有 reference failure | 修复 reference identity、flow kind 和 finite positive amount |
+| `missing_or_zero_reference` | quantitative reference 未精确命中一个 exchange、direction 不是 Input/Output、最终 amount 非 finite 或为零、声明多个 reference flow，或 coverage 有 reference failure | 修复 reference identity、direction 和 finite non-zero amount |
 | `invalid_exchange_amount` | exchange amount 缺失、不可解析、带非法文本、NaN 或 Infinity | 修复 exchange amount / 单位转换 |
 | `invalid_allocation_fraction` | 除两个有界 legacy fallback 外，已声明 allocation 的结构、target identity/uniqueness、`Perc` fraction 或 100% 守恒不合法，targetless 声明无法安全推断，或 target omission 不满足 sparse-zero 条件；该 blocker 必须在 snapshot build 前产生 | 修复 target-aware allocation vector 后重新构造 snapshot |
 | `duplicate_exchange_fingerprint` | 不同 process 的 flow/direction/amount fingerprint 完全一致 | 合并重复 process 或补充可区分 exchange |
@@ -244,8 +246,8 @@ Provider 相关信号仍会保留在 `metrics.provider_scan` 中，供 UI 展示
 DB runner 先对权威 `processes.json_ordered` 执行 allocation semantics preflight；invalid allocation 在任何 snapshot build / persistence 前直接阻断。通过 preflight 后，snapshot compile fail closed 地验证 quantitative reference，随后 Gate 按便宜到昂贵的顺序执行：
 
 1. revision freshness。
-2. process record scan：scope state、精确 Output Product reference、finite positive 最终 amount、target-aware allocation、duplicate fingerprint、service-loop。
-3. provider scan：missing metric、unresolved、equal fallback、allocation conservation、volume evidence，仅记录 metrics。
+2. process record scan：scope state、精确 signed reference pivot、finite non-zero 最终 amount、target-aware allocation、duplicate fingerprint、service-loop。
+3. balance/provider compatibility scan：unresolved、equal fallback、allocation conservation、volume evidence，仅记录 metrics。
 4. flow / LCIA semantic scan。
 5. sparse structure scan：diagonal、duplicate sparse column。
 6. target process coverage check。
@@ -259,4 +261,4 @@ DB runner 先对权威 `processes.json_ordered` 执行 allocation semantics pref
 
 `review_submit_gate` 面向 dataset revision 提交审核，回答“这个 revision 是否允许进入审核流程”。
 
-两者共享 coverage、payload、compiled provider evidence 和 sparse solver 语义，但 blocker code 不相同。Edge 和 Next 在提交审核流程中应消费 `review_submit_gate_report.v1`，不应直接把 `matrix_readiness_report.v1` 的 blocker 当成提交审核结论。
+两者共享 coverage、payload、compiled signed-balance evidence 和 sparse solver 语义，但 blocker code 不相同。Edge 和 Next 在提交审核流程中应消费 `review_submit_gate_report.v1`，不应直接把 `matrix_readiness_report.v2` 的 blocker 当成提交审核结论。

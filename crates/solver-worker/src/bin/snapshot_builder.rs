@@ -35,16 +35,17 @@ use solver_worker::calculation_evidence::{
     validate_public_owner_draft_build_request,
 };
 use solver_worker::compiled_graph::{
-    CompiledAllocationStats, CompiledBiosphereEdge, CompiledEdgePartition,
-    CompiledExchangeDirection, CompiledFlow, CompiledFlowKind, CompiledGraph,
-    CompiledMatchingStats, CompiledProcess, CompiledProviderAllocation, CompiledProviderCandidate,
-    CompiledProviderCandidateEligibility, CompiledProviderDecision, CompiledProviderDecisionKind,
-    CompiledProviderFailureReason, CompiledProviderGeographyTier, CompiledProviderOutput,
-    CompiledProviderOutputAllocationState, CompiledProviderResolutionStrategy,
-    CompiledProviderSupplyRegionSource, CompiledReferenceStats, CompiledReleaseEvidence,
-    CompiledReleaseInventoryExchange, CompiledReleaseProcess, CompiledReleaseSourceDataset,
-    CompiledReleaseSourceDatasetRole, CompiledReleaseSourceDatasetType,
-    CompiledReleaseTechnosphereEdge, CompiledTechnosphereEdge,
+    CompiledAllocationStats, CompiledBalanceResolution, CompiledBiosphereEdge,
+    CompiledEdgePartition, CompiledExchangeDirection, CompiledFlow, CompiledFlowKind,
+    CompiledFlowSpace, CompiledGraph, CompiledMatchingStats, CompiledProcess,
+    CompiledProviderAllocation, CompiledProviderCandidate, CompiledProviderCandidateEligibility,
+    CompiledProviderDecision, CompiledProviderDecisionKind, CompiledProviderFailureReason,
+    CompiledProviderGeographyTier, CompiledProviderOutput, CompiledProviderOutputAllocationState,
+    CompiledProviderResolutionStrategy, CompiledProviderSupplyRegionSource, CompiledReferencePort,
+    CompiledReferenceStats, CompiledReleaseEvidence, CompiledReleaseInventoryExchange,
+    CompiledReleaseProcess, CompiledReleaseSourceDataset, CompiledReleaseSourceDatasetRole,
+    CompiledReleaseSourceDatasetType, CompiledReleaseTechnosphereEdge, CompiledSourceFlowType,
+    CompiledTechnosphereEdge, CompiledUnresolvedBalance,
 };
 use solver_worker::db_pool::{APP_SNAPSHOT_BUILDER, WorkerDbPoolOptions};
 use solver_worker::graph_types::{
@@ -59,6 +60,11 @@ use solver_worker::local_reports::{
 use solver_worker::pgbouncer_sqlx::{self as sqlx, PgPool, Row};
 use solver_worker::readiness::{
     MatrixReadinessInput, MatrixReadinessPolicy, MatrixReadinessReport, verify_matrix_readiness,
+};
+use solver_worker::signed_flow::{
+    ReferencePivot, SIGNED_FLOW_CLOSURE_TOLERANCE, SignedFlowDirection, TechnosphereBoundaryPolicy,
+    WeightedReferencePort, normalize_reference_coefficient, resolve_weighted_balance,
+    signed_coefficient,
 };
 use solver_worker::snapshot_artifacts::{
     EncodedSnapshotArtifact, SNAPSHOT_ARTIFACT_FORMAT, SnapshotAllocationCoverage,
@@ -172,6 +178,8 @@ struct Cli {
     reference_normalization_mode: String,
     #[arg(long, default_value = "strict")]
     allocation_fraction_mode: String,
+    #[arg(long, default_value = "closed")]
+    technosphere_boundary_policy: String,
     #[arg(long, default_value_t = 0.999_999)]
     self_loop_cutoff: f64,
     #[arg(long, default_value_t = 1e-12)]
@@ -271,6 +279,13 @@ impl ExchangeDirection {
             Self::Output => "Output",
         }
     }
+
+    const fn signed_flow_direction(self) -> SignedFlowDirection {
+        match self {
+            Self::Input => SignedFlowDirection::Input,
+            Self::Output => SignedFlowDirection::Output,
+        }
+    }
 }
 
 fn parse_exchange_direction(value: Option<&str>) -> Option<ExchangeDirection> {
@@ -291,6 +306,8 @@ struct ParsedExchange {
     exchange_id: String,
     flow_version: String,
     is_reference_exchange: bool,
+    raw_amount: Option<f64>,
+    signed_raw_coefficient: Option<f64>,
     amount: Option<f64>,
     allocation_state: AllocationFractionState,
     allocation_fraction: f64,
@@ -299,16 +316,25 @@ struct ParsedExchange {
 }
 
 #[derive(Debug, Clone)]
-struct ProviderOutputCandidate {
+struct ReferencePortCandidate {
     flow_id: Uuid,
-    provider_idx: i32,
-    output_exchange_internal_id: Option<String>,
-    output_exchange_is_reference: bool,
-    output_normalized_amount: Option<f64>,
-    output_allocation_state: AllocationFractionState,
+    flow_version: String,
+    process_idx: i32,
+    reference_exchange_internal_id: Option<String>,
+    coefficient: f64,
+    raw_direction: ExchangeDirection,
+    raw_amount: f64,
+    signed_raw_coefficient: f64,
+    allocation_state: AllocationFractionState,
 }
 
-type ProviderMap = HashMap<Uuid, Vec<ProviderOutputCandidate>>;
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FlowLinkIdentity {
+    flow_id: Uuid,
+    flow_version: String,
+}
+
+type ReferencePortMap = HashMap<FlowLinkIdentity, Vec<ReferencePortCandidate>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderRule {
@@ -373,7 +399,7 @@ struct AllocationParseStats {
     fraction_missing_count: i64,
     fraction_invalid_count: i64,
     legacy_empty_allocation_as_undeclared_count: i64,
-    legacy_single_output_target_inferred_count: i64,
+    legacy_single_reference_target_inferred_count: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -663,6 +689,8 @@ async fn main() -> anyhow::Result<()> {
     let provider_rule = ProviderRule::parse(&cli.provider_rule)?;
     let reference_normalization_mode = NormalizationMode::parse(&cli.reference_normalization_mode)?;
     let allocation_mode = AllocationMode::parse(&cli.allocation_fraction_mode)?;
+    let technosphere_boundary_policy =
+        TechnosphereBoundaryPolicy::parse(&cli.technosphere_boundary_policy)?;
     let report_policy = snapshot_report_policy(&cli)?;
 
     let db_url = cli
@@ -729,11 +757,15 @@ async fn main() -> anyhow::Result<()> {
         process_limit: i32::try_from(cli.process_limit)
             .map_err(|_| anyhow::anyhow!("process_limit overflow"))?,
         provider_rule: cli.provider_rule.clone(),
-        provider_candidate_eligibility_mode: "reference_output_only".to_owned(),
+        provider_candidate_eligibility_mode: "opposite_sign_reference_port".to_owned(),
         reference_normalization_mode: cli.reference_normalization_mode.clone(),
         allocation_fraction_mode: cli.allocation_fraction_mode.clone(),
         allocation_semantics_version:
             solver_worker::tidas_process_semantics::TIDAS_PROCESS_SEMANTICS_VERSION.to_owned(),
+        link_semantics_version:
+            solver_worker::tidas_process_semantics::SIGNED_FLOW_LINK_SEMANTICS_VERSION.to_owned(),
+        technosphere_boundary_policy: technosphere_boundary_policy.as_str().to_owned(),
+        flow_identity_policy: "exact-flow-version-reference-unit-v1".to_owned(),
         biosphere_sign_mode: "gross".to_owned(),
         self_loop_cutoff: cli.self_loop_cutoff,
         singular_eps: cli.singular_eps,
@@ -752,7 +784,25 @@ async fn main() -> anyhow::Result<()> {
         versioned_scope.as_ref(),
     )
     .await?;
-    let resolved_scope = resolve_process_selection(
+    let request_scope_flow_ids = candidate_processes
+        .iter()
+        .flat_map(|process| process_exchange_items(&process.json))
+        .filter_map(|exchange| parse_uuid_at(exchange, &["referenceToFlowDataSet", "@refObjectId"]))
+        .collect::<BTreeSet<_>>();
+    let request_scope_flow_meta =
+        fetch_flow_meta(&pool, &request_scope_flow_ids, versioned_scope.as_ref()).await?;
+    let request_scope_flow_spaces = request_scope_flow_meta
+        .iter()
+        .map(|(flow_id, meta)| {
+            let source_type = classify_source_flow_type(&meta.json);
+            (*flow_id, flow_space_for_source_type(source_type))
+        })
+        .collect::<HashMap<_, _>>();
+    let request_scope_flow_versions = request_scope_flow_meta
+        .iter()
+        .map(|(flow_id, meta)| (*flow_id, meta.version.clone()))
+        .collect::<HashMap<_, _>>();
+    let resolved_scope = resolve_process_selection_with_flow_versions(
         candidate_processes,
         all_states,
         &state_codes,
@@ -760,6 +810,8 @@ async fn main() -> anyhow::Result<()> {
         &request_roots,
         provider_rule,
         cli.process_limit,
+        Some(&request_scope_flow_spaces),
+        Some(&request_scope_flow_versions),
     )?;
     let fingerprint_started = Instant::now();
     let (source_summary, source_fingerprint) = compute_source_fingerprint(
@@ -1813,6 +1865,9 @@ fn empty_compiled_graph() -> CompiledGraph {
     CompiledGraph {
         processes: Vec::new(),
         flows: Vec::new(),
+        reference_ports: Vec::new(),
+        balance_resolutions: Vec::new(),
+        unresolved_balances: Vec::new(),
         provider_outputs: Vec::new(),
         provider_decisions: Vec::new(),
         technosphere_edges: Vec::new(),
@@ -1850,7 +1905,7 @@ async fn build_review_submit_overlay_graph(
     let mut graph = baseline_graph.clone();
     let target_idx = i32::try_from(graph.processes.len())
         .map_err(|_| anyhow::anyhow!("overlay target index overflow"))?;
-    let (target_meta, target_exchanges, target_flow_ids, target_reference, target_allocation) =
+    let (target_meta, mut target_exchanges, target_flow_ids, target_reference, target_allocation) =
         parse_process_chunk(
             target_row,
             target_idx,
@@ -1882,8 +1937,8 @@ async fn build_review_submit_overlay_graph(
         target_allocation.legacy_empty_allocation_as_undeclared_count;
     graph
         .allocation_stats
-        .legacy_single_output_target_inferred_count +=
-        target_allocation.legacy_single_output_target_inferred_count;
+        .legacy_single_reference_target_inferred_count +=
+        target_allocation.legacy_single_reference_target_inferred_count;
 
     let mut flow_idx_by_id = graph
         .flows
@@ -1896,31 +1951,51 @@ async fn build_review_submit_overlay_graph(
         .filter(|flow_id| !flow_idx_by_id.contains_key(flow_id))
         .collect::<BTreeSet<_>>();
     let flow_meta = fetch_flow_meta(pool, &missing_flow_ids, None).await?;
-    let mut reference_flow_kind_by_id = graph
+    let mut selected_flow_version_by_id = flow_meta
+        .iter()
+        .map(|(flow_id, meta)| (*flow_id, meta.version.clone()))
+        .collect::<HashMap<_, _>>();
+    for port in &graph.reference_ports {
+        if !port.flow_version.is_empty() {
+            selected_flow_version_by_id
+                .entry(port.flow_id)
+                .or_insert_with(|| port.flow_version.clone());
+        }
+    }
+    if let Some(release_evidence) = graph.release_evidence.as_ref() {
+        for exchange in &release_evidence.inventory_exchanges {
+            if !exchange.flow_version.is_empty() && exchange.flow_version != "unknown" {
+                selected_flow_version_by_id
+                    .entry(exchange.flow_id)
+                    .or_insert_with(|| exchange.flow_version.clone());
+            }
+        }
+    }
+    resolve_selected_flow_versions(&mut target_exchanges, &selected_flow_version_by_id)?;
+    let mut flow_space_by_id = graph
         .flows
         .iter()
-        .map(|flow| (flow.flow_id, flow.kind))
+        .map(|flow| (flow.flow_id, flow.space))
         .collect::<HashMap<_, _>>();
-    reference_flow_kind_by_id.extend(flow_meta.iter().map(|(flow_id, meta)| {
-        let kind = if classify_flow_kind(&meta.json) == "elementary" {
-            CompiledFlowKind::Elementary
-        } else {
-            CompiledFlowKind::Product
-        };
-        (*flow_id, kind)
+    flow_space_by_id.extend(flow_meta.iter().map(|(flow_id, meta)| {
+        let source_type = classify_source_flow_type(&meta.json);
+        (*flow_id, flow_space_for_source_type(source_type))
     }));
-    validate_reference_product_exchanges(
+    validate_quantitative_references(
         &target_exchanges,
         std::slice::from_ref(&target_meta),
-        &reference_flow_kind_by_id,
+        &flow_space_by_id,
     )?;
     for flow_id in missing_flow_ids {
         let flow_idx =
             i32::try_from(graph.flows.len()).map_err(|_| anyhow::anyhow!("flow idx overflow"))?;
-        let kind = if flow_meta
+        let source_type = flow_meta
             .get(&flow_id)
-            .is_some_and(|meta| classify_flow_kind(&meta.json) == "elementary")
-        {
+            .map_or(CompiledSourceFlowType::Other, |meta| {
+                classify_source_flow_type(&meta.json)
+            });
+        let space = flow_space_for_source_type(source_type);
+        let kind = if source_type == CompiledSourceFlowType::Elementary {
             CompiledFlowKind::Elementary
         } else {
             CompiledFlowKind::Product
@@ -1929,32 +2004,16 @@ async fn build_review_submit_overlay_graph(
             flow_idx,
             flow_id,
             kind,
+            space,
+            source_type,
         });
         flow_idx_by_id.insert(flow_id, flow_idx);
     }
     let elementary_flow_idx = graph
         .flows
         .iter()
-        .filter_map(|flow| (flow.kind == CompiledFlowKind::Elementary).then_some(flow.flow_idx))
+        .filter_map(|flow| (flow.space == CompiledFlowSpace::Biosphere).then_some(flow.flow_idx))
         .collect::<HashSet<_>>();
-
-    for ex in &target_exchanges {
-        if ex.direction == Some(ExchangeDirection::Output) {
-            graph.provider_outputs.push(CompiledProviderOutput {
-                flow_id: ex.flow_id,
-                provider_idx: target_idx,
-                output_exchange_internal_id: ex.internal_id.clone(),
-                output_exchange_is_reference: ex.is_reference_exchange,
-                output_normalized_amount: ex.amount,
-                output_allocation_state: compiled_allocation_state(ex.allocation_state),
-                eligibility: if ex.is_reference_exchange {
-                    CompiledProviderCandidateEligibility::AcceptedReferenceOutput
-                } else {
-                    CompiledProviderCandidateEligibility::RejectedNonReferenceOutput
-                },
-            });
-        }
-    }
 
     let mut process_meta = graph
         .processes
@@ -1962,28 +2021,43 @@ async fn build_review_submit_overlay_graph(
         .map(process_meta_from_compiled)
         .collect::<Vec<_>>();
     process_meta.sort_by_key(|meta| meta.process_idx);
-    let mut provider_map: ProviderMap = HashMap::new();
-    for output in &graph.provider_outputs {
-        provider_map
-            .entry(output.flow_id)
-            .or_default()
-            .push(provider_output_candidate_from_compiled_output(output));
-    }
-    for providers in provider_map.values_mut() {
-        sort_provider_output_candidates(providers, &process_meta);
-    }
-    graph.provider_outputs = provider_outputs_from_map(&provider_map);
 
-    let target_process = compiled_process_for_idx(&graph.processes, target_idx)
-        .ok_or_else(|| anyhow::anyhow!("missing overlay target process"))?
-        .clone();
-    for ex in &target_exchanges {
-        if let Some(flow_idx) = flow_idx_by_id.get(&ex.flow_id).copied()
+    let mut reference_port_map: ReferencePortMap = HashMap::new();
+    for port in &graph.reference_ports {
+        reference_port_map
+            .entry(flow_link_identity_for_port(port))
+            .or_default()
+            .push(reference_port_candidate_from_compiled_port(port));
+    }
+    for exchange in &target_exchanges {
+        if exchange.is_reference_exchange
+            && flow_space_by_id.get(&exchange.flow_id) == Some(&CompiledFlowSpace::Technosphere)
+        {
+            reference_port_map
+                .entry(flow_link_identity(exchange))
+                .or_default()
+                .push(reference_port_candidate_from_exchange(exchange)?);
+        }
+    }
+    for ports in reference_port_map.values_mut() {
+        sort_reference_port_candidates(ports, &process_meta);
+    }
+    let source_flow_type_by_id = graph
+        .flows
+        .iter()
+        .map(|flow| (flow.flow_id, flow.source_type))
+        .collect::<HashMap<_, _>>();
+    graph.reference_ports =
+        compiled_reference_ports_from_map(&reference_port_map, &source_flow_type_by_id);
+    graph.provider_outputs = legacy_provider_outputs_from_reference_port_map(&reference_port_map);
+
+    for exchange in &target_exchanges {
+        if let Some(flow_idx) = flow_idx_by_id.get(&exchange.flow_id).copied()
             && elementary_flow_idx.contains(&flow_idx)
-            && let Some(amount) = ex.amount
+            && let Some(amount) = exchange.amount
         {
             let value = biosphere_gross_value(amount);
-            if value.abs() > f64::EPSILON {
+            if value != 0.0 {
                 graph.biosphere_edges.push(CompiledBiosphereEdge {
                     process_idx: target_idx,
                     flow_idx,
@@ -1992,178 +2066,40 @@ async fn build_review_submit_overlay_graph(
                 });
             }
         }
-
-        if ex.direction != Some(ExchangeDirection::Input) {
-            continue;
-        }
-        let Some(amount) = nonzero_attributed_input_amount(ex) else {
-            continue;
-        };
-        let supply_region_anchor = supply_region_anchor_for_exchange(ex, &process_meta)?;
-        graph.matching_stats.input_edges_total += 1;
-        let provider_outputs = provider_map.get(&ex.flow_id);
-        let eligible_providers = eligible_provider_indices(provider_outputs);
-        let provider_candidates = provider_candidates_for_outputs(provider_outputs, &process_meta)?;
-        let candidate_provider_count =
-            i32::try_from(eligible_providers.len()).map_err(|_| anyhow::anyhow!("providers"))?;
-        if candidate_provider_count == 1 {
-            graph.matching_stats.matched_unique_provider += 1;
-            graph.matching_stats.a_input_edges_written += 1;
-            let provider_idx = *eligible_providers
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("missing provider idx"))?;
-            let provider_meta =
-                process_meta_for_idx(&process_meta, provider_idx).ok_or_else(|| {
-                    anyhow::anyhow!("missing provider process meta idx={provider_idx}")
-                })?;
-            graph.provider_decisions.push(CompiledProviderDecision {
-                consumer_idx: target_idx,
-                flow_id: ex.flow_id,
-                candidate_provider_count,
-                matched_provider_count: 1,
-                candidates: provider_candidates,
-                decision_kind: Some(CompiledProviderDecisionKind::UniqueProvider),
-                resolution_strategy: Some(CompiledProviderResolutionStrategy::UniqueProvider),
-                failure_reason: None,
-                used_equal_fallback: false,
-                volume_fallback_to_one_count: 0,
-                geography_tier: Some(provider_geography_tier(
-                    supply_region_anchor.location.as_deref(),
-                    provider_meta.location.as_deref(),
-                )),
-                supply_region_source: Some(supply_region_anchor.source),
-                supply_region_location: supply_region_anchor.location.clone(),
-                exchange_location_present: ex.location.is_some(),
-                allocations: vec![CompiledProviderAllocation {
-                    provider_idx,
-                    weight: 1.0,
-                }],
-            });
-            let provider = compiled_process_for_idx(&graph.processes, provider_idx)
-                .ok_or_else(|| anyhow::anyhow!("missing compiled provider idx={provider_idx}"))?;
-            graph.technosphere_edges.push(CompiledTechnosphereEdge {
-                provider_idx,
-                consumer_idx: target_idx,
-                flow_id: ex.flow_id,
-                amount,
-                provider_partition: provider.partition,
-                consumer_partition: target_process.partition,
-                partition: CompiledEdgePartition::from_partitions(
-                    provider.partition,
-                    target_process.partition,
-                ),
-            });
-        } else if candidate_provider_count > 1 {
-            graph.matching_stats.matched_multi_provider += 1;
-            match resolve_multi_provider(provider_rule, ex, &eligible_providers, &process_meta)? {
-                MultiProviderDecision::Resolved(mut resolution) => {
-                    graph.matching_stats.matched_multi_resolved += 1;
-                    if resolution.used_equal_fallback {
-                        graph.matching_stats.matched_multi_fallback_equal += 1;
-                    }
-                    graph.matching_stats.a_input_edges_written += 1;
-                    if resolution.geography_tier.is_none() {
-                        resolution.geography_tier = best_geography_tier_for_allocations(
-                            supply_region_anchor.location.as_deref(),
-                            &resolution.allocations,
-                            &process_meta,
-                        )?;
-                    }
-                    let allocations = resolution
-                        .allocations
-                        .into_iter()
-                        .map(|(provider_idx, weight)| CompiledProviderAllocation {
-                            provider_idx,
-                            weight,
-                        })
-                        .collect::<Vec<_>>();
-                    graph.provider_decisions.push(CompiledProviderDecision {
-                        consumer_idx: target_idx,
-                        flow_id: ex.flow_id,
-                        candidate_provider_count,
-                        matched_provider_count: i32::try_from(allocations.len())
-                            .map_err(|_| anyhow::anyhow!("provider allocation overflow"))?,
-                        candidates: provider_candidates,
-                        decision_kind: Some(CompiledProviderDecisionKind::MultiResolved),
-                        resolution_strategy: Some(resolution.resolution_strategy),
-                        failure_reason: None,
-                        used_equal_fallback: resolution.used_equal_fallback,
-                        volume_fallback_to_one_count: resolution.volume_fallback_to_one_count,
-                        geography_tier: resolution.geography_tier,
-                        supply_region_source: Some(supply_region_anchor.source),
-                        supply_region_location: supply_region_anchor.location.clone(),
-                        exchange_location_present: ex.location.is_some(),
-                        allocations: allocations.clone(),
-                    });
-                    for allocation in allocations {
-                        let weighted = amount * allocation.weight;
-                        if weighted.abs() <= f64::EPSILON {
-                            continue;
-                        }
-                        let provider =
-                            compiled_process_for_idx(&graph.processes, allocation.provider_idx)
-                                .ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "missing compiled provider idx={}",
-                                        allocation.provider_idx
-                                    )
-                                })?;
-                        graph.technosphere_edges.push(CompiledTechnosphereEdge {
-                            provider_idx: allocation.provider_idx,
-                            consumer_idx: target_idx,
-                            flow_id: ex.flow_id,
-                            amount: weighted,
-                            provider_partition: provider.partition,
-                            consumer_partition: target_process.partition,
-                            partition: CompiledEdgePartition::from_partitions(
-                                provider.partition,
-                                target_process.partition,
-                            ),
-                        });
-                    }
-                }
-                MultiProviderDecision::Unresolved(failure_reason) => {
-                    graph.matching_stats.matched_multi_unresolved += 1;
-                    graph.provider_decisions.push(CompiledProviderDecision {
-                        consumer_idx: target_idx,
-                        flow_id: ex.flow_id,
-                        candidate_provider_count,
-                        matched_provider_count: 0,
-                        candidates: provider_candidates,
-                        decision_kind: Some(CompiledProviderDecisionKind::MultiUnresolved),
-                        resolution_strategy: None,
-                        failure_reason: Some(failure_reason),
-                        used_equal_fallback: false,
-                        volume_fallback_to_one_count: 0,
-                        geography_tier: None,
-                        supply_region_source: Some(supply_region_anchor.source),
-                        supply_region_location: supply_region_anchor.location.clone(),
-                        exchange_location_present: ex.location.is_some(),
-                        allocations: Vec::new(),
-                    });
-                }
-            }
-        } else {
-            graph.matching_stats.unmatched_no_provider += 1;
-            graph.provider_decisions.push(CompiledProviderDecision {
-                consumer_idx: target_idx,
-                flow_id: ex.flow_id,
-                candidate_provider_count: 0,
-                matched_provider_count: 0,
-                candidates: provider_candidates,
-                decision_kind: Some(CompiledProviderDecisionKind::NoProvider),
-                resolution_strategy: None,
-                failure_reason: Some(no_provider_failure_reason(provider_outputs)),
-                used_equal_fallback: false,
-                volume_fallback_to_one_count: 0,
-                geography_tier: None,
-                supply_region_source: Some(supply_region_anchor.source),
-                supply_region_location: supply_region_anchor.location,
-                exchange_location_present: ex.location.is_some(),
-                allocations: Vec::new(),
-            });
-        }
     }
+
+    let balance_batch = compile_signed_flow_balances(
+        &target_exchanges,
+        &flow_space_by_id,
+        &reference_port_map,
+        &process_meta,
+        &graph.processes,
+        provider_rule,
+    )?;
+    graph.provider_decisions.extend(balance_batch.decisions);
+    graph
+        .technosphere_edges
+        .extend(balance_batch.technosphere_edges);
+    graph.balance_resolutions.extend(balance_batch.resolutions);
+    graph.unresolved_balances.extend(balance_batch.unresolved);
+    graph.matching_stats.input_edges_total += balance_batch.matching_stats.input_edges_total;
+    graph.matching_stats.matched_unique_provider +=
+        balance_batch.matching_stats.matched_unique_provider;
+    graph.matching_stats.matched_multi_provider +=
+        balance_batch.matching_stats.matched_multi_provider;
+    graph.matching_stats.unmatched_no_provider +=
+        balance_batch.matching_stats.unmatched_no_provider;
+    graph.matching_stats.matched_multi_resolved +=
+        balance_batch.matching_stats.matched_multi_resolved;
+    graph.matching_stats.matched_multi_unresolved +=
+        balance_batch.matching_stats.matched_multi_unresolved;
+    graph.matching_stats.matched_multi_fallback_equal +=
+        balance_batch.matching_stats.matched_multi_fallback_equal;
+    graph.matching_stats.a_input_edges_written +=
+        balance_batch.matching_stats.a_input_edges_written;
+    graph.matching_stats.residual_edges_total += balance_batch.matching_stats.residual_edges_total;
+    graph.matching_stats.a_balance_edges_written +=
+        balance_batch.matching_stats.a_balance_edges_written;
 
     Ok(graph)
 }
@@ -2684,24 +2620,62 @@ fn add_technosphere_edge(
     }
 }
 
-fn provider_outputs_from_map(provider_map: &ProviderMap) -> Vec<CompiledProviderOutput> {
-    let mut outputs = provider_map
+fn compiled_reference_ports_from_map(
+    reference_port_map: &ReferencePortMap,
+    source_flow_type_by_id: &HashMap<Uuid, CompiledSourceFlowType>,
+) -> Vec<CompiledReferencePort> {
+    let mut ports = reference_port_map
         .values()
-        .flat_map(|providers| {
-            providers
+        .flat_map(|candidates| {
+            candidates
                 .iter()
-                .map(|provider| CompiledProviderOutput {
-                    flow_id: provider.flow_id,
-                    provider_idx: provider.provider_idx,
-                    output_exchange_internal_id: provider.output_exchange_internal_id.clone(),
-                    output_exchange_is_reference: provider.output_exchange_is_reference,
-                    output_normalized_amount: provider.output_normalized_amount,
-                    output_allocation_state: compiled_allocation_state(
-                        provider.output_allocation_state,
-                    ),
-                    eligibility: provider_candidate_eligibility(provider),
+                .map(|candidate| CompiledReferencePort {
+                    process_idx: candidate.process_idx,
+                    flow_id: candidate.flow_id,
+                    flow_version: candidate.flow_version.clone(),
+                    reference_exchange_internal_id: candidate
+                        .reference_exchange_internal_id
+                        .clone()
+                        .unwrap_or_default(),
+                    coefficient: candidate.coefficient,
+                    raw_direction: compiled_exchange_direction(candidate.raw_direction),
+                    raw_amount: candidate.raw_amount,
+                    signed_raw_coefficient: candidate.signed_raw_coefficient,
+                    source_flow_type: source_flow_type_by_id
+                        .get(&candidate.flow_id)
+                        .copied()
+                        .unwrap_or_default(),
                 })
                 .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    ports.sort_unstable_by_key(|port| {
+        (
+            port.flow_id,
+            port.flow_version.clone(),
+            port.process_idx,
+            port.reference_exchange_internal_id.clone(),
+        )
+    });
+    ports
+}
+
+fn legacy_provider_outputs_from_reference_port_map(
+    reference_port_map: &ReferencePortMap,
+) -> Vec<CompiledProviderOutput> {
+    let mut outputs = reference_port_map
+        .values()
+        .flatten()
+        .map(|port| CompiledProviderOutput {
+            flow_id: port.flow_id,
+            provider_idx: port.process_idx,
+            output_exchange_internal_id: port.reference_exchange_internal_id.clone(),
+            output_exchange_is_reference: true,
+            output_normalized_amount: Some(port.raw_amount),
+            output_allocation_state: compiled_allocation_state(port.allocation_state),
+            eligibility: CompiledProviderCandidateEligibility::AcceptedOppositeSignReference,
+            reference_coefficient: Some(port.coefficient),
+            reference_direction: Some(compiled_exchange_direction(port.raw_direction)),
         })
         .collect::<Vec<_>>();
     outputs.sort_unstable_by_key(|output| {
@@ -2714,78 +2688,137 @@ fn provider_outputs_from_map(provider_map: &ProviderMap) -> Vec<CompiledProvider
     outputs
 }
 
-fn provider_output_candidate_from_exchange(
-    provider_idx: i32,
-    flow_id: Uuid,
+fn reference_port_candidate_from_exchange(
     exchange: &ParsedExchange,
-) -> ProviderOutputCandidate {
-    ProviderOutputCandidate {
-        flow_id,
-        provider_idx,
-        output_exchange_internal_id: exchange.internal_id.clone(),
-        output_exchange_is_reference: exchange.is_reference_exchange,
-        output_normalized_amount: exchange.amount,
-        output_allocation_state: exchange.allocation_state,
-    }
+) -> anyhow::Result<ReferencePortCandidate> {
+    let direction = exchange.direction.ok_or_else(|| {
+        anyhow::anyhow!(
+            "reference exchange direction is unavailable: {}",
+            exchange.exchange_id
+        )
+    })?;
+    let coefficient = exchange
+        .amount
+        .map(|amount| signed_coefficient(direction.signed_flow_direction(), amount))
+        .transpose()?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "reference exchange amount is unavailable: {}",
+                exchange.exchange_id
+            )
+        })?;
+    let raw_amount = exchange.raw_amount.ok_or_else(|| {
+        anyhow::anyhow!(
+            "raw reference amount is unavailable: {}",
+            exchange.exchange_id
+        )
+    })?;
+    let signed_raw_coefficient = exchange.signed_raw_coefficient.ok_or_else(|| {
+        anyhow::anyhow!(
+            "raw signed reference coefficient is unavailable: {}",
+            exchange.exchange_id
+        )
+    })?;
+    Ok(ReferencePortCandidate {
+        flow_id: exchange.flow_id,
+        flow_version: exchange.flow_version.clone(),
+        process_idx: exchange.process_idx,
+        reference_exchange_internal_id: exchange.internal_id.clone(),
+        coefficient,
+        raw_direction: direction,
+        raw_amount,
+        signed_raw_coefficient,
+        allocation_state: exchange.allocation_state,
+    })
 }
 
-fn provider_output_candidate_from_compiled_output(
-    output: &CompiledProviderOutput,
-) -> ProviderOutputCandidate {
-    ProviderOutputCandidate {
-        flow_id: output.flow_id,
-        provider_idx: output.provider_idx,
-        output_exchange_internal_id: output.output_exchange_internal_id.clone(),
-        output_exchange_is_reference: output.output_exchange_is_reference
-            || output.eligibility == CompiledProviderCandidateEligibility::AcceptedReferenceOutput,
-        output_normalized_amount: output.output_normalized_amount,
-        output_allocation_state: match output.output_allocation_state {
-            CompiledProviderOutputAllocationState::Present => AllocationFractionState::Present,
-            CompiledProviderOutputAllocationState::Missing
-            | CompiledProviderOutputAllocationState::Unknown => AllocationFractionState::Missing,
-            CompiledProviderOutputAllocationState::Invalid => AllocationFractionState::Invalid,
+fn reference_port_candidate_from_compiled_port(
+    port: &CompiledReferencePort,
+) -> ReferencePortCandidate {
+    ReferencePortCandidate {
+        flow_id: port.flow_id,
+        flow_version: port.flow_version.clone(),
+        process_idx: port.process_idx,
+        reference_exchange_internal_id: Some(port.reference_exchange_internal_id.clone()),
+        coefficient: port.coefficient,
+        raw_direction: match port.raw_direction {
+            CompiledExchangeDirection::Input => ExchangeDirection::Input,
+            CompiledExchangeDirection::Output => ExchangeDirection::Output,
         },
+        raw_amount: port.raw_amount,
+        signed_raw_coefficient: port.signed_raw_coefficient,
+        allocation_state: AllocationFractionState::Missing,
     }
 }
 
-fn sort_provider_output_candidates(
-    providers: &mut [ProviderOutputCandidate],
+fn flow_link_identity(exchange: &ParsedExchange) -> FlowLinkIdentity {
+    FlowLinkIdentity {
+        flow_id: exchange.flow_id,
+        flow_version: exchange.flow_version.clone(),
+    }
+}
+
+fn flow_link_identity_for_port(port: &CompiledReferencePort) -> FlowLinkIdentity {
+    FlowLinkIdentity {
+        flow_id: port.flow_id,
+        flow_version: port.flow_version.clone(),
+    }
+}
+
+fn resolve_selected_flow_versions(
+    exchanges: &mut [ParsedExchange],
+    selected_version_by_id: &HashMap<Uuid, String>,
+) -> anyhow::Result<()> {
+    for exchange in exchanges {
+        let Some(selected_version) = selected_version_by_id.get(&exchange.flow_id) else {
+            continue;
+        };
+        if exchange.flow_version == "unknown" {
+            exchange.flow_version.clone_from(selected_version);
+        } else if exchange.flow_version != *selected_version {
+            return Err(anyhow::anyhow!(
+                "exchange flow version does not match the snapshot-selected exact revision: exchange={} flow={} referenced_version={} selected_version={}",
+                exchange.exchange_id,
+                exchange.flow_id,
+                exchange.flow_version,
+                selected_version
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn sort_reference_port_candidates(
+    candidates: &mut [ReferencePortCandidate],
     process_meta: &[ProcessMeta],
 ) {
-    providers.sort_by_key(|candidate| {
+    candidates.sort_by_key(|candidate| {
         (
-            process_meta_for_idx(process_meta, candidate.provider_idx)
+            process_meta_for_idx(process_meta, candidate.process_idx)
                 .map_or(Uuid::nil(), |meta| meta.process_id),
-            !candidate.output_exchange_is_reference,
-            candidate.output_exchange_internal_id.clone(),
+            candidate.reference_exchange_internal_id.clone(),
         )
     });
 }
 
-fn eligible_provider_indices(outputs: Option<&Vec<ProviderOutputCandidate>>) -> Vec<i32> {
-    let Some(outputs) = outputs else {
+fn eligible_balancing_process_indices(
+    ports: Option<&Vec<ReferencePortCandidate>>,
+    dependent_process_idx: i32,
+    residual_coefficient: f64,
+) -> Vec<i32> {
+    let Some(ports) = ports else {
         return Vec::new();
     };
-    let mut providers = outputs
+    let mut processes = ports
         .iter()
         .filter_map(|candidate| {
-            candidate
-                .output_exchange_is_reference
-                .then_some(candidate.provider_idx)
+            (candidate.process_idx != dependent_process_idx
+                && candidate.coefficient.signum() != residual_coefficient.signum())
+            .then_some(candidate.process_idx)
         })
         .collect::<Vec<_>>();
-    providers.dedup();
-    providers
-}
-
-fn provider_candidate_eligibility(
-    candidate: &ProviderOutputCandidate,
-) -> CompiledProviderCandidateEligibility {
-    if candidate.output_exchange_is_reference {
-        CompiledProviderCandidateEligibility::AcceptedReferenceOutput
-    } else {
-        CompiledProviderCandidateEligibility::RejectedNonReferenceOutput
-    }
+    processes.dedup();
+    processes
 }
 
 fn compiled_allocation_state(
@@ -2800,18 +2833,23 @@ fn compiled_allocation_state(
     }
 }
 
-fn nonzero_attributed_input_amount(exchange: &ParsedExchange) -> Option<f64> {
-    if exchange.direction != Some(ExchangeDirection::Input) {
+fn nonzero_residual_coefficient(exchange: &ParsedExchange) -> Option<f64> {
+    if exchange.is_reference_exchange
+        || exchange.allocation_state == AllocationFractionState::Invalid
+    {
         return None;
     }
-    exchange.amount.filter(|amount| *amount != 0.0)
+    let direction = exchange.direction?;
+    let amount = exchange.amount?;
+    let coefficient = signed_coefficient(direction.signed_flow_direction(), amount).ok()?;
+    (coefficient != 0.0).then_some(coefficient)
 }
 
-fn no_provider_failure_reason(
-    outputs: Option<&Vec<ProviderOutputCandidate>>,
+fn no_balancing_reference_failure_reason(
+    ports: Option<&Vec<ReferencePortCandidate>>,
 ) -> CompiledProviderFailureReason {
-    if outputs.is_some_and(|candidates| !candidates.is_empty()) {
-        CompiledProviderFailureReason::RejectedNonReferenceOnly
+    if ports.is_some_and(|candidates| !candidates.is_empty()) {
+        CompiledProviderFailureReason::NoOppositeSignReference
     } else {
         CompiledProviderFailureReason::NoProviderCandidates
     }
@@ -2888,7 +2926,7 @@ fn parse_process_chunk(
     let mut local_allocation = AllocationParseStats::default();
     let exchange_items = process_exchange_items(&proc_row.json);
     let reference_internal_id = parse_reference_internal_id(&proc_row.json);
-    let (reference_scale, local_reference) = resolve_reference_normalization(
+    let (reference_pivot, local_reference) = resolve_reference_normalization(
         proc_row.id,
         &proc_row.json,
         &exchange_items,
@@ -2900,23 +2938,20 @@ fn parse_process_chunk(
             proc_row.id
         )
     })?;
-    let mut output_internal_ids = HashSet::new();
-    let mut output_exchange_count = 0_usize;
+    let mut exchange_internal_ids = HashSet::new();
+    let mut reference_exchange_count = 0_usize;
     for exchange in &exchange_items {
-        if parse_exchange_direction(exchange.get("exchangeDirection").and_then(Value::as_str))
-            != Some(ExchangeDirection::Output)
-        {
-            continue;
-        }
-        output_exchange_count += 1;
         if let Some(internal_id) = parse_exchange_internal_id(exchange)
-            && !output_internal_ids.insert(internal_id.clone())
+            && !exchange_internal_ids.insert(internal_id.clone())
         {
             return Err(anyhow::anyhow!(
-                "duplicate Output exchange internal ID={} for process={}",
+                "duplicate exchange internal ID={} for process={}",
                 internal_id,
                 proc_row.id
             ));
+        }
+        if parse_exchange_internal_id(exchange).as_deref() == Some(reference_internal_id.as_str()) {
+            reference_exchange_count += 1;
         }
     }
 
@@ -2954,8 +2989,8 @@ fn parse_process_chunk(
             resolve_allocation_fraction(
                 ex,
                 &reference_internal_id,
-                &output_internal_ids,
-                output_exchange_count,
+                &exchange_internal_ids,
+                reference_exchange_count,
                 allocation_mode,
             )
             .map_err(|error| {
@@ -2981,15 +3016,45 @@ fn parse_process_chunk(
             AllocationFallbackState::LegacyEmptyUndeclared => {
                 local_allocation.legacy_empty_allocation_as_undeclared_count += 1;
             }
-            AllocationFallbackState::LegacySingleOutputTargetInferred => {
-                local_allocation.legacy_single_output_target_inferred_count += 1;
+            AllocationFallbackState::LegacySingleReferenceTargetInferred => {
+                local_allocation.legacy_single_reference_target_inferred_count += 1;
             }
         }
-        let amount = parse_number(
+        let is_reference_exchange = is_reference_internal_exchange(
+            internal_id.as_deref(),
+            Some(reference_internal_id.as_str()),
+        );
+        let attributed_fraction = if is_reference_exchange {
+            1.0
+        } else {
+            allocation_fraction
+        };
+        let raw_amount = parse_number(
             solver_worker::tidas_process_semantics::preferred_calculation_amount_value(ex),
-        )
-        .map(|raw| raw * reference_scale * allocation_fraction)
-        .filter(|normalized| normalized.is_finite());
+        );
+        let signed_raw_coefficient = direction
+            .zip(raw_amount)
+            .map(|(direction, raw)| signed_coefficient(direction.signed_flow_direction(), raw))
+            .transpose()?;
+        let amount = raw_amount
+            .map(|raw| raw * reference_pivot.scale * attributed_fraction)
+            .filter(|normalized| normalized.is_finite());
+
+        if is_reference_exchange && let (Some(direction), Some(amount)) = (direction, amount) {
+            let normalized_coefficient =
+                signed_coefficient(direction.signed_flow_direction(), amount)?;
+            if (normalized_coefficient - reference_pivot.coefficient).abs()
+                > SIGNED_FLOW_CLOSURE_TOLERANCE
+            {
+                return Err(anyhow::anyhow!(
+                    "normalized reference pivot mismatch for process={} exchange={}: expected={} actual={}",
+                    proc_row.id,
+                    internal_id.as_deref().unwrap_or("unknown"),
+                    reference_pivot.coefficient,
+                    normalized_coefficient
+                ));
+            }
+        }
 
         local_exchanges.push(ParsedExchange {
             process_idx,
@@ -2999,10 +3064,9 @@ fn parse_process_chunk(
             internal_id: internal_id.clone(),
             exchange_id,
             flow_version,
-            is_reference_exchange: is_reference_internal_exchange(
-                internal_id.as_deref(),
-                Some(reference_internal_id.as_str()),
-            ),
+            is_reference_exchange,
+            raw_amount,
+            signed_raw_coefficient,
             amount,
             allocation_state,
             allocation_fraction,
@@ -3021,10 +3085,10 @@ fn parse_process_chunk(
     ))
 }
 
-fn validate_reference_product_exchanges(
+fn validate_quantitative_references(
     exchanges: &[ParsedExchange],
     processes: &[ProcessMeta],
-    flow_kind_by_id: &HashMap<Uuid, CompiledFlowKind>,
+    flow_space_by_id: &HashMap<Uuid, CompiledFlowSpace>,
 ) -> anyhow::Result<()> {
     for process in processes {
         let reference_exchanges = exchanges
@@ -3042,23 +3106,318 @@ fn validate_reference_product_exchanges(
             ));
         }
         let reference_exchange = reference_exchanges[0];
-        if reference_exchange.direction != Some(ExchangeDirection::Output) {
+        if !flow_space_by_id.contains_key(&reference_exchange.flow_id) {
             return Err(anyhow::anyhow!(
-                "quantitative reference must resolve to an Output exchange for process={} version={}",
-                process.process_id,
-                process.process_version
-            ));
-        }
-        if flow_kind_by_id.get(&reference_exchange.flow_id) != Some(&CompiledFlowKind::Product) {
-            return Err(anyhow::anyhow!(
-                "quantitative reference must resolve to a Product flow for process={} version={} flow={}",
+                "quantitative reference flow metadata is unavailable for process={} version={} flow={}",
                 process.process_id,
                 process.process_version,
                 reference_exchange.flow_id
             ));
         }
+        let Some(direction) = reference_exchange.direction else {
+            return Err(anyhow::anyhow!(
+                "quantitative reference must have Input or Output direction for process={} version={}",
+                process.process_id,
+                process.process_version
+            ));
+        };
+        let coefficient = reference_exchange
+            .amount
+            .map(|amount| signed_coefficient(direction.signed_flow_direction(), amount))
+            .transpose()?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "quantitative reference must have a finite non-zero amount for process={} version={}",
+                    process.process_id,
+                    process.process_version
+                )
+            })?;
+        if (coefficient.abs() - 1.0).abs() > SIGNED_FLOW_CLOSURE_TOLERANCE {
+            return Err(anyhow::anyhow!(
+                "quantitative reference must normalize to a signed unit pivot for process={} version={}; coefficient={coefficient}",
+                process.process_id,
+                process.process_version
+            ));
+        }
     }
     Ok(())
+}
+
+#[derive(Debug, Default)]
+struct CompiledBalanceBatch {
+    decisions: Vec<CompiledProviderDecision>,
+    technosphere_edges: Vec<CompiledTechnosphereEdge>,
+    release_edges: Vec<CompiledReleaseTechnosphereEdge>,
+    resolutions: Vec<CompiledBalanceResolution>,
+    unresolved: Vec<CompiledUnresolvedBalance>,
+    matching_stats: CompiledMatchingStats,
+}
+
+fn compile_signed_flow_balances(
+    exchanges: &[ParsedExchange],
+    flow_space_by_id: &HashMap<Uuid, CompiledFlowSpace>,
+    reference_port_map: &ReferencePortMap,
+    process_meta: &[ProcessMeta],
+    compiled_processes: &[CompiledProcess],
+    provider_rule: ProviderRule,
+) -> anyhow::Result<CompiledBalanceBatch> {
+    let mut batch = CompiledBalanceBatch::default();
+    for exchange in exchanges {
+        if flow_space_by_id.get(&exchange.flow_id) != Some(&CompiledFlowSpace::Technosphere) {
+            continue;
+        }
+        let Some(residual_coefficient) = nonzero_residual_coefficient(exchange) else {
+            continue;
+        };
+        batch.matching_stats.input_edges_total += 1;
+        batch.matching_stats.residual_edges_total += 1;
+
+        let supply_region_anchor = supply_region_anchor_for_exchange(exchange, process_meta)?;
+        let candidate_ports = reference_port_map.get(&flow_link_identity(exchange));
+        let balancing_processes = eligible_balancing_process_indices(
+            candidate_ports,
+            exchange.process_idx,
+            residual_coefficient,
+        );
+        let candidates = compiled_balance_candidates(
+            candidate_ports,
+            process_meta,
+            exchange.process_idx,
+            residual_coefficient,
+        )?;
+        let candidate_count = i32::try_from(balancing_processes.len())
+            .map_err(|_| anyhow::anyhow!("balance candidate count overflow"))?;
+
+        let (
+            decision_kind,
+            resolution_strategy,
+            failure_reason,
+            used_equal_fallback,
+            volume_fallback_to_one_count,
+            geography_tier,
+            allocations,
+        ) = if candidate_count == 1 {
+            batch.matching_stats.matched_unique_provider += 1;
+            let balancing_process_idx = balancing_processes[0];
+            let balancing_meta = process_meta_for_idx(process_meta, balancing_process_idx)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("missing balancing process meta idx={balancing_process_idx}")
+                })?;
+            (
+                CompiledProviderDecisionKind::UniqueProvider,
+                Some(CompiledProviderResolutionStrategy::UniqueProvider),
+                None,
+                false,
+                0,
+                Some(provider_geography_tier(
+                    supply_region_anchor.location.as_deref(),
+                    balancing_meta.location.as_deref(),
+                )),
+                vec![CompiledProviderAllocation {
+                    provider_idx: balancing_process_idx,
+                    weight: 1.0,
+                }],
+            )
+        } else if candidate_count > 1 {
+            batch.matching_stats.matched_multi_provider += 1;
+            match resolve_multi_provider(
+                provider_rule,
+                exchange,
+                &balancing_processes,
+                process_meta,
+            )? {
+                MultiProviderDecision::Resolved(mut resolution) => {
+                    batch.matching_stats.matched_multi_resolved += 1;
+                    if resolution.used_equal_fallback {
+                        batch.matching_stats.matched_multi_fallback_equal += 1;
+                    }
+                    if resolution.geography_tier.is_none() {
+                        resolution.geography_tier = best_geography_tier_for_allocations(
+                            supply_region_anchor.location.as_deref(),
+                            &resolution.allocations,
+                            process_meta,
+                        )?;
+                    }
+                    (
+                        CompiledProviderDecisionKind::MultiResolved,
+                        Some(resolution.resolution_strategy),
+                        None,
+                        resolution.used_equal_fallback,
+                        resolution.volume_fallback_to_one_count,
+                        resolution.geography_tier,
+                        resolution
+                            .allocations
+                            .into_iter()
+                            .map(|(provider_idx, weight)| CompiledProviderAllocation {
+                                provider_idx,
+                                weight,
+                            })
+                            .collect(),
+                    )
+                }
+                MultiProviderDecision::Unresolved(reason) => {
+                    batch.matching_stats.matched_multi_unresolved += 1;
+                    (
+                        CompiledProviderDecisionKind::MultiUnresolved,
+                        None,
+                        Some(reason),
+                        false,
+                        0,
+                        None,
+                        Vec::new(),
+                    )
+                }
+            }
+        } else {
+            batch.matching_stats.unmatched_no_provider += 1;
+            (
+                CompiledProviderDecisionKind::NoProvider,
+                None,
+                Some(no_balancing_reference_failure_reason(candidate_ports)),
+                false,
+                0,
+                None,
+                Vec::new(),
+            )
+        };
+
+        batch.decisions.push(CompiledProviderDecision {
+            consumer_idx: exchange.process_idx,
+            flow_id: exchange.flow_id,
+            candidate_provider_count: candidate_count,
+            matched_provider_count: i32::try_from(allocations.len())
+                .map_err(|_| anyhow::anyhow!("balance allocation count overflow"))?,
+            candidates,
+            decision_kind: Some(decision_kind),
+            resolution_strategy,
+            failure_reason,
+            used_equal_fallback,
+            volume_fallback_to_one_count,
+            geography_tier,
+            supply_region_source: Some(supply_region_anchor.source),
+            supply_region_location: supply_region_anchor.location.clone(),
+            exchange_location_present: exchange.location.is_some(),
+            allocations: allocations.clone(),
+        });
+
+        if allocations.is_empty() {
+            let total_candidates = candidate_ports.map_or(0, |ports| {
+                ports
+                    .iter()
+                    .filter(|port| port.process_idx != exchange.process_idx)
+                    .count()
+            });
+            batch.unresolved.push(CompiledUnresolvedBalance {
+                dependent_process_idx: exchange.process_idx,
+                residual_exchange_internal_id: exchange.internal_id.clone().unwrap_or_default(),
+                flow_id: exchange.flow_id,
+                flow_version: exchange.flow_version.clone(),
+                residual_coefficient,
+                required_reference_sign: -residual_coefficient.signum(),
+                candidate_count: i32::try_from(total_candidates)
+                    .map_err(|_| anyhow::anyhow!("reference candidate count overflow"))?,
+                opposite_sign_candidate_count: candidate_count,
+            });
+            continue;
+        }
+
+        let candidate_ports = candidate_ports
+            .ok_or_else(|| anyhow::anyhow!("resolved balance has no reference port map"))?;
+        let weighted_ports = allocations
+            .iter()
+            .map(|allocation| {
+                let port = candidate_ports
+                    .iter()
+                    .find(|port| port.process_idx == allocation.provider_idx)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "missing selected reference port for balancing process idx={}",
+                            allocation.provider_idx
+                        )
+                    })?;
+                Ok((
+                    port,
+                    WeightedReferencePort {
+                        reference_coefficient: port.coefficient,
+                        routing_weight: allocation.weight,
+                    },
+                ))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let balance_inputs = weighted_ports
+            .iter()
+            .map(|(_, port)| *port)
+            .collect::<Vec<_>>();
+        let balance = resolve_weighted_balance(residual_coefficient, &balance_inputs)?;
+        batch.matching_stats.a_input_edges_written += 1;
+        batch.matching_stats.a_balance_edges_written += 1;
+
+        let dependent = compiled_process_for_idx(compiled_processes, exchange.process_idx)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "missing dependent compiled process idx={}",
+                    exchange.process_idx
+                )
+            })?;
+        for ((port, weighted_port), contribution) in
+            weighted_ports.iter().zip(&balance.contributions)
+        {
+            if contribution.activity_requirement == 0.0 {
+                continue;
+            }
+            let balancing = compiled_process_for_idx(compiled_processes, port.process_idx)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "missing balancing compiled process idx={}",
+                        port.process_idx
+                    )
+                })?;
+            batch.technosphere_edges.push(CompiledTechnosphereEdge {
+                provider_idx: port.process_idx,
+                consumer_idx: exchange.process_idx,
+                flow_id: exchange.flow_id,
+                amount: contribution.activity_requirement,
+                provider_partition: balancing.partition,
+                consumer_partition: dependent.partition,
+                partition: CompiledEdgePartition::from_partitions(
+                    balancing.partition,
+                    dependent.partition,
+                ),
+            });
+            let resolution = CompiledBalanceResolution {
+                dependent_process_idx: exchange.process_idx,
+                residual_exchange_internal_id: exchange.internal_id.clone().unwrap_or_default(),
+                balancing_process_idx: port.process_idx,
+                balancing_reference_exchange_internal_id: port
+                    .reference_exchange_internal_id
+                    .clone()
+                    .unwrap_or_default(),
+                flow_id: exchange.flow_id,
+                flow_version: exchange.flow_version.clone(),
+                residual_coefficient,
+                reference_coefficient: port.coefficient,
+                routing_weight: weighted_port.routing_weight,
+                activity_requirement: contribution.activity_requirement,
+            };
+            batch.release_edges.push(CompiledReleaseTechnosphereEdge {
+                dependent_process_idx: resolution.dependent_process_idx,
+                residual_exchange_internal_id: resolution.residual_exchange_internal_id.clone(),
+                balancing_process_idx: resolution.balancing_process_idx,
+                balancing_reference_exchange_internal_id: resolution
+                    .balancing_reference_exchange_internal_id
+                    .clone(),
+                residual_coefficient: resolution.residual_coefficient,
+                reference_coefficient: resolution.reference_coefficient,
+                routing_weight: resolution.routing_weight,
+                activity_requirement: resolution.activity_requirement,
+                flow_id: exchange.flow_id,
+                flow_version: exchange.flow_version.clone(),
+                location: exchange.location.clone(),
+            });
+            batch.resolutions.push(resolution);
+        }
+    }
+    Ok(batch)
 }
 
 async fn compile_scope_graph(
@@ -3107,8 +3466,8 @@ async fn compile_scope_graph(
         allocation_stats.fraction_invalid_count += chunk_allocation.fraction_invalid_count;
         allocation_stats.legacy_empty_allocation_as_undeclared_count +=
             chunk_allocation.legacy_empty_allocation_as_undeclared_count;
-        allocation_stats.legacy_single_output_target_inferred_count +=
-            chunk_allocation.legacy_single_output_target_inferred_count;
+        allocation_stats.legacy_single_reference_target_inferred_count +=
+            chunk_allocation.legacy_single_reference_target_inferred_count;
     }
 
     let mut process_meta = Vec::with_capacity(processes.len());
@@ -3147,6 +3506,11 @@ async fn compile_scope_graph(
 
     let flow_meta = fetch_flow_meta(pool, &flow_candidates, versioned_scope).await?;
     let flow_release_metadata = fetch_flow_release_metadata(pool, &flow_meta).await?;
+    let selected_flow_version_by_id = flow_meta
+        .iter()
+        .map(|(flow_id, meta)| (*flow_id, meta.version.clone()))
+        .collect::<HashMap<_, _>>();
+    resolve_selected_flow_versions(&mut exchanges, &selected_flow_version_by_id)?;
     let source_datasets =
         build_frozen_source_datasets(pool, &processes, &flow_meta, impact_factor_sets).await?;
     if versioned_scope.is_some() {
@@ -3158,10 +3522,18 @@ async fn compile_scope_graph(
             }
         }
     }
-    let flow_kind_by_id = flow_meta
+    let source_flow_type_by_id = flow_meta
         .iter()
-        .map(|(flow_id, meta)| {
-            let kind = if classify_flow_kind(&meta.json) == "elementary" {
+        .map(|(flow_id, meta)| (*flow_id, classify_source_flow_type(&meta.json)))
+        .collect::<HashMap<_, _>>();
+    let flow_space_by_id = source_flow_type_by_id
+        .iter()
+        .map(|(flow_id, source_type)| (*flow_id, flow_space_for_source_type(*source_type)))
+        .collect::<HashMap<_, _>>();
+    let flow_kind_by_id = source_flow_type_by_id
+        .iter()
+        .map(|(flow_id, source_type)| {
+            let kind = if *source_type == CompiledSourceFlowType::Elementary {
                 CompiledFlowKind::Elementary
             } else {
                 CompiledFlowKind::Product
@@ -3181,15 +3553,17 @@ async fn compile_scope_graph(
     let mut elementary_flow_idx = HashSet::new();
     for (idx, flow_id) in candidate_flow_ids.iter().enumerate() {
         let flow_index = i32::try_from(idx).map_err(|_| anyhow::anyhow!("flow idx overflow"))?;
-        let kind = if flow_meta
+        let source_type = source_flow_type_by_id
             .get(flow_id)
-            .is_some_and(|meta| classify_flow_kind(&meta.json) == "elementary")
-        {
+            .copied()
+            .unwrap_or_default();
+        let space = flow_space_for_source_type(source_type);
+        let kind = if source_type == CompiledSourceFlowType::Elementary {
             CompiledFlowKind::Elementary
         } else {
             CompiledFlowKind::Product
         };
-        if kind == CompiledFlowKind::Elementary {
+        if space == CompiledFlowSpace::Biosphere {
             elementary_flow_idx.insert(flow_index);
         }
         flow_idx_by_id.insert(*flow_id, flow_index);
@@ -3197,270 +3571,71 @@ async fn compile_scope_graph(
             flow_idx: flow_index,
             flow_id: *flow_id,
             kind,
+            space,
+            source_type,
         });
     }
-    validate_reference_product_exchanges(&exchanges, &process_meta, &flow_kind_by_id)?;
+    validate_quantitative_references(&exchanges, &process_meta, &flow_space_by_id)?;
 
-    let mut provider_map: ProviderMap = HashMap::new();
-    for ex in &exchanges {
-        if ex.direction == Some(ExchangeDirection::Output) {
-            provider_map.entry(ex.flow_id).or_default().push(
-                provider_output_candidate_from_exchange(ex.process_idx, ex.flow_id, ex),
-            );
+    let mut reference_port_map: ReferencePortMap = HashMap::new();
+    for exchange in &exchanges {
+        if exchange.is_reference_exchange
+            && flow_space_by_id.get(&exchange.flow_id) == Some(&CompiledFlowSpace::Technosphere)
+        {
+            reference_port_map
+                .entry(flow_link_identity(exchange))
+                .or_default()
+                .push(reference_port_candidate_from_exchange(exchange)?);
         }
     }
-    for providers in provider_map.values_mut() {
-        sort_provider_output_candidates(providers, &process_meta);
+    for ports in reference_port_map.values_mut() {
+        sort_reference_port_candidates(ports, &process_meta);
     }
-    let provider_outputs = provider_outputs_from_map(&provider_map);
+    let reference_ports =
+        compiled_reference_ports_from_map(&reference_port_map, &source_flow_type_by_id);
+    let provider_outputs = legacy_provider_outputs_from_reference_port_map(&reference_port_map);
 
-    let mut provider_decisions = Vec::<CompiledProviderDecision>::new();
-    let mut technosphere_edges = Vec::<CompiledTechnosphereEdge>::new();
     let mut biosphere_edges = Vec::<CompiledBiosphereEdge>::new();
-    let mut release_technosphere_edges = Vec::<CompiledReleaseTechnosphereEdge>::new();
-    let mut matching_stats = CompiledMatchingStats::default();
-
-    for ex in &exchanges {
-        if let Some(flow_idx) = flow_idx_by_id.get(&ex.flow_id).copied()
+    for exchange in &exchanges {
+        if let Some(flow_idx) = flow_idx_by_id.get(&exchange.flow_id).copied()
             && elementary_flow_idx.contains(&flow_idx)
-            && let Some(amount) = ex.amount
+            && let Some(amount) = exchange.amount
         {
             let value = biosphere_gross_value(amount);
             if retain_sparse_value(value, versioned_scope.is_some()) {
                 let process_partition =
-                    compiled_process_for_idx(&compiled_processes, ex.process_idx)
+                    compiled_process_for_idx(&compiled_processes, exchange.process_idx)
                         .ok_or_else(|| {
                             anyhow::anyhow!(
                                 "missing compiled process for biosphere idx={}",
-                                ex.process_idx
+                                exchange.process_idx
                             )
                         })?
                         .partition;
                 biosphere_edges.push(CompiledBiosphereEdge {
-                    process_idx: ex.process_idx,
+                    process_idx: exchange.process_idx,
                     flow_idx,
                     amount: value,
                     process_partition,
                 });
             }
         }
-
-        if ex.direction != Some(ExchangeDirection::Input) {
-            continue;
-        }
-
-        let Some(amount) = nonzero_attributed_input_amount(ex) else {
-            continue;
-        };
-        let supply_region_anchor = supply_region_anchor_for_exchange(ex, &process_meta)?;
-        matching_stats.input_edges_total += 1;
-        let provider_outputs = provider_map.get(&ex.flow_id);
-        let eligible_providers = eligible_provider_indices(provider_outputs);
-        let provider_candidates = provider_candidates_for_outputs(provider_outputs, &process_meta)?;
-        let candidate_provider_count =
-            i32::try_from(eligible_providers.len()).map_err(|_| anyhow::anyhow!("providers"))?;
-        if candidate_provider_count == 1 {
-            matching_stats.matched_unique_provider += 1;
-            matching_stats.a_input_edges_written += 1;
-            let provider_idx = *eligible_providers
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("missing provider idx"))?;
-            let provider_meta =
-                process_meta_for_idx(&process_meta, provider_idx).ok_or_else(|| {
-                    anyhow::anyhow!("missing provider process meta idx={provider_idx}")
-                })?;
-            provider_decisions.push(CompiledProviderDecision {
-                consumer_idx: ex.process_idx,
-                flow_id: ex.flow_id,
-                candidate_provider_count,
-                matched_provider_count: 1,
-                candidates: provider_candidates,
-                decision_kind: Some(CompiledProviderDecisionKind::UniqueProvider),
-                resolution_strategy: Some(CompiledProviderResolutionStrategy::UniqueProvider),
-                failure_reason: None,
-                used_equal_fallback: false,
-                volume_fallback_to_one_count: 0,
-                geography_tier: Some(provider_geography_tier(
-                    supply_region_anchor.location.as_deref(),
-                    provider_meta.location.as_deref(),
-                )),
-                supply_region_source: Some(supply_region_anchor.source),
-                supply_region_location: supply_region_anchor.location.clone(),
-                exchange_location_present: ex.location.is_some(),
-                allocations: vec![CompiledProviderAllocation {
-                    provider_idx,
-                    weight: 1.0,
-                }],
-            });
-            let provider = compiled_process_for_idx(&compiled_processes, provider_idx)
-                .ok_or_else(|| anyhow::anyhow!("missing compiled provider idx={provider_idx}"))?;
-            let consumer = compiled_process_for_idx(&compiled_processes, ex.process_idx)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("missing compiled consumer idx={}", ex.process_idx)
-                })?;
-            technosphere_edges.push(CompiledTechnosphereEdge {
-                provider_idx,
-                consumer_idx: ex.process_idx,
-                flow_id: ex.flow_id,
-                amount,
-                provider_partition: provider.partition,
-                consumer_partition: consumer.partition,
-                partition: CompiledEdgePartition::from_partitions(
-                    provider.partition,
-                    consumer.partition,
-                ),
-            });
-            release_technosphere_edges.push(CompiledReleaseTechnosphereEdge {
-                consumer_process_idx: ex.process_idx,
-                consumer_input_exchange_internal_id: ex.internal_id.clone().unwrap_or_default(),
-                provider_process_idx: provider_idx,
-                provider_output_exchange_internal_id: provider_output_internal_id(
-                    provider_outputs,
-                    provider_idx,
-                )
-                .unwrap_or_default(),
-                provider_weight: 1.0,
-                normalized_amount: amount,
-                flow_id: ex.flow_id,
-                flow_version: ex.flow_version.clone(),
-                location: ex.location.clone(),
-            });
-        } else if candidate_provider_count > 1 {
-            matching_stats.matched_multi_provider += 1;
-            let resolution =
-                resolve_multi_provider(provider_rule, ex, &eligible_providers, &process_meta)?;
-            match resolution {
-                MultiProviderDecision::Resolved(mut resolution) => {
-                    matching_stats.matched_multi_resolved += 1;
-                    if resolution.used_equal_fallback {
-                        matching_stats.matched_multi_fallback_equal += 1;
-                    }
-                    matching_stats.a_input_edges_written += 1;
-                    if resolution.geography_tier.is_none() {
-                        resolution.geography_tier = best_geography_tier_for_allocations(
-                            supply_region_anchor.location.as_deref(),
-                            &resolution.allocations,
-                            &process_meta,
-                        )?;
-                    }
-                    let allocations = resolution
-                        .allocations
-                        .into_iter()
-                        .map(|(provider_idx, weight)| CompiledProviderAllocation {
-                            provider_idx,
-                            weight,
-                        })
-                        .collect::<Vec<_>>();
-                    provider_decisions.push(CompiledProviderDecision {
-                        consumer_idx: ex.process_idx,
-                        flow_id: ex.flow_id,
-                        candidate_provider_count,
-                        matched_provider_count: i32::try_from(allocations.len())
-                            .map_err(|_| anyhow::anyhow!("provider allocation overflow"))?,
-                        candidates: provider_candidates.clone(),
-                        decision_kind: Some(CompiledProviderDecisionKind::MultiResolved),
-                        resolution_strategy: Some(resolution.resolution_strategy),
-                        failure_reason: None,
-                        used_equal_fallback: resolution.used_equal_fallback,
-                        volume_fallback_to_one_count: resolution.volume_fallback_to_one_count,
-                        geography_tier: resolution.geography_tier,
-                        supply_region_source: Some(supply_region_anchor.source),
-                        supply_region_location: supply_region_anchor.location.clone(),
-                        exchange_location_present: ex.location.is_some(),
-                        allocations: allocations.clone(),
-                    });
-                    let consumer = compiled_process_for_idx(&compiled_processes, ex.process_idx)
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("missing compiled consumer idx={}", ex.process_idx)
-                        })?;
-                    for allocation in &allocations {
-                        let weighted = amount * allocation.weight;
-                        if weighted.abs() <= f64::EPSILON {
-                            continue;
-                        }
-                        let provider =
-                            compiled_process_for_idx(&compiled_processes, allocation.provider_idx)
-                                .ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "missing compiled provider idx={}",
-                                        allocation.provider_idx
-                                    )
-                                })?;
-                        technosphere_edges.push(CompiledTechnosphereEdge {
-                            provider_idx: allocation.provider_idx,
-                            consumer_idx: ex.process_idx,
-                            flow_id: ex.flow_id,
-                            amount: weighted,
-                            provider_partition: provider.partition,
-                            consumer_partition: consumer.partition,
-                            partition: CompiledEdgePartition::from_partitions(
-                                provider.partition,
-                                consumer.partition,
-                            ),
-                        });
-                        release_technosphere_edges.push(CompiledReleaseTechnosphereEdge {
-                            consumer_process_idx: ex.process_idx,
-                            consumer_input_exchange_internal_id: ex
-                                .internal_id
-                                .clone()
-                                .unwrap_or_default(),
-                            provider_process_idx: allocation.provider_idx,
-                            provider_output_exchange_internal_id: provider_output_internal_id(
-                                provider_outputs,
-                                allocation.provider_idx,
-                            )
-                            .unwrap_or_default(),
-                            provider_weight: allocation.weight,
-                            normalized_amount: amount,
-                            flow_id: ex.flow_id,
-                            flow_version: ex.flow_version.clone(),
-                            location: ex.location.clone(),
-                        });
-                    }
-                }
-                MultiProviderDecision::Unresolved(failure_reason) => {
-                    matching_stats.matched_multi_unresolved += 1;
-                    provider_decisions.push(CompiledProviderDecision {
-                        consumer_idx: ex.process_idx,
-                        flow_id: ex.flow_id,
-                        candidate_provider_count,
-                        matched_provider_count: 0,
-                        candidates: provider_candidates,
-                        decision_kind: Some(CompiledProviderDecisionKind::MultiUnresolved),
-                        resolution_strategy: None,
-                        failure_reason: Some(failure_reason),
-                        used_equal_fallback: false,
-                        volume_fallback_to_one_count: 0,
-                        geography_tier: None,
-                        supply_region_source: Some(supply_region_anchor.source),
-                        supply_region_location: supply_region_anchor.location.clone(),
-                        exchange_location_present: ex.location.is_some(),
-                        allocations: Vec::new(),
-                    });
-                }
-            }
-        } else {
-            matching_stats.unmatched_no_provider += 1;
-            provider_decisions.push(CompiledProviderDecision {
-                consumer_idx: ex.process_idx,
-                flow_id: ex.flow_id,
-                candidate_provider_count: 0,
-                matched_provider_count: 0,
-                candidates: provider_candidates,
-                decision_kind: Some(CompiledProviderDecisionKind::NoProvider),
-                resolution_strategy: None,
-                failure_reason: Some(no_provider_failure_reason(provider_outputs)),
-                used_equal_fallback: false,
-                volume_fallback_to_one_count: 0,
-                geography_tier: None,
-                supply_region_source: Some(supply_region_anchor.source),
-                supply_region_location: supply_region_anchor.location,
-                exchange_location_present: ex.location.is_some(),
-                allocations: Vec::new(),
-            });
-        }
     }
 
+    let balance_batch = compile_signed_flow_balances(
+        &exchanges,
+        &flow_space_by_id,
+        &reference_port_map,
+        &process_meta,
+        &compiled_processes,
+        provider_rule,
+    )?;
+    let provider_decisions = balance_batch.decisions;
+    let technosphere_edges = balance_batch.technosphere_edges;
+    let release_technosphere_edges = balance_batch.release_edges;
+    let balance_resolutions = balance_batch.resolutions;
+    let unresolved_balances = balance_batch.unresolved;
+    let matching_stats = balance_batch.matching_stats;
     let lcia_exchange_observations = exchanges
         .iter()
         .filter_map(|exchange| {
@@ -3485,6 +3660,9 @@ async fn compile_scope_graph(
         graph: CompiledGraph {
             processes: compiled_processes,
             flows,
+            reference_ports,
+            balance_resolutions,
+            unresolved_balances,
             provider_outputs,
             provider_decisions,
             technosphere_edges,
@@ -3501,8 +3679,9 @@ async fn compile_scope_graph(
                 fraction_invalid_count: allocation_stats.fraction_invalid_count,
                 legacy_empty_allocation_as_undeclared_count: allocation_stats
                     .legacy_empty_allocation_as_undeclared_count,
-                legacy_single_output_target_inferred_count: allocation_stats
-                    .legacy_single_output_target_inferred_count,
+                legacy_single_output_target_inferred_count: 0,
+                legacy_single_reference_target_inferred_count: allocation_stats
+                    .legacy_single_reference_target_inferred_count,
             },
             matching_stats,
             release_evidence: Some(release_evidence),
@@ -3528,21 +3707,6 @@ fn lcia_exchange_observation_for_attributed_exchange(
         exchange_id: exchange.exchange_id.clone(),
         amount: exchange.amount,
     })
-}
-
-fn provider_output_internal_id(
-    outputs: Option<&Vec<ProviderOutputCandidate>>,
-    provider_idx: i32,
-) -> Option<String> {
-    outputs?
-        .iter()
-        .find(|output| {
-            output.provider_idx == provider_idx
-                && output.output_exchange_is_reference
-                && output.output_allocation_state != AllocationFractionState::Invalid
-        })?
-        .output_exchange_internal_id
-        .clone()
 }
 
 fn build_compiled_release_evidence(
@@ -3584,6 +3748,13 @@ fn build_compiled_release_evidence(
             quantitative_reference_flow_version: reference_flow_version,
             reference_unit,
             normalized_mean_amount: reference.amount.unwrap_or(f64::NAN),
+            reference_direction: reference.direction.map(compiled_exchange_direction),
+            raw_reference_amount: reference.raw_amount,
+            signed_raw_reference_coefficient: reference.signed_raw_coefficient,
+            normalized_reference_coefficient: reference
+                .direction
+                .zip(reference.amount)
+                .map(|(direction, amount)| direction.signed_flow_direction().sign() * amount),
         });
     }
     release_processes.sort_unstable_by_key(|process| process.process_idx);
@@ -3610,6 +3781,9 @@ fn build_compiled_release_evidence(
             normalized_mean_amount: amount,
             allocation_target_internal_id: exchange.allocation_target_internal_id.clone(),
             allocation_fraction: exchange.allocation_fraction,
+            signed_normalized_coefficient: exchange
+                .direction
+                .map(|direction| direction.signed_flow_direction().sign() * amount),
         };
         inventory_exchanges.push(release_exchange.clone());
         if flow_kind_by_id.get(&exchange.flow_id) == Some(&CompiledFlowKind::Elementary)
@@ -3628,13 +3802,13 @@ fn build_compiled_release_evidence(
         }
     }
     technosphere_edges.sort_by(|left, right| {
-        left.consumer_process_idx
-            .cmp(&right.consumer_process_idx)
+        left.dependent_process_idx
+            .cmp(&right.dependent_process_idx)
             .then_with(|| {
-                left.consumer_input_exchange_internal_id
-                    .cmp(&right.consumer_input_exchange_internal_id)
+                left.residual_exchange_internal_id
+                    .cmp(&right.residual_exchange_internal_id)
             })
-            .then_with(|| left.provider_process_idx.cmp(&right.provider_process_idx))
+            .then_with(|| left.balancing_process_idx.cmp(&right.balancing_process_idx))
     });
 
     Ok(CompiledReleaseEvidence {
@@ -3908,6 +4082,8 @@ fn assemble_sparse_payload(
                 .matching_stats
                 .matched_multi_fallback_equal,
             a_input_edges_written: compiled_graph.matching_stats.a_input_edges_written,
+            residual_edges_total: compiled_graph.matching_stats.residual_edges_total,
+            a_balance_edges_written: compiled_graph.matching_stats.a_balance_edges_written,
             a_write_pct,
             provider_present_resolved_pct,
             unique_provider_match_pct,
@@ -3940,6 +4116,9 @@ fn assemble_sparse_payload(
             legacy_single_output_target_inferred_count: compiled_graph
                 .allocation_stats
                 .legacy_single_output_target_inferred_count,
+            legacy_single_reference_target_inferred_count: compiled_graph
+                .allocation_stats
+                .legacy_single_reference_target_inferred_count,
         },
         singular_risk: SnapshotSingularRisk {
             risk_level,
@@ -3992,7 +4171,7 @@ fn assemble_sparse_payload(
         calculation_evidence: None,
     };
     let readiness = verify_matrix_readiness(&MatrixReadinessInput {
-        schema_version: "matrix_readiness_input.v1".to_owned(),
+        schema_version: "matrix_readiness_input.v2".to_owned(),
         snapshot_id: Some(snapshot_id),
         config: None,
         coverage: coverage.clone(),
@@ -4263,7 +4442,7 @@ enum AllocationFractionState {
 enum AllocationFallbackState {
     None,
     LegacyEmptyUndeclared,
-    LegacySingleOutputTargetInferred,
+    LegacySingleReferenceTargetInferred,
 }
 
 fn resolve_reference_normalization(
@@ -4271,11 +4450,17 @@ fn resolve_reference_normalization(
     process_json: &Value,
     exchanges: &[&Value],
     _mode: NormalizationMode,
-) -> anyhow::Result<(f64, ReferenceParseStats)> {
+) -> anyhow::Result<(ReferencePivot, ReferenceParseStats)> {
     let mut stats = ReferenceParseStats::default();
-    let reference_internal_id = parse_reference_internal_id(process_json);
+    let reference_internal_ids = parse_reference_internal_ids(process_json);
+    if reference_internal_ids.len() > 1 {
+        return Err(anyhow::anyhow!(
+            "multiple quantitative reference flows are not supported for process={process_id}; referenceToReferenceFlow={reference_internal_ids:?}"
+        ));
+    }
+    let reference_internal_id = reference_internal_ids.first();
 
-    let Some(reference_internal_id) = reference_internal_id.as_deref() else {
+    let Some(reference_internal_id) = reference_internal_id else {
         return Err(anyhow::anyhow!(
             "missing quantitativeReference.referenceToReferenceFlow for process={process_id}"
         ));
@@ -4296,47 +4481,57 @@ fn resolve_reference_normalization(
         ));
     }
     let reference_exchange = reference_exchanges[0];
-    if parse_exchange_direction(
+    let direction = parse_exchange_direction(
         reference_exchange
             .get("exchangeDirection")
             .and_then(Value::as_str),
-    ) != Some(ExchangeDirection::Output)
-    {
-        return Err(anyhow::anyhow!(
-            "referenceToReferenceFlow={} must identify an Output exchange for process={process_id}",
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "referenceToReferenceFlow={} must identify an Input or Output exchange for process={process_id}",
             reference_internal_id
-        ));
-    }
+        )
+    })?;
 
     let reference_amount = parse_number(
         solver_worker::tidas_process_semantics::preferred_calculation_amount_value(
             reference_exchange,
         ),
-    )
-    .filter(|value| value.is_finite() && *value > f64::EPSILON);
+    );
     let Some(reference_amount) = reference_amount else {
         return Err(anyhow::anyhow!(
-            "reference amount must be finite and positive for process={process_id} reference_internal_id={}",
+            "reference amount must be finite for process={process_id} reference_internal_id={}",
             reference_internal_id
         ));
     };
+    let raw_reference_coefficient =
+        signed_coefficient(direction.signed_flow_direction(), reference_amount).map_err(|error| {
+            anyhow::anyhow!(
+                "invalid signed reference coefficient for process={process_id} reference_internal_id={reference_internal_id}: {error}"
+            )
+        })?;
+    let pivot = normalize_reference_coefficient(raw_reference_coefficient).map_err(|error| {
+        anyhow::anyhow!(
+            "invalid quantitative reference for process={process_id} reference_internal_id={reference_internal_id}: {error}"
+        )
+    })?;
 
     stats.normalized_processes = 1;
-    Ok((1.0 / reference_amount, stats))
+    Ok((pivot, stats))
 }
 
 fn resolve_allocation_fraction(
     exchange_json: &Value,
     reference_internal_id: &str,
-    valid_output_internal_ids: &HashSet<String>,
-    output_exchange_count: usize,
+    valid_exchange_internal_ids: &HashSet<String>,
+    reference_exchange_count: usize,
     _mode: AllocationMode,
 ) -> anyhow::Result<(f64, AllocationFractionState, AllocationFallbackState)> {
     match solver_worker::tidas_process_semantics::resolve_tidas_exchange_allocation(
         exchange_json,
         reference_internal_id,
-        valid_output_internal_ids,
-        output_exchange_count,
+        valid_exchange_internal_ids,
+        reference_exchange_count,
     )? {
         solver_worker::tidas_process_semantics::TidasAllocationResolution::Undeclared => {
             Ok((
@@ -4364,7 +4559,7 @@ fn resolve_allocation_fraction(
         } => Ok((
             fraction,
             AllocationFractionState::Present,
-            AllocationFallbackState::LegacySingleOutputTargetInferred,
+            AllocationFallbackState::LegacySingleReferenceTargetInferred,
         )),
         solver_worker::tidas_process_semantics::TidasAllocationResolution::SparseZero => {
             Ok((
@@ -4657,37 +4852,41 @@ fn process_meta_for_idx(process_meta: &[ProcessMeta], process_idx: i32) -> Optio
         .and_then(|idx| process_meta.get(idx))
 }
 
-fn provider_candidates_for_outputs(
-    providers: Option<&Vec<ProviderOutputCandidate>>,
+fn compiled_balance_candidates(
+    ports: Option<&Vec<ReferencePortCandidate>>,
     process_meta: &[ProcessMeta],
+    dependent_process_idx: i32,
+    residual_coefficient: f64,
 ) -> anyhow::Result<Vec<CompiledProviderCandidate>> {
-    let Some(providers) = providers else {
+    let Some(ports) = ports else {
         return Ok(Vec::new());
     };
-    providers
+    ports
         .iter()
-        .map(|provider| {
-            let meta =
-                process_meta_for_idx(process_meta, provider.provider_idx).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "missing provider process meta idx={}",
-                        provider.provider_idx
-                    )
-                })?;
+        .map(|port| {
+            let meta = process_meta_for_idx(process_meta, port.process_idx).ok_or_else(|| {
+                anyhow::anyhow!("missing balancing process meta idx={}", port.process_idx)
+            })?;
+            let is_eligible = port.process_idx != dependent_process_idx
+                && port.coefficient.signum() != residual_coefficient.signum();
             Ok(CompiledProviderCandidate {
-                provider_idx: provider.provider_idx,
+                provider_idx: port.process_idx,
                 provider_id: meta.process_id,
-                output_exchange_internal_id: provider.output_exchange_internal_id.clone(),
-                output_exchange_is_reference: provider.output_exchange_is_reference,
-                output_normalized_amount: provider.output_normalized_amount,
-                output_allocation_state: compiled_allocation_state(
-                    provider.output_allocation_state,
-                ),
-                eligibility: provider_candidate_eligibility(provider),
+                output_exchange_internal_id: port.reference_exchange_internal_id.clone(),
+                output_exchange_is_reference: true,
+                output_normalized_amount: Some(port.raw_amount),
+                output_allocation_state: compiled_allocation_state(port.allocation_state),
+                eligibility: if is_eligible {
+                    CompiledProviderCandidateEligibility::AcceptedOppositeSignReference
+                } else {
+                    CompiledProviderCandidateEligibility::RejectedSameSignReference
+                },
                 process_name: meta.process_name.clone(),
                 location: meta.location.clone(),
                 reference_year: meta.reference_year,
                 annual_supply_or_production_volume: meta.annual_supply_or_production_volume,
+                reference_exchange_internal_id: port.reference_exchange_internal_id.clone(),
+                reference_coefficient: Some(port.coefficient),
             })
         })
         .collect()
@@ -5192,6 +5391,7 @@ fn provider_failure_reason_label(reason: CompiledProviderFailureReason) -> &'sta
         CompiledProviderFailureReason::Top1BelowTop1MinScore => "top1_below_top1_min_score",
         CompiledProviderFailureReason::Top1Top2RatioTooClose => "top1_top2_ratio_too_close",
         CompiledProviderFailureReason::ScoreSumNonPositive => "score_sum_non_positive",
+        CompiledProviderFailureReason::NoOppositeSignReference => "no_opposite_sign_reference",
     }
 }
 
@@ -5205,6 +5405,12 @@ fn provider_candidate_eligibility_label(
         }
         CompiledProviderCandidateEligibility::RejectedNonReferenceOutput => {
             "rejected_non_reference_output"
+        }
+        CompiledProviderCandidateEligibility::AcceptedOppositeSignReference => {
+            "accepted_opposite_sign_reference"
+        }
+        CompiledProviderCandidateEligibility::RejectedSameSignReference => {
+            "rejected_same_sign_reference"
         }
     }
 }
@@ -5262,46 +5468,32 @@ fn classify_scope_partition(
     }
 }
 
-fn request_root_input_allocation_state(
-    exchange: &Value,
-    reference_internal_id: Option<&str>,
-    valid_output_internal_ids: &HashSet<String>,
-    output_exchange_count: usize,
-) -> (Option<f64>, AllocationFractionState) {
-    if exchange.get("allocations").is_none() {
-        return (Some(1.0), AllocationFractionState::Missing);
-    }
-    let Some(reference_internal_id) = reference_internal_id else {
-        return (None, AllocationFractionState::Invalid);
-    };
-    match solver_worker::tidas_process_semantics::resolve_tidas_exchange_allocation(
-        exchange,
-        reference_internal_id,
-        valid_output_internal_ids,
-        output_exchange_count,
-    ) {
-        Ok(
-            solver_worker::tidas_process_semantics::TidasAllocationResolution::Undeclared
-            | solver_worker::tidas_process_semantics::TidasAllocationResolution::LegacyEmptyUndeclared,
-        ) => {
-            (Some(1.0), AllocationFractionState::Missing)
-        }
-        Ok(
-            solver_worker::tidas_process_semantics::TidasAllocationResolution::Explicit {
-                fraction,
-            }
-            | solver_worker::tidas_process_semantics::TidasAllocationResolution::LegacyInferredReference {
-                fraction,
-            },
-        ) => (Some(fraction), AllocationFractionState::Present),
-        Ok(solver_worker::tidas_process_semantics::TidasAllocationResolution::SparseZero) => {
-            (Some(0.0), AllocationFractionState::SparseZero)
-        }
-        Err(_) => (None, AllocationFractionState::Invalid),
-    }
+#[cfg(test)]
+fn resolve_process_selection(
+    candidate_processes: Vec<ProcessRow>,
+    all_states: bool,
+    state_codes: &[i32],
+    include_user_id: Option<Uuid>,
+    request_roots: &[RequestRootProcess],
+    provider_rule: ProviderRule,
+    process_limit: usize,
+    flow_space_by_id: Option<&HashMap<Uuid, CompiledFlowSpace>>,
+) -> anyhow::Result<ResolvedProcessSelection> {
+    resolve_process_selection_with_flow_versions(
+        candidate_processes,
+        all_states,
+        state_codes,
+        include_user_id,
+        request_roots,
+        provider_rule,
+        process_limit,
+        flow_space_by_id,
+        None,
+    )
 }
 
-fn resolve_process_selection(
+#[allow(clippy::too_many_arguments)]
+fn resolve_process_selection_with_flow_versions(
     mut candidate_processes: Vec<ProcessRow>,
     all_states: bool,
     state_codes: &[i32],
@@ -5309,6 +5501,8 @@ fn resolve_process_selection(
     request_roots: &[RequestRootProcess],
     provider_rule: ProviderRule,
     process_limit: usize,
+    flow_space_by_id: Option<&HashMap<Uuid, CompiledFlowSpace>>,
+    selected_flow_version_by_id: Option<&HashMap<Uuid, String>>,
 ) -> anyhow::Result<ResolvedProcessSelection> {
     if request_roots.is_empty() {
         if process_limit > 0 && candidate_processes.len() > process_limit {
@@ -5359,133 +5553,83 @@ fn resolve_process_selection(
 
     let processes = candidate_processes;
     let mut process_meta = Vec::with_capacity(processes.len());
-    let mut input_exchanges_by_idx = Vec::<Vec<ParsedExchange>>::with_capacity(processes.len());
-    let mut provider_sets: ProviderMap = HashMap::new();
+    let mut residual_exchanges_by_idx = Vec::<Vec<ParsedExchange>>::with_capacity(processes.len());
+    let mut reference_port_map: ReferencePortMap = HashMap::new();
     let mut process_lookup = HashMap::<(Uuid, String), i32>::with_capacity(processes.len());
+    let requested_root_keys = request_roots
+        .iter()
+        .map(|root| (root.process_id, root.process_version.clone()))
+        .collect::<HashSet<_>>();
 
     for (idx, proc_row) in processes.iter().enumerate() {
         let process_idx =
             i32::try_from(idx).map_err(|_| anyhow::anyhow!("process index overflow"))?;
         process_lookup.insert((proc_row.id, proc_row.version.clone()), process_idx);
-        let reference_internal_id = parse_reference_internal_id(&proc_row.json);
-        let exchange_items = process_exchange_items(&proc_row.json);
-        let output_exchange_count = exchange_items
-            .iter()
-            .filter(|exchange| {
-                parse_exchange_direction(exchange.get("exchangeDirection").and_then(Value::as_str))
-                    == Some(ExchangeDirection::Output)
-            })
-            .count();
-        let valid_output_internal_ids = exchange_items
-            .iter()
-            .filter(|exchange| {
-                parse_exchange_direction(exchange.get("exchangeDirection").and_then(Value::as_str))
-                    == Some(ExchangeDirection::Output)
-            })
-            .filter_map(|exchange| parse_exchange_internal_id(exchange))
-            .collect::<HashSet<_>>();
-        process_meta.push(ProcessMeta {
+        let parsed = parse_process_chunk(
+            proc_row,
             process_idx,
-            process_id: proc_row.id,
-            process_version: proc_row.version.clone(),
-            process_name: parse_process_name(&proc_row.json),
-            model_id: proc_row.model_id,
-            location: parse_process_location(&proc_row.json),
-            reference_year: parse_process_reference_year(&proc_row.json),
-            annual_supply_or_production_volume: parse_process_annual_supply_or_production_volume(
-                &proc_row.json,
-            ),
-        });
-
-        let mut input_exchanges = Vec::new();
-        for exchange in exchange_items {
-            let direction = match exchange
-                .get("exchangeDirection")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-            {
-                "Input" => Some(ExchangeDirection::Input),
-                "Output" => Some(ExchangeDirection::Output),
-                _ => None,
-            };
-            let Some(direction) = direction else {
-                continue;
-            };
-            let Some(flow_id) =
-                parse_uuid_at(exchange, &["referenceToFlowDataSet", "@refObjectId"])
-            else {
-                continue;
-            };
-            let internal_id = parse_exchange_internal_id(exchange);
-
-            if direction == ExchangeDirection::Output {
-                provider_sets.entry(flow_id).or_default().push(
-                    provider_output_candidate_from_exchange(
-                        process_idx,
-                        flow_id,
-                        &ParsedExchange {
-                            process_idx,
-                            flow_id,
-                            direction: Some(direction),
-                            direction_label: direction.as_str().to_owned(),
-                            internal_id: internal_id.clone(),
-                            exchange_id: internal_id
-                                .clone()
-                                .unwrap_or_else(|| format!("scope:{}:{}", proc_row.id, flow_id)),
-                            flow_version: "unknown".to_owned(),
-                            is_reference_exchange: is_reference_internal_exchange(
-                                internal_id.as_deref(),
-                                reference_internal_id.as_deref(),
-                            ),
-                            amount: None,
-                            allocation_state: AllocationFractionState::Missing,
-                            allocation_fraction: 1.0,
-                            allocation_target_internal_id: reference_internal_id
-                                .clone()
-                                .unwrap_or_default(),
-                            location: parse_exchange_location(exchange),
-                        },
-                    ),
-                );
-            } else {
-                let (allocation_amount, allocation_state) = request_root_input_allocation_state(
-                    exchange,
-                    reference_internal_id.as_deref(),
-                    &valid_output_internal_ids,
-                    output_exchange_count,
-                );
-                input_exchanges.push(ParsedExchange {
+            NormalizationMode::Strict,
+            AllocationMode::Strict,
+        );
+        let (meta, mut exchanges, _, _, _) = match parsed {
+            Ok(parsed) => parsed,
+            Err(_) if !requested_root_keys.contains(&(proc_row.id, proc_row.version.clone())) => {
+                process_meta.push(ProcessMeta {
                     process_idx,
-                    flow_id,
-                    direction: Some(direction),
-                    direction_label: direction.as_str().to_owned(),
-                    internal_id: internal_id.clone(),
-                    exchange_id: internal_id
-                        .clone()
-                        .unwrap_or_else(|| format!("scope:{}:{}", proc_row.id, flow_id)),
-                    flow_version: "unknown".to_owned(),
-                    is_reference_exchange: is_reference_internal_exchange(
-                        internal_id.as_deref(),
-                        reference_internal_id.as_deref(),
-                    ),
-                    amount: allocation_amount,
-                    allocation_state,
-                    allocation_fraction: allocation_amount.unwrap_or(f64::NAN),
-                    allocation_target_internal_id: reference_internal_id
-                        .clone()
-                        .unwrap_or_default(),
-                    location: parse_exchange_location(exchange),
+                    process_id: proc_row.id,
+                    process_version: proc_row.version.clone(),
+                    process_name: parse_process_name(&proc_row.json),
+                    model_id: proc_row.model_id,
+                    location: parse_process_location(&proc_row.json),
+                    reference_year: parse_process_reference_year(&proc_row.json),
+                    annual_supply_or_production_volume:
+                        parse_process_annual_supply_or_production_volume(&proc_row.json),
                 });
+                residual_exchanges_by_idx.push(Vec::new());
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(selected_flow_version_by_id) = selected_flow_version_by_id {
+            if let Err(error) =
+                resolve_selected_flow_versions(&mut exchanges, selected_flow_version_by_id)
+            {
+                if requested_root_keys.contains(&(proc_row.id, proc_row.version.clone())) {
+                    return Err(error);
+                }
+                process_meta.push(meta);
+                residual_exchanges_by_idx.push(Vec::new());
+                continue;
             }
         }
-        input_exchanges_by_idx.push(input_exchanges);
+        for exchange in &exchanges {
+            let is_technosphere = flow_space_by_id.is_none_or(|spaces| {
+                spaces.get(&exchange.flow_id) == Some(&CompiledFlowSpace::Technosphere)
+            });
+            if exchange.is_reference_exchange && is_technosphere {
+                reference_port_map
+                    .entry(flow_link_identity(exchange))
+                    .or_default()
+                    .push(reference_port_candidate_from_exchange(exchange)?);
+            }
+        }
+        process_meta.push(meta);
+        residual_exchanges_by_idx.push(
+            exchanges
+                .into_iter()
+                .filter(|exchange| {
+                    !exchange.is_reference_exchange
+                        && flow_space_by_id.is_none_or(|spaces| {
+                            spaces.get(&exchange.flow_id) == Some(&CompiledFlowSpace::Technosphere)
+                        })
+                })
+                .collect(),
+        );
     }
 
-    let mut provider_map = provider_sets;
-    for providers in provider_map.values_mut() {
-        sort_provider_output_candidates(providers, &process_meta);
+    for ports in reference_port_map.values_mut() {
+        sort_reference_port_candidates(ports, &process_meta);
     }
-
     let normalized_roots = normalize_request_roots(request_roots);
     let mut selected = HashSet::<i32>::new();
     let mut queue = Vec::<i32>::new();
@@ -5504,10 +5648,10 @@ fn resolve_process_selection(
     while cursor < queue.len() {
         let current = queue[cursor];
         cursor += 1;
-        let input_exchanges = input_exchanges_by_idx
+        let residual_exchanges = residual_exchanges_by_idx
             .get(usize::try_from(current).map_err(|_| anyhow::anyhow!("negative process idx"))?)
             .ok_or_else(|| anyhow::anyhow!("missing input exchanges for process idx={current}"))?;
-        for exchange in input_exchanges {
+        for exchange in residual_exchanges {
             if exchange.allocation_state == AllocationFractionState::Invalid {
                 let process = process_meta_for_idx(&process_meta, current)
                     .ok_or_else(|| anyhow::anyhow!("missing process metadata idx={current}"))?;
@@ -5518,11 +5662,15 @@ fn resolve_process_selection(
                     exchange.exchange_id
                 ));
             }
-            if nonzero_attributed_input_amount(exchange).is_none() {
+            let Some(residual_coefficient) = nonzero_residual_coefficient(exchange) else {
                 continue;
-            }
-            let provider_outputs = provider_map.get(&exchange.flow_id);
-            let providers = eligible_provider_indices(provider_outputs);
+            };
+            let reference_ports = reference_port_map.get(&flow_link_identity(exchange));
+            let providers = eligible_balancing_process_indices(
+                reference_ports,
+                exchange.process_idx,
+                residual_coefficient,
+            );
             let provider_cnt = providers.len();
             let next_indices = if provider_cnt == 1 {
                 providers
@@ -6800,15 +6948,32 @@ fn parse_uuid_at(value: &Value, path: &[&str]) -> Option<Uuid> {
 }
 
 fn parse_reference_internal_id(process_json: &Value) -> Option<String> {
-    process_json
+    let reference_internal_ids = parse_reference_internal_ids(process_json);
+    (reference_internal_ids.len() == 1).then(|| reference_internal_ids[0].clone())
+}
+
+fn parse_reference_internal_ids(process_json: &Value) -> Vec<String> {
+    let Some(value) = process_json
         .get("processDataSet")
         .and_then(|v| v.get("processInformation"))
         .and_then(|v| v.get("quantitativeReference"))
         .and_then(|v| v.get("referenceToReferenceFlow"))
-        .and_then(Value::as_str)
+    else {
+        return Vec::new();
+    };
+
+    let values = match value {
+        Value::Array(values) => values.iter().collect::<Vec<_>>(),
+        _ => vec![value],
+    };
+
+    values
+        .into_iter()
+        .filter_map(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn parse_exchange_internal_id(exchange_json: &Value) -> Option<String> {
@@ -6981,7 +7146,22 @@ fn parse_positive_number_prefix(text: &str) -> Option<f64> {
     (value.is_finite() && value > 0.0).then_some(value)
 }
 
-fn classify_flow_kind(flow_json: &Value) -> &'static str {
+fn classify_source_flow_type(flow_json: &Value) -> CompiledSourceFlowType {
+    let declared_type = flow_json
+        .get("flowDataSet")
+        .and_then(|value| value.get("modellingAndValidation"))
+        .and_then(|value| value.get("LCIMethod"))
+        .and_then(|value| value.get("typeOfDataSet"))
+        .and_then(Value::as_str)
+        .map(str::trim);
+    match declared_type {
+        Some("Product flow") => return CompiledSourceFlowType::Product,
+        Some("Waste flow") => return CompiledSourceFlowType::Waste,
+        Some("Elementary flow") => return CompiledSourceFlowType::Elementary,
+        Some(_) => return CompiledSourceFlowType::Other,
+        None => {}
+    }
+
     let Some(category) = flow_json
         .get("flowDataSet")
         .and_then(|v| v.get("flowInformation"))
@@ -6990,7 +7170,7 @@ fn classify_flow_kind(flow_json: &Value) -> &'static str {
         .and_then(|v| v.get("common:elementaryFlowCategorization"))
         .and_then(|v| v.get("common:category"))
     else {
-        return "product";
+        return CompiledSourceFlowType::Product;
     };
 
     let category_text = match category {
@@ -7005,8 +7185,18 @@ fn classify_flow_kind(flow_json: &Value) -> &'static str {
     };
 
     match category_text {
-        "Emissions" | "Resources" | "Land use" => "elementary",
-        _ => "product",
+        "Emissions" | "Resources" | "Land use" => CompiledSourceFlowType::Elementary,
+        _ => CompiledSourceFlowType::Product,
+    }
+}
+
+const fn flow_space_for_source_type(source_type: CompiledSourceFlowType) -> CompiledFlowSpace {
+    match source_type {
+        CompiledSourceFlowType::Product | CompiledSourceFlowType::Waste => {
+            CompiledFlowSpace::Technosphere
+        }
+        CompiledSourceFlowType::Elementary => CompiledFlowSpace::Biosphere,
+        CompiledSourceFlowType::Other => CompiledFlowSpace::Reporting,
     }
 }
 
@@ -7398,6 +7588,18 @@ fn write_report_files(
         config.allocation_semantics_version
     ));
     md.push_str(&format!(
+        "- link_semantics_version: `{}`\n",
+        config.link_semantics_version
+    ));
+    md.push_str(&format!(
+        "- technosphere_boundary_policy: `{}`\n",
+        config.technosphere_boundary_policy
+    ));
+    md.push_str(&format!(
+        "- flow_identity_policy: `{}`\n",
+        config.flow_identity_policy
+    ));
+    md.push_str(&format!(
         "- biosphere_sign_mode: `{}`\n",
         config.biosphere_sign_mode
     ));
@@ -7504,6 +7706,14 @@ fn write_report_files(
     ));
 
     md.push_str("## Matching Coverage\n\n");
+    md.push_str(&format!(
+        "- residual_edges_total: `{}`\n",
+        coverage.matching.residual_edges_total
+    ));
+    md.push_str(&format!(
+        "- a_balance_edges_written: `{}`\n",
+        coverage.matching.a_balance_edges_written
+    ));
     md.push_str(&format!(
         "- input_edges_total: `{}`\n",
         coverage.matching.input_edges_total
@@ -7982,14 +8192,14 @@ mod tests {
         candidate_count_bucket_label, collect_source_dataset_references,
         compute_review_submit_overlay_source_hash, compute_scope_hash,
         compute_source_fingerprint_from_summary, geo_score, insert_compiled_source_dataset,
-        location_granularity_label, no_provider_failure_reason, normalize_request_roots,
+        location_granularity_label, no_balancing_reference_failure_reason, normalize_request_roots,
         parse_number, parse_process_annual_supply_or_production_volume, parse_process_states,
         parse_provider_rule_list, resolve_allocation_fraction, resolve_lcia_method_source_row,
         resolve_multi_provider, resolve_process_selection, resolve_reference_normalization,
         review_submit_root_dependency_fingerprint, snapshot_db_statement_timeout,
         source_dataset_document_id, source_reference_is_satisfied, summarize_matching_diagnostics,
         time_score, unique_supported_direction_by_flow, validate_flow_row_visibility,
-        validate_process_row_visibility, validate_reference_product_exchanges,
+        validate_process_row_visibility, validate_quantitative_references,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -7999,8 +8209,8 @@ mod tests {
 
     use solver_worker::compiled_graph::{
         CompiledAllocationStats, CompiledBiosphereEdge, CompiledFlow, CompiledFlowKind,
-        CompiledGraph, CompiledMatchingStats, CompiledProcess, CompiledProviderAllocation,
-        CompiledProviderCandidateEligibility, CompiledProviderDecision,
+        CompiledFlowSpace, CompiledGraph, CompiledMatchingStats, CompiledProcess,
+        CompiledProviderAllocation, CompiledProviderCandidateEligibility, CompiledProviderDecision,
         CompiledProviderDecisionKind, CompiledProviderFailureReason, CompiledProviderGeographyTier,
         CompiledProviderOutput, CompiledProviderOutputAllocationState,
         CompiledProviderResolutionStrategy, CompiledProviderSupplyRegionSource,
@@ -8030,10 +8240,15 @@ mod tests {
             request_roots: Vec::new(),
             process_limit: 0,
             provider_rule: "split_by_process_volume".to_owned(),
-            provider_candidate_eligibility_mode: "reference_output_only".to_owned(),
+            provider_candidate_eligibility_mode: "opposite_sign_reference_port".to_owned(),
             reference_normalization_mode: "strict".to_owned(),
             allocation_fraction_mode: "strict".to_owned(),
             allocation_semantics_version: allocation_semantics_version.to_owned(),
+            link_semantics_version:
+                solver_worker::tidas_process_semantics::SIGNED_FLOW_LINK_SEMANTICS_VERSION
+                    .to_owned(),
+            technosphere_boundary_policy: "closed".to_owned(),
+            flow_identity_policy: "exact-flow-version-reference-unit-v1".to_owned(),
             biosphere_sign_mode: "gross".to_owned(),
             self_loop_cutoff: 0.999_999,
             singular_eps: 1e-12,
@@ -8094,12 +8309,232 @@ mod tests {
     }
 
     #[test]
+    fn link_semantics_and_boundary_policy_change_all_source_fingerprints() {
+        let summary = SourceSnapshotSummary {
+            process_count: 2,
+            process_max_modified_at_utc: "2026-07-15T00:00:00.000000Z".to_owned(),
+            flow_count: 3,
+            flow_max_modified_at_utc: "2026-07-15T00:00:00.000000Z".to_owned(),
+            lciamethod_count: 0,
+            lciamethod_max_modified_at_utc: "disabled".to_owned(),
+        };
+        let mut config = test_snapshot_build_config("tidas-reference-allocation-v3");
+        let snapshot_hash = compute_source_fingerprint_from_summary(&summary, &config)
+            .expect("signed-flow source fingerprint");
+        let overlay_hash = compute_review_submit_overlay_source_hash("baseline", &config)
+            .expect("signed-flow overlay fingerprint");
+
+        config.link_semantics_version = "legacy-directional-link-v0".to_owned();
+        assert_ne!(
+            snapshot_hash,
+            compute_source_fingerprint_from_summary(&summary, &config)
+                .expect("legacy link source fingerprint")
+        );
+        assert_ne!(
+            overlay_hash,
+            compute_review_submit_overlay_source_hash("baseline", &config)
+                .expect("legacy link overlay fingerprint")
+        );
+
+        config.link_semantics_version =
+            solver_worker::tidas_process_semantics::SIGNED_FLOW_LINK_SEMANTICS_VERSION.to_owned();
+        config.technosphere_boundary_policy = "open".to_owned();
+        assert_ne!(
+            snapshot_hash,
+            compute_source_fingerprint_from_summary(&summary, &config)
+                .expect("open boundary source fingerprint")
+        );
+    }
+
+    #[test]
     fn technosphere_edge_is_provider_to_consumer() {
         let mut a_map: HashMap<(i32, i32), f64> = HashMap::new();
         add_technosphere_edge(&mut a_map, 10, 20, 0.4);
 
         assert_close(*a_map.get(&(10, 20)).expect("provider->consumer"), 0.4);
         assert!(!a_map.contains_key(&(20, 10)));
+    }
+
+    #[test]
+    fn generic_balance_compiler_links_product_and_equivalent_waste_reference_forms() {
+        let flow_id = Uuid::new_v4();
+        let process_meta = vec![
+            test_process_meta(0, Some("GLO"), Some(1.0)),
+            test_process_meta(1, Some("GLO"), Some(1.0)),
+        ];
+        let compiled_processes = process_meta
+            .iter()
+            .map(|meta| CompiledProcess {
+                process_idx: meta.process_idx,
+                process_id: meta.process_id,
+                process_version: meta.process_version.clone(),
+                process_name: meta.process_name.clone(),
+                model_id: meta.model_id,
+                location: meta.location.clone(),
+                reference_year: meta.reference_year,
+                annual_supply_or_production_volume: meta.annual_supply_or_production_volume,
+                partition: ScopeProcessPartition::Public,
+            })
+            .collect::<Vec<_>>();
+        let residual = ParsedExchange {
+            process_idx: 1,
+            flow_id,
+            direction: Some(ExchangeDirection::Output),
+            direction_label: "Output".to_owned(),
+            internal_id: Some("residual".to_owned()),
+            exchange_id: "residual".to_owned(),
+            flow_version: "01.00.000".to_owned(),
+            is_reference_exchange: false,
+            raw_amount: Some(3.0),
+            signed_raw_coefficient: Some(3.0),
+            amount: Some(3.0),
+            allocation_state: AllocationFractionState::Missing,
+            allocation_fraction: 1.0,
+            allocation_target_internal_id: "dependent-reference".to_owned(),
+            location: Some("GLO".to_owned()),
+        };
+
+        let compile_reference = |direction: ExchangeDirection, raw_amount: f64| {
+            let signed_raw = direction.signed_flow_direction().sign() * raw_amount;
+            let normalized_amount = raw_amount / signed_raw.abs();
+            let reference = ParsedExchange {
+                process_idx: 0,
+                flow_id,
+                direction: Some(direction),
+                direction_label: direction.as_str().to_owned(),
+                internal_id: Some("reference".to_owned()),
+                exchange_id: "reference".to_owned(),
+                flow_version: "01.00.000".to_owned(),
+                is_reference_exchange: true,
+                raw_amount: Some(raw_amount),
+                signed_raw_coefficient: Some(signed_raw),
+                amount: Some(normalized_amount),
+                allocation_state: AllocationFractionState::Missing,
+                allocation_fraction: 1.0,
+                allocation_target_internal_id: "reference".to_owned(),
+                location: Some("GLO".to_owned()),
+            };
+            let identity = super::flow_link_identity(&reference);
+            let mut ports = HashMap::from([(
+                identity.clone(),
+                vec![
+                    super::reference_port_candidate_from_exchange(&reference)
+                        .expect("reference port"),
+                ],
+            )]);
+            super::sort_reference_port_candidates(
+                ports.get_mut(&identity).expect("flow ports"),
+                &process_meta,
+            );
+            super::compile_signed_flow_balances(
+                std::slice::from_ref(&residual),
+                &HashMap::from([(flow_id, CompiledFlowSpace::Technosphere)]),
+                &ports,
+                &process_meta,
+                &compiled_processes,
+                ProviderRule::StrictUniqueProvider,
+            )
+            .expect("signed-flow balance")
+        };
+
+        let waste_input = compile_reference(ExchangeDirection::Input, 1_000.0);
+        let negative_waste_output = compile_reference(ExchangeDirection::Output, -1_000.0);
+        for batch in [&waste_input, &negative_waste_output] {
+            assert_eq!(batch.technosphere_edges.len(), 1);
+            assert_close(batch.technosphere_edges[0].amount, 3.0);
+            assert_close(batch.resolutions[0].residual_coefficient, 3.0);
+            assert_close(batch.resolutions[0].reference_coefficient, -1.0);
+            assert_close(batch.resolutions[0].activity_requirement, 3.0);
+            assert_eq!(batch.matching_stats.residual_edges_total, 1);
+            assert_eq!(batch.matching_stats.a_balance_edges_written, 1);
+        }
+
+        let product_input = ParsedExchange {
+            direction: Some(ExchangeDirection::Input),
+            direction_label: "Input".to_owned(),
+            raw_amount: Some(2.0),
+            signed_raw_coefficient: Some(-2.0),
+            amount: Some(2.0),
+            ..residual
+        };
+        let product_output = ParsedExchange {
+            process_idx: 0,
+            direction: Some(ExchangeDirection::Output),
+            direction_label: "Output".to_owned(),
+            internal_id: Some("reference".to_owned()),
+            exchange_id: "reference".to_owned(),
+            is_reference_exchange: true,
+            raw_amount: Some(1.0),
+            signed_raw_coefficient: Some(1.0),
+            amount: Some(1.0),
+            allocation_target_internal_id: "reference".to_owned(),
+            ..product_input.clone()
+        };
+        let ports = HashMap::from([(
+            super::flow_link_identity(&product_output),
+            vec![
+                super::reference_port_candidate_from_exchange(&product_output)
+                    .expect("product reference port"),
+            ],
+        )]);
+        let product_batch = super::compile_signed_flow_balances(
+            std::slice::from_ref(&product_input),
+            &HashMap::from([(flow_id, CompiledFlowSpace::Technosphere)]),
+            &ports,
+            &process_meta,
+            &compiled_processes,
+            ProviderRule::StrictUniqueProvider,
+        )
+        .expect("product signed-flow balance");
+        assert_close(product_batch.technosphere_edges[0].amount, 2.0);
+
+        let mut mismatched_version = product_input;
+        mismatched_version.flow_version = "02.00.000".to_owned();
+        let mismatched_batch = super::compile_signed_flow_balances(
+            &[mismatched_version],
+            &HashMap::from([(flow_id, CompiledFlowSpace::Technosphere)]),
+            &ports,
+            &process_meta,
+            &compiled_processes,
+            ProviderRule::StrictUniqueProvider,
+        )
+        .expect("mismatched flow revision remains unresolved");
+        assert!(mismatched_batch.technosphere_edges.is_empty());
+        assert_eq!(mismatched_batch.unresolved.len(), 1);
+        assert_eq!(mismatched_batch.unresolved[0].candidate_count, 0);
+    }
+
+    #[test]
+    fn snapshot_selected_flow_version_resolves_omitted_and_rejects_drift() {
+        let flow_id = Uuid::new_v4();
+        let mut exchange = ParsedExchange {
+            process_idx: 0,
+            flow_id,
+            direction: Some(ExchangeDirection::Output),
+            direction_label: "Output".to_owned(),
+            internal_id: Some("1".to_owned()),
+            exchange_id: "exchange".to_owned(),
+            flow_version: "unknown".to_owned(),
+            is_reference_exchange: true,
+            raw_amount: Some(1.0),
+            signed_raw_coefficient: Some(1.0),
+            amount: Some(1.0),
+            allocation_state: AllocationFractionState::Missing,
+            allocation_fraction: 1.0,
+            allocation_target_internal_id: "1".to_owned(),
+            location: None,
+        };
+        let selected = HashMap::from([(flow_id, "01.00.000".to_owned())]);
+
+        super::resolve_selected_flow_versions(std::slice::from_mut(&mut exchange), &selected)
+            .expect("omitted version resolves to snapshot selection");
+        assert_eq!(exchange.flow_version, "01.00.000");
+
+        exchange.flow_version = "02.00.000".to_owned();
+        assert!(
+            super::resolve_selected_flow_versions(std::slice::from_mut(&mut exchange), &selected)
+                .is_err()
+        );
     }
 
     #[test]
@@ -8310,13 +8745,30 @@ mod tests {
                     flow_idx: 0,
                     flow_id,
                     kind: CompiledFlowKind::Product,
+                    space: CompiledFlowSpace::Technosphere,
+                    source_type: solver_worker::compiled_graph::CompiledSourceFlowType::Product,
                 },
                 CompiledFlow {
                     flow_idx: 1,
                     flow_id: target_output_flow_id,
                     kind: CompiledFlowKind::Product,
+                    space: CompiledFlowSpace::Technosphere,
+                    source_type: solver_worker::compiled_graph::CompiledSourceFlowType::Product,
                 },
             ],
+            reference_ports: vec![solver_worker::compiled_graph::CompiledReferencePort {
+                process_idx: 0,
+                flow_id,
+                flow_version: "01.00.000".to_owned(),
+                reference_exchange_internal_id: "1".to_owned(),
+                coefficient: 1.0,
+                raw_direction: solver_worker::compiled_graph::CompiledExchangeDirection::Output,
+                raw_amount: 1.0,
+                signed_raw_coefficient: 1.0,
+                source_flow_type: solver_worker::compiled_graph::CompiledSourceFlowType::Product,
+            }],
+            balance_resolutions: Vec::new(),
+            unresolved_balances: Vec::new(),
             provider_outputs: vec![CompiledProviderOutput {
                 flow_id,
                 provider_idx: 0,
@@ -8325,6 +8777,10 @@ mod tests {
                 output_normalized_amount: Some(1.0),
                 output_allocation_state: CompiledProviderOutputAllocationState::Present,
                 eligibility: CompiledProviderCandidateEligibility::AcceptedReferenceOutput,
+                reference_coefficient: Some(1.0),
+                reference_direction: Some(
+                    solver_worker::compiled_graph::CompiledExchangeDirection::Output,
+                ),
             }],
             provider_decisions: Vec::new(),
             technosphere_edges: Vec::new(),
@@ -8418,7 +8874,12 @@ mod tests {
                 flow_idx: 0,
                 flow_id,
                 kind: CompiledFlowKind::Elementary,
+                space: CompiledFlowSpace::Biosphere,
+                source_type: solver_worker::compiled_graph::CompiledSourceFlowType::Elementary,
             }],
+            reference_ports: Vec::new(),
+            balance_resolutions: Vec::new(),
+            unresolved_balances: Vec::new(),
             provider_outputs: Vec::new(),
             provider_decisions: Vec::new(),
             technosphere_edges: Vec::new(),
@@ -8685,8 +9146,8 @@ mod tests {
                     review_id: None,
                     modified_at: Some(Utc::now()),
                     json: process_json(&[
-                        ("Input", fixed_flow_id("public-output")),
                         ("Output", Uuid::new_v4()),
+                        ("Input", fixed_flow_id("public-output")),
                     ]),
                 },
             ],
@@ -8699,6 +9160,7 @@ mod tests {
             )],
             ProviderRule::StrictUniqueProvider,
             0,
+            None,
         )
         .expect("resolve scope");
 
@@ -8791,6 +9253,7 @@ mod tests {
             )],
             ProviderRule::StrictUniqueProvider,
             0,
+            None,
         )
         .expect("resolve sparse-zero closure");
         assert_eq!(
@@ -8810,11 +9273,81 @@ mod tests {
         )
         .expect("parse sparse-zero root");
         assert_eq!(exchanges[2].amount, Some(0.0));
-        assert!(super::nonzero_attributed_input_amount(&exchanges[2]).is_none());
+        assert!(super::nonzero_residual_coefficient(&exchanges[2]).is_none());
     }
 
     #[test]
-    fn request_roots_closure_uses_only_safe_targetless_allocation_fallback() {
+    fn request_roots_closure_traverses_only_technosphere_flow_space() {
+        let root_process_id = Uuid::new_v4();
+        let balancing_process_id = Uuid::new_v4();
+        let root_flow_id = Uuid::new_v4();
+        let shared_flow_id = Uuid::new_v4();
+        let rows = || {
+            vec![
+                ProcessRow {
+                    id: root_process_id,
+                    version: "01.00.000".to_owned(),
+                    model_id: None,
+                    user_id: None,
+                    state_code: 100,
+                    team_id: None,
+                    review_id: None,
+                    modified_at: Some(Utc::now()),
+                    json: process_json(&[("Output", root_flow_id), ("Input", shared_flow_id)]),
+                },
+                ProcessRow {
+                    id: balancing_process_id,
+                    version: "01.00.000".to_owned(),
+                    model_id: None,
+                    user_id: None,
+                    state_code: 100,
+                    team_id: None,
+                    review_id: None,
+                    modified_at: Some(Utc::now()),
+                    json: process_json(&[("Output", shared_flow_id)]),
+                },
+            ]
+        };
+        let roots = [RequestRootProcess::new(
+            root_process_id,
+            "01.00.000".to_owned(),
+        )];
+
+        let biosphere_scope = resolve_process_selection(
+            rows(),
+            false,
+            &[100],
+            None,
+            &roots,
+            ProviderRule::StrictUniqueProvider,
+            0,
+            Some(&HashMap::from([
+                (root_flow_id, CompiledFlowSpace::Technosphere),
+                (shared_flow_id, CompiledFlowSpace::Biosphere),
+            ])),
+        )
+        .expect("biosphere closure");
+        assert_eq!(biosphere_scope.processes.len(), 1);
+
+        let technosphere_scope = resolve_process_selection(
+            rows(),
+            false,
+            &[100],
+            None,
+            &roots,
+            ProviderRule::StrictUniqueProvider,
+            0,
+            Some(&HashMap::from([
+                (root_flow_id, CompiledFlowSpace::Technosphere),
+                (shared_flow_id, CompiledFlowSpace::Technosphere),
+            ])),
+        )
+        .expect("technosphere closure");
+        assert_eq!(technosphere_scope.processes.len(), 2);
+    }
+
+    #[test]
+    fn request_roots_closure_targetless_fallback_depends_only_on_unique_reference() {
         let root_process_id = Uuid::new_v4();
         let provider_process_id = Uuid::new_v4();
         let root_flow = fixed_flow_id("root-flow");
@@ -8871,6 +9404,7 @@ mod tests {
             )],
             ProviderRule::StrictUniqueProvider,
             0,
+            None,
         )
         .expect("resolve safe targetless closure");
         assert_eq!(selected.processes.len(), 2);
@@ -8888,7 +9422,7 @@ mod tests {
                 }),
             );
         let ambiguous_root = row(root_process_id, ambiguous_json);
-        let error = resolve_process_selection(
+        let selected = resolve_process_selection(
             vec![ambiguous_root, provider],
             false,
             &[100],
@@ -8899,9 +9433,10 @@ mod tests {
             )],
             ProviderRule::StrictUniqueProvider,
             0,
+            None,
         )
-        .expect_err("reject ambiguous targetless closure");
-        assert!(format!("{error:#}").contains("invalid allocation"));
+        .expect("other exchange directions do not make the reference target ambiguous");
+        assert_eq!(selected.processes.len(), 2);
     }
 
     #[test]
@@ -8962,6 +9497,9 @@ mod tests {
                 },
             ],
             flows: Vec::<CompiledFlow>::new(),
+            reference_ports: Vec::new(),
+            balance_resolutions: Vec::new(),
+            unresolved_balances: Vec::new(),
             provider_outputs: Vec::new(),
             provider_decisions: vec![
                 CompiledProviderDecision {
@@ -9378,6 +9916,8 @@ mod tests {
             flow_version: "01.00.000".to_owned(),
             internal_id: None,
             is_reference_exchange: false,
+            raw_amount: None,
+            signed_raw_coefficient: None,
             amount: Some(1.0),
             allocation_state: AllocationFractionState::Present,
             allocation_fraction: 1.0,
@@ -9428,6 +9968,8 @@ mod tests {
             flow_version: "01.00.000".to_owned(),
             internal_id: None,
             is_reference_exchange: false,
+            raw_amount: None,
+            signed_raw_coefficient: None,
             amount: Some(1.0),
             allocation_state: AllocationFractionState::Present,
             allocation_fraction: 1.0,
@@ -9471,6 +10013,8 @@ mod tests {
             flow_version: "01.00.000".to_owned(),
             internal_id: None,
             is_reference_exchange: false,
+            raw_amount: None,
+            signed_raw_coefficient: None,
             amount: Some(1.0),
             allocation_state: AllocationFractionState::Present,
             allocation_fraction: 1.0,
@@ -9516,6 +10060,8 @@ mod tests {
             flow_version: "01.00.000".to_owned(),
             internal_id: None,
             is_reference_exchange: false,
+            raw_amount: None,
+            signed_raw_coefficient: None,
             amount: Some(1.0),
             allocation_state: AllocationFractionState::Present,
             allocation_fraction: 1.0,
@@ -9559,6 +10105,8 @@ mod tests {
             flow_version: "01.00.000".to_owned(),
             internal_id: None,
             is_reference_exchange: false,
+            raw_amount: None,
+            signed_raw_coefficient: None,
             amount: Some(1.0),
             allocation_state: AllocationFractionState::Present,
             allocation_fraction: 1.0,
@@ -9601,6 +10149,8 @@ mod tests {
             flow_version: "01.00.000".to_owned(),
             internal_id: None,
             is_reference_exchange: false,
+            raw_amount: None,
+            signed_raw_coefficient: None,
             amount: Some(1.0),
             allocation_state: AllocationFractionState::Present,
             allocation_fraction: 1.0,
@@ -9646,6 +10196,8 @@ mod tests {
             flow_version: "01.00.000".to_owned(),
             internal_id: None,
             is_reference_exchange: false,
+            raw_amount: None,
+            signed_raw_coefficient: None,
             amount: Some(1.0),
             allocation_state: AllocationFractionState::Present,
             allocation_fraction: 1.0,
@@ -9689,7 +10241,11 @@ mod tests {
                     team_id: None,
                     review_id: None,
                     modified_at: Some(Utc::now()),
-                    json: process_json_with_metadata(&[("Input", flow_id)], Some("CN-BJ"), None),
+                    json: process_json_with_metadata(
+                        &[("Output", Uuid::new_v4()), ("Input", flow_id)],
+                        Some("CN-BJ"),
+                        None,
+                    ),
                 },
                 ProcessRow {
                     id: local_provider_id,
@@ -9731,6 +10287,7 @@ mod tests {
             )],
             ProviderRule::SplitByProcessVolume,
             0,
+            None,
         )
         .expect("resolve scope");
 
@@ -9761,7 +10318,10 @@ mod tests {
                     review_id: None,
                     modified_at: Some(Utc::now()),
                     json: process_json_with_exchange_locations(
-                        &[("Input", flow_id, Some("GLO"))],
+                        &[
+                            ("Output", Uuid::new_v4(), None),
+                            ("Input", flow_id, Some("GLO")),
+                        ],
                         Some("CN-BJ"),
                         None,
                     ),
@@ -9806,6 +10366,7 @@ mod tests {
             )],
             ProviderRule::SplitByProcessVolume,
             0,
+            None,
         )
         .expect("resolve scope");
 
@@ -9837,7 +10398,7 @@ mod tests {
                     review_id: None,
                     modified_at: Some(Utc::now()),
                     json: process_json_with_metadata(
-                        &[("Input", demanded_flow_id)],
+                        &[("Output", Uuid::new_v4()), ("Input", demanded_flow_id)],
                         Some("CN-BJ"),
                         None,
                     ),
@@ -9885,6 +10446,7 @@ mod tests {
             )],
             ProviderRule::SplitByProcessVolume,
             0,
+            None,
         )
         .expect("resolve scope");
 
@@ -9918,7 +10480,7 @@ mod tests {
                     review_id: None,
                     modified_at: Some(Utc::now()),
                     json: process_json_with_metadata(
-                        &[("Input", demanded_flow_id)],
+                        &[("Output", Uuid::new_v4()), ("Input", demanded_flow_id)],
                         Some("CN-BJ"),
                         None,
                     ),
@@ -9962,6 +10524,7 @@ mod tests {
             )],
             ProviderRule::SplitByProcessVolume,
             0,
+            None,
         )
         .expect("resolve scope");
 
@@ -9977,23 +10540,26 @@ mod tests {
     }
 
     #[test]
-    fn no_provider_reason_distinguishes_rejected_non_reference_only() {
+    fn unresolved_balance_reason_distinguishes_same_sign_reference_only() {
         let flow_id = fixed_flow_id("demanded-flow");
-        let rejected = super::ProviderOutputCandidate {
+        let rejected = super::ReferencePortCandidate {
             flow_id,
-            provider_idx: 1,
-            output_exchange_internal_id: Some("2".to_owned()),
-            output_exchange_is_reference: false,
-            output_normalized_amount: Some(100.0),
-            output_allocation_state: AllocationFractionState::Present,
+            flow_version: "01.00.000".to_owned(),
+            process_idx: 1,
+            reference_exchange_internal_id: Some("2".to_owned()),
+            coefficient: -1.0,
+            raw_direction: ExchangeDirection::Input,
+            raw_amount: 1.0,
+            signed_raw_coefficient: -1.0,
+            allocation_state: AllocationFractionState::Present,
         };
 
         assert_eq!(
-            no_provider_failure_reason(Some(&vec![rejected])),
-            CompiledProviderFailureReason::RejectedNonReferenceOnly
+            no_balancing_reference_failure_reason(Some(&vec![rejected])),
+            CompiledProviderFailureReason::NoOppositeSignReference
         );
         assert_eq!(
-            no_provider_failure_reason(None),
+            no_balancing_reference_failure_reason(None),
             CompiledProviderFailureReason::NoProviderCandidates
         );
     }
@@ -10041,6 +10607,8 @@ mod tests {
             flow_version: "01.00.000".to_owned(),
             internal_id: None,
             is_reference_exchange: false,
+            raw_amount: None,
+            signed_raw_coefficient: None,
             amount: Some(1.0),
             allocation_state: AllocationFractionState::Present,
             allocation_fraction: 1.0,
@@ -10112,6 +10680,8 @@ mod tests {
             flow_version: "01.00.000".to_owned(),
             internal_id: None,
             is_reference_exchange: false,
+            raw_amount: None,
+            signed_raw_coefficient: None,
             amount: Some(1.0),
             allocation_state: AllocationFractionState::Present,
             allocation_fraction: 1.0,
@@ -10177,6 +10747,8 @@ mod tests {
             flow_version: "01.00.000".to_owned(),
             internal_id: None,
             is_reference_exchange: false,
+            raw_amount: None,
+            signed_raw_coefficient: None,
             amount: Some(1.0),
             allocation_state: AllocationFractionState::Present,
             allocation_fraction: 1.0,
@@ -10244,6 +10816,8 @@ mod tests {
             flow_version: "01.00.000".to_owned(),
             internal_id: None,
             is_reference_exchange: false,
+            raw_amount: None,
+            signed_raw_coefficient: None,
             amount: Some(1.0),
             allocation_state: AllocationFractionState::Present,
             allocation_fraction: 1.0,
@@ -10308,6 +10882,8 @@ mod tests {
             flow_version: "01.00.000".to_owned(),
             internal_id: None,
             is_reference_exchange: false,
+            raw_amount: None,
+            signed_raw_coefficient: None,
             amount: Some(1.0),
             allocation_state: AllocationFractionState::Present,
             allocation_fraction: 1.0,
@@ -10347,7 +10923,7 @@ mod tests {
         });
         let outputs = HashSet::from(["1".to_owned(), "2".to_owned()]);
         let (fraction, state, fallback) =
-            resolve_allocation_fraction(&exchange, "2", &outputs, 2, AllocationMode::Strict)
+            resolve_allocation_fraction(&exchange, "2", &outputs, 1, AllocationMode::Strict)
                 .expect("parse targeted allocation");
         assert_close(fraction, 0.4);
         assert_eq!(state, AllocationFractionState::Present);
@@ -10392,7 +10968,7 @@ mod tests {
             assert_eq!(state, AllocationFractionState::Present);
             assert_eq!(
                 fallback,
-                AllocationFallbackState::LegacySingleOutputTargetInferred
+                AllocationFallbackState::LegacySingleReferenceTargetInferred
             );
 
             assert!(
@@ -10420,7 +10996,7 @@ mod tests {
             }
         });
         let (fraction, state, fallback) =
-            resolve_allocation_fraction(&sparse, "1", &outputs, 2, AllocationMode::Lenient)
+            resolve_allocation_fraction(&sparse, "1", &outputs, 1, AllocationMode::Lenient)
                 .expect("closed sparse vector");
         assert_close(fraction, 0.0);
         assert_eq!(state, AllocationFractionState::SparseZero);
@@ -10435,7 +11011,7 @@ mod tests {
             }
         });
         assert!(
-            resolve_allocation_fraction(&invalid, "1", &outputs, 2, AllocationMode::Lenient)
+            resolve_allocation_fraction(&invalid, "1", &outputs, 1, AllocationMode::Lenient)
                 .is_err()
         );
     }
@@ -10466,21 +11042,23 @@ mod tests {
             }),
         ];
         let exchange_refs = exchanges.iter().collect::<Vec<_>>();
-        let (scale, stats) = resolve_reference_normalization(
+        let (pivot, stats) = resolve_reference_normalization(
             process_id,
             &process_json,
             exchange_refs.as_slice(),
             NormalizationMode::Strict,
         )
         .expect("normalize");
-        assert_close(scale, 4.0);
+        assert_close(pivot.scale, 4.0);
+        assert_close(pivot.raw_coefficient, 0.25);
+        assert_close(pivot.coefficient, 1.0);
         assert_eq!(stats.normalized_processes, 1);
         assert_eq!(stats.missing_reference, 0);
         assert_eq!(stats.invalid_reference, 0);
     }
 
     #[test]
-    fn quantitative_reference_rejects_duplicate_input_and_nonpositive_exchange() {
+    fn quantitative_reference_rejects_duplicates_and_zero_but_accepts_all_signed_forms() {
         let process_id = Uuid::new_v4();
         let process_json = json!({
             "processDataSet": {
@@ -10512,38 +11090,87 @@ mod tests {
             .is_err()
         );
 
-        for exchange in [
-            json!({
-                "@dataSetInternalID": "1",
-                "exchangeDirection": "Input",
-                "resultingAmount": "1"
-            }),
-            json!({
-                "@dataSetInternalID": "1",
-                "exchangeDirection": "Output",
-                "resultingAmount": "-1"
-            }),
-            json!({
-                "@dataSetInternalID": "1",
-                "exchangeDirection": "Output",
-                "resultingAmount": "0"
-            }),
+        for (direction, amount, expected_coefficient) in [
+            ("Input", "1", -1.0),
+            ("Output", "1", 1.0),
+            ("Input", "-1", 1.0),
+            ("Output", "-1", -1.0),
         ] {
+            let exchange = json!({
+                "@dataSetInternalID": "1",
+                "exchangeDirection": direction,
+                "resultingAmount": amount
+            });
             let refs = [&exchange];
-            assert!(
-                resolve_reference_normalization(
-                    process_id,
-                    &process_json,
-                    &refs,
-                    NormalizationMode::Lenient,
-                )
-                .is_err()
-            );
+            let (pivot, _) = resolve_reference_normalization(
+                process_id,
+                &process_json,
+                &refs,
+                NormalizationMode::Lenient,
+            )
+            .expect("valid signed quantitative reference");
+            assert_close(pivot.coefficient, expected_coefficient);
         }
+
+        let zero = json!({
+            "@dataSetInternalID": "1",
+            "exchangeDirection": "Output",
+            "resultingAmount": "0"
+        });
+        assert!(
+            resolve_reference_normalization(
+                process_id,
+                &process_json,
+                &[&zero],
+                NormalizationMode::Lenient,
+            )
+            .is_err()
+        );
     }
 
     #[test]
-    fn quantitative_reference_must_point_to_product_flow() {
+    fn quantitative_reference_reports_unsupported_multiple_reference_flows() {
+        let process_id = Uuid::new_v4();
+        let process_json = json!({
+            "processDataSet": {
+                "processInformation": {
+                    "quantitativeReference": {
+                        "referenceToReferenceFlow": ["1", "2"]
+                    }
+                }
+            }
+        });
+        let exchanges = [
+            json!({
+                "@dataSetInternalID": "1",
+                "exchangeDirection": "Output",
+                "resultingAmount": "1"
+            }),
+            json!({
+                "@dataSetInternalID": "2",
+                "exchangeDirection": "Input",
+                "resultingAmount": "1"
+            }),
+        ];
+        let exchange_refs = exchanges.iter().collect::<Vec<_>>();
+
+        let error = resolve_reference_normalization(
+            process_id,
+            &process_json,
+            &exchange_refs,
+            NormalizationMode::Strict,
+        )
+        .expect_err("multiple quantitative references must be explicit and unsupported");
+
+        assert!(
+            error
+                .to_string()
+                .contains("multiple quantitative reference flows are not supported")
+        );
+    }
+
+    #[test]
+    fn quantitative_reference_accepts_any_known_flow_space() {
         let flow_id = Uuid::new_v4();
         let process = test_process_meta(0, None, None);
         let exchange = ParsedExchange {
@@ -10555,6 +11182,8 @@ mod tests {
             exchange_id: "reference".to_owned(),
             flow_version: "01.00.000".to_owned(),
             is_reference_exchange: true,
+            raw_amount: Some(1.0),
+            signed_raw_coefficient: Some(1.0),
             amount: Some(1.0),
             allocation_state: AllocationFractionState::Missing,
             allocation_fraction: 1.0,
@@ -10562,22 +11191,20 @@ mod tests {
             location: None,
         };
 
-        validate_reference_product_exchanges(
-            std::slice::from_ref(&exchange),
-            std::slice::from_ref(&process),
-            &HashMap::from([(flow_id, CompiledFlowKind::Product)]),
-        )
-        .expect("product reference");
-        assert!(
-            validate_reference_product_exchanges(
+        for space in [
+            CompiledFlowSpace::Technosphere,
+            CompiledFlowSpace::Biosphere,
+            CompiledFlowSpace::Reporting,
+        ] {
+            validate_quantitative_references(
                 std::slice::from_ref(&exchange),
                 std::slice::from_ref(&process),
-                &HashMap::from([(flow_id, CompiledFlowKind::Elementary)]),
+                &HashMap::from([(flow_id, space)]),
             )
-            .is_err()
-        );
+            .expect("known flow space reference");
+        }
         assert!(
-            validate_reference_product_exchanges(
+            validate_quantitative_references(
                 std::slice::from_ref(&exchange),
                 std::slice::from_ref(&process),
                 &HashMap::new(),
@@ -10698,6 +11325,9 @@ mod tests {
                 exchange_id: id.to_owned(),
                 flow_version: "01.00.000".to_owned(),
                 is_reference_exchange: false,
+                raw_amount: amount,
+                signed_raw_coefficient: amount
+                    .map(|amount| direction.signed_flow_direction().sign() * amount),
                 amount,
                 allocation_state: if amount == Some(0.0) {
                     AllocationFractionState::SparseZero
@@ -11032,13 +11662,13 @@ mod tests {
             1
         );
         assert_eq!(
-            allocation_stats.legacy_single_output_target_inferred_count,
+            allocation_stats.legacy_single_reference_target_inferred_count,
             1
         );
     }
 
     #[test]
-    fn parse_process_chunk_does_not_infer_when_another_output_lacks_an_id() {
+    fn parse_process_chunk_infers_unique_reference_even_when_another_output_lacks_an_id() {
         let reference_flow = Uuid::new_v4();
         let coproduct_flow = Uuid::new_v4();
         let input_flow = Uuid::new_v4();
@@ -11084,14 +11714,18 @@ mod tests {
             }),
         };
 
-        let error = super::parse_process_chunk(
+        let (_, exchanges, _, _, allocation_stats) = super::parse_process_chunk(
             &process,
             0,
             NormalizationMode::Strict,
             AllocationMode::Strict,
         )
-        .expect_err("targetless allocation must stay ambiguous");
-        assert!(format!("{error:#}").contains("exactly one Output"));
+        .expect("unique reference target is unambiguous");
+        assert_close(exchanges[2].allocation_fraction, 1.0);
+        assert_eq!(
+            allocation_stats.legacy_single_reference_target_inferred_count,
+            1
+        );
     }
 
     #[test]
@@ -11429,6 +12063,8 @@ mod tests {
                 exchange_id: format!("{process_id}:01.01.000:{internal_id}"),
                 flow_version: flow_version.to_owned(),
                 is_reference_exchange: is_reference,
+                raw_amount: Some(1.0),
+                signed_raw_coefficient: Some(1.0),
                 amount: Some(1.0),
                 allocation_state: AllocationFractionState::Present,
                 allocation_fraction: 1.0,
@@ -11469,12 +12105,14 @@ mod tests {
             (explicitly_versioned_flow_id, CompiledFlowKind::Elementary),
         ]);
         let technosphere_edges = vec![CompiledReleaseTechnosphereEdge {
-            consumer_process_idx: 0,
-            consumer_input_exchange_internal_id: "3".to_owned(),
-            provider_process_idx: 1,
-            provider_output_exchange_internal_id: "0".to_owned(),
-            provider_weight: 1.0,
-            normalized_amount: 1.0,
+            dependent_process_idx: 0,
+            residual_exchange_internal_id: "3".to_owned(),
+            balancing_process_idx: 1,
+            balancing_reference_exchange_internal_id: "0".to_owned(),
+            residual_coefficient: -1.0,
+            reference_coefficient: 1.0,
+            routing_weight: 1.0,
+            activity_requirement: 1.0,
             flow_id: product_flow_id,
             flow_version: "unknown".to_owned(),
             location: None,

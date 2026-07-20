@@ -31,56 +31,61 @@ related:
   - docs/matrix-readiness-report-contract.md
 ---
 
-# Provider Linking Runtime Contract
+# Signed-Flow Linking Runtime Contract
 
-本文档记录 calculator 当前 provider-link 的运行时决策逻辑。
+本文档记录 calculator 当前 signed-flow balance/link 的运行时决策逻辑。`provider`、`consumer`、`input demand` 仍作为兼容显示词汇保留，但不再定义矩阵链接的资格。
 
 边界：
 
-- 本文档说明 runtime 怎么选 provider、怎么分配 input demand、怎么写入 `A`。
+- 本文档说明 runtime 如何把 exchange 编译为有符号系数、选择相反符号的 reference port、应用 routing weight 并写入 `A`。
 - `docs/implicit-regional-supply-mix-modeling.md` 和英文版说明这个方法的建模依据：regional supply mix、exchange-location supply-region anchor、annual-volume share。
 - 两者必须一起维护：运行时顺序改变时，本文件和 implicit regional supply mix 文档都要同步。
 
 ## 运行阶段
 
-Provider link 发生在 snapshot build 阶段，不发生在 solve 阶段。
+Signed-flow link 发生在 snapshot build 阶段，不发生在 solve 阶段。
 
 主链路：
 
 ```text
 process JSON
   -> parsed exchanges
-  -> provider output candidates
-  -> input exchange provider decisions
-  -> technosphere edges
-  -> A[provider, consumer]
+  -> signed coefficients
+  -> quantitative-reference pivots
+  -> opposite-sign reference-port candidates
+  -> routing decisions
+  -> balance contributions
+  -> A[balancing process, dependent process]
   -> M = I - A
 ```
 
 Provider-link 的结果直接决定：
 
-- 哪些 product input exchange 能写入 `A`；
-- multi-provider input demand 如何拆分到多个 provider；
-- provider closure / A-write 覆盖率；
-- matrix-readiness 和结果解释中的 provider evidence。
+- 哪些 technosphere residual coefficient 能被 reference port 闭合并写入 `A`；
+- multi-candidate balance 如何按 routing weight 拆分；
+- signed-flow closure / A-write 覆盖率；
+- matrix-readiness 和结果解释中的 reference port、balance、unresolved evidence。
 
 ## Process、quantitative reference 与矩阵列
 
-一个完整 TIDAS Process 只代表其 `quantitativeReference.referenceToReferenceFlow`：
+一个完整 TIDAS Process revision 在 snapshot 中只对应一个 process index 和一个矩阵列。它的 `quantitativeReference.referenceToReferenceFlow` 只做两件事：选择 reference exchange，并为该列定义 normalization pivot。它不通过 Product/Waste type 或 Input/Output 方向预先声明“供给”或“需求”。
 
-- 一个 Process revision 在 snapshot 中只对应一个 process index 和一个矩阵列；
-- 只有 quantitative reference output 能声明该 Process 可供应对应 product flow；
-- 同一 Process 中的非 reference co-product output 只保留为数据集内容和 rejected candidate evidence，不生成额外矩阵列，也不成为 provider；
-- 如果 co-product `B` 需要作为 root 或 provider 参与计算，上游必须提供另一个完整、独立、以 `B` 为 quantitative reference 的 TIDAS Process。worker 不从原 Process 临时派生不完整 Process。
+- reference exchange 可以是 `Input` 或 `Output`，flow source type 可以是 Product、Waste、Elementary 或 Other；reference 有效性的核心条件是 internal ID 唯一命中，以及最终 calculation amount finite 且非零；
+- 当前只支持一个 quantitative reference flow。数组包含多个 reference flow 时明确 fail closed，不能任取第一个；
+- normalized reference coefficient 保留符号并归一为 `+1` 或 `-1`；
+- 同一 Process 中的非-reference exchange 不生成额外矩阵列。若它需要独立成为另一个 activity pivot，上游仍须发布另一个完整 Process revision。
 
 因此，同一个联合生产来源可以由上游发布多个完整 Process，但矩阵身份始终来自这些实际 Process revisions，而不是由 snapshot builder 展开 co-products。
 
 ## TIDAS exchange allocation
 
-Exchange allocation 在 provider matching 之前应用，用于得到当前 Process quantitative reference 对应的 exchange amount：
+Exchange allocation 在 balance matching 之前应用，用于得到当前 Process quantitative reference 对应的 attributed exchange amount：
 
 ```text
-normalized exchange amount = calculation amount * reference_scale * selected allocation fraction
+raw coefficient = direction_sign * calculation amount
+reference scale = 1 / abs(raw reference coefficient)
+normalized residual coefficient = raw coefficient * reference scale * selected allocation fraction
+normalized reference coefficient = sign(raw reference coefficient)
 ```
 
 运行时规则如下：
@@ -91,53 +96,74 @@ normalized exchange amount = calculation amount * reference_scale * selected all
 - allocation vector 的非零项闭合为 `100%`、但没有当前 reference target 时，按稀疏零处理，selected fraction 为 `0`；
 - exchange 完全未声明 `allocations` 时，selected fraction 为 `1`；
 - 仅 legacy scalar `allocations.allocation = {}` 视为“未声明 allocation”，selected fraction 为 `1`；这个例外不适用于空数组、`[{}]`、缺少 `allocation` 字段或带其他字段但缺少 target/fraction 的 object；
-- 单个 targetless allocation entry 只有在 Process 的物理 `Output` exchange 恰好为 `1`、该 Output 具有唯一有效 internal ID 且该 ID 等于 quantitative reference 时才可推断为当前 reference；其 fraction 必须是 canonical full `100`，或 legacy string 精确为 `"100%"`，推断后的 selected fraction 为 `1`；
-- 除上述两个有界 legacy 例外外，空数组、坏结构、缺失 target/fraction、多 entry targetless、multiple-output targetless、重复或未知 target、非有限/越界 fraction、非 full targetless fraction、总和不闭合都 fail closed，不能在 lenient 路径回退为 `1`。
+- 单个 targetless allocation entry 只有在 Process 恰好有一个 reference exchange、该 exchange 具有唯一有效 internal ID 且等于 quantitative reference 时才可推断；不再要求它是物理 `Output`。fraction 必须是 canonical full `100`，或 legacy string 精确为 `"100%"`；
+- 除上述两个有界 legacy 例外外，空数组、坏结构、缺失 target/fraction、多 entry targetless、重复或未知 target、非有限/越界 fraction、非 full targetless fraction、总和不闭合都 fail closed。
 
-selected fraction 为显式零或稀疏零的 Input 不进入 request-root provider closure，不计入 provider matching / missing-provider diagnostics，也不写入 `A`；零 attributed elementary exchange 同样不写入 `B`，也不参与 LCIA direction / factor-coverage evidence。否则会把不属于当前 quantitative reference 的零负担分支误判成供应链或 LCIA 缺口。
+Reference pivot 本身不乘 allocation fraction；allocation 只作用于 non-reference residual coefficient。selected fraction 为显式零或稀疏零的 residual 不进入 request-root closure，不计入 matching diagnostics，也不写入 `A` 或 `B`。
 
 Exchange allocation 与下文的 multi-provider share 是两个独立阶段：前者决定 consumer column 的 attributed amount，后者只决定该 amount 在 eligible provider rows 之间的分布。
 
-## Provider 候选与 eligibility
+## Flow space 与候选 eligibility
 
-候选集合按 product/reference `flow_id` 建立：
+Flow 的 ILCD/TIDAS source type 先映射到计算空间：
 
-- 遍历 process exchanges；
-- `Output` exchange 进入同 `flow_id` 的 provider candidate set；
-- candidate 保留 output internal id、reference-output 状态、normalized amount、allocation state 等诊断信息。
+- Product 和 Waste -> `technosphere`，参与 reference-port linking；
+- Elementary -> `biosphere`，直接写入 `B`，不参与 technosphere closure；
+- Other -> `reporting`，保留证据但不进入 `A/B`。
 
-只有 reference output 是 eligible provider：
+Technosphere 候选集合按 exact flow identity 建立。当前 snapshot selection 已固定 flow revision，in-memory 索引可以使用该固定 revision 的 UUID；持久证据仍保留 flow UUID/version/reference unit，禁止跨 revision 或不兼容单位链接。
+
+对同一 flow identity：
 
 ```text
-Output.@dataSetInternalID == process.quantitativeReference.referenceToReferenceFlow
+eligible(reference, residual)
+  = reference.is_quantitative_reference
+  && reference.process != residual.process
+  && sign(reference.coefficient) == -sign(residual.coefficient)
 ```
 
-同 `flow_id` 的非 reference output 不参与自动 provider linking。它只作为 rejected candidate diagnostics 暴露，failure reason 可表现为 `rejected_non_reference_only`。
+因此 Waste Input、Waste Output、Product Input、Product Output 都可能成为 reference port；能否平衡某个 residual 只由 normalized coefficient 的相反符号决定。自链接明确排除。同 flow 的 non-reference exchange 和同符号 reference port 只保留为 rejected candidate evidence。
 
-## Input edge 决策
+## Signed balance 与 A 写入
 
-对每条有 amount 的 `Input` exchange：
-
-1. 计入 `input_edges_total`。
-2. 查找同 `flow_id` 的 eligible providers。
-3. 根据 provider 数量分支：
+对每条非零 technosphere non-reference exchange，设其 normalized residual coefficient 为 `c_r`。候选 reference port `i` 的 coefficient 为 `c_i ∈ {-1,+1}`，routing weight 为 `w_i >= 0` 且 `sum(w_i)=1`：
 
 ```text
-0 providers
-  -> NoProvider
+activity_requirement_i = (-c_r / c_i) * w_i
+A[balancing_process_i, dependent_process] += activity_requirement_i
+closure = c_r + sum(c_i * activity_requirement_i) = 0
+```
+
+相反符号保证 activity requirement 非负。routing 只分配已确定的 balance magnitude，不改变 exchange 的符号或 reference pivot。
+
+候选数量分支：
+
+```text
+0 opposite-sign reference ports
+  -> NoOppositeSignReference
   -> 不写 A
 
-1 provider
-  -> UniqueProvider
-  -> A[provider, consumer] += amount
+1 reference port
+  -> UniqueProvider compatibility decision
+  -> weight = 1
 
->1 providers
+>1 reference ports
   -> resolve_multi_provider(provider_rule)
-  -> resolved: 按 allocation share 写 A
+  -> resolved: 按 routing weight 求 activity requirement 并写 A
   -> unresolved: 不写 A
 ```
 
-单 provider case 不进入 multi-provider rule，直接以 weight `1.0` 写入 `A`。
+`Waste Input +1000` 的 raw reference coefficient 是 `-1000`，归一后为 `-1`；`Waste Output -1000` 也是 `-1000`，归一后同样为 `-1`。二者作为 reference port 对相同 residual 产生相同数学结果。相反，`Waste Output +1000` 的 pivot 为 `+1`，只能平衡负 residual。
+
+## Technosphere boundary policy
+
+`snapshot_builder --technosphere-boundary-policy` 必须显式落入 snapshot config、source/review fingerprint 和 calculation-bundle evidence：
+
+- `closed`（默认）：任一非零 residual 无法闭合即阻断 readiness；
+- `open`：允许 unresolved balance 留在系统边界外，readiness 输出 warning 和逐边证据；
+- `cutoff`：允许按明确 cutoff 边界省略该 balance，同样必须保留 warning 和逐边证据。
+
+未知策略 fail closed。`open/cutoff` 不是“没有找到 provider 时静默跳过”的别名。
 
 ## 当前默认 rule
 
@@ -150,12 +176,12 @@ provider_rule = split_by_process_volume
 该规则的 multi-provider 决策顺序是：
 
 ```text
-eligible same-flow reference-output providers
+eligible same-flow opposite-sign reference ports
   -> same-model provider subset, if available
   -> supply-region anchor
   -> best non-empty geography tier
   -> annual-volume provider shares within selected tier
-  -> A[provider_i, consumer] += input_amount * share_i
+  -> activity_requirement_i = balance_magnitude * share_i
 ```
 
 ### 1. 同 model_id 优先
@@ -209,10 +235,10 @@ share_i = raw_weight_i / sum(raw_weight)
 写入矩阵：
 
 ```text
-A[provider_i, consumer] += input_amount * share_i
+A[balancing_process_i, dependent_process] += activity_requirement_i
 ```
 
-同一 input demand 的 provider shares 总和必须为 `1`，因此 provider 分配只改变 provider row distribution，不改变 consumer column 的总 input demand。
+同一 residual 的 routing weights 总和必须为 `1`，因此 routing 只改变 balancing process row distribution，不改变待闭合 coefficient 的总量。
 
 ## 其他 provider rules
 
@@ -230,20 +256,22 @@ A[provider_i, consumer] += input_amount * share_i
 
 ## Diagnostics
 
-Provider decisions 至少应支持解释：
+Compiled graph 和 readiness 至少应支持解释：
 
 - `decision_kind`: unique, multi resolved, multi unresolved, no provider；
 - `resolution_strategy`: unique, split by process volume, evidence, equal fallback 等；
-- same-flow candidates 及 reference-output eligibility；
+- reference port 的 process/exchange identity、raw direction/amount、raw coefficient 与 normalized coefficient；
+- residual exchange identity、residual coefficient、required reference sign；
+- same-flow candidates 及 opposite-sign eligibility；
 - candidate provider count 与 matched provider count；
 - supply-region source 与 selected geography tier；
 - annual volume fallback-to-one count；
 - `legacy_empty_allocation_as_undeclared_count`：按 legacy scalar `{}` 兼容为未声明 allocation 的 exchange 数；
-- `legacy_single_output_target_inferred_count`：在唯一物理 Output 的有效 internal ID 等于 quantitative reference 时推断 full targetless allocation 的 exchange 数；
-- final provider allocations；
-- no-provider 或 unresolved failure reason；
-- `a_input_edges_written` 与 provider-present resolved coverage。
+- `legacy_single_reference_target_inferred_count`：在唯一 reference exchange 的有效 internal ID 等于 quantitative reference 时推断 full targetless allocation 的 exchange 数；旧 `legacy_single_output_target_inferred_count` 仅作为兼容投影保留；
+- routing weights、activity requirements 与 closure residual；
+- unresolved balance 与 failure reason；
+- `residual_edges_total` 与 `a_balance_edges_written`。旧 `input_edges_total` / `a_input_edges_written` 仅作为兼容计数保留。
 
 Matrix-readiness、diagnostics export 和人工 debug 应消费这些 provider decisions，而不是在外部重写 provider resolution。
 
-Snapshot build config 记录 `allocation_semantics_version = tidas-quantitative-reference-v2`。该字段进入 source fingerprint，因此 v2 compatibility semantics 不会复用 v1 或更早语义构建的 snapshot。Coverage schema 保持 `snapshot_coverage.v2`，但 `allocation` summary 增加上述两个 default-zero 兼容计数；旧 artifact 缺少这些字段时按 `0` 读取。
+Snapshot build config 记录 `allocation_semantics_version = tidas-reference-allocation-v3`、`link_semantics_version = signed-flow-balance-v1`、`technosphere_boundary_policy` 和 `flow_identity_policy = exact-flow-version-reference-unit-v1`。这些字段进入 source/review fingerprint，旧语义 snapshot 不会被复用。Coverage schema 为 `snapshot_coverage.v3`；readiness input/report 为 v2。Calculation bundle 为 `tiangong.calculation-bundle.v2`，technosphere release edge 使用 residual/balancing/reference/activity 的中性字段。

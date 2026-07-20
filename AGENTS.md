@@ -40,9 +40,9 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-07-17
-lastReviewedCommit: 6d61068445ebfad0fb3e07469f6d0468d692574a
-lastReviewedNote: "Reviewed frozen TIDAS source closure evidence and Calculation Bundle export ownership for Issue #127."
+lastReviewedAt: 2026-07-20
+lastReviewedCommit: 4001a5f367ba1eb3a2405e71042d1fe0987acf88
+lastReviewedNote: "Reviewed worker ownership, validation, and governance boundaries for the signed-flow linking redesign in Issue #131; boundaries are unchanged."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md

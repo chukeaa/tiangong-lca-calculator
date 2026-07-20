@@ -888,23 +888,16 @@ fn build_review_process_record(
 ) -> ReviewProcessRecord {
     let exchange_items = process_exchange_items(&revision.json_ordered);
     let reference_exchange_id = reference_exchange_id(&revision.json_ordered);
-    let output_exchange_count = exchange_items
+    let valid_exchange_internal_ids = exchange_items
         .iter()
-        .filter(|exchange| {
-            value_at_path(exchange, &["exchangeDirection"])
-                .and_then(value_to_trimmed_string)
-                .is_some_and(|direction| direction.eq_ignore_ascii_case("output"))
-        })
-        .count();
-    let valid_output_internal_ids = exchange_items
-        .iter()
-        .filter(|exchange| {
-            value_at_path(exchange, &["exchangeDirection"])
-                .and_then(value_to_trimmed_string)
-                .is_some_and(|direction| direction.eq_ignore_ascii_case("output"))
-        })
         .filter_map(|exchange| exchange_id(exchange))
         .collect::<HashSet<_>>();
+    let reference_exchange_count = reference_exchange_id.as_deref().map_or(0, |reference| {
+        exchange_items
+            .iter()
+            .filter(|exchange| exchange_id(exchange).as_deref() == Some(reference))
+            .count()
+    });
     ReviewProcessRecord {
         process_idx,
         process_id: revision.process_id,
@@ -918,8 +911,8 @@ fn build_review_process_record(
                 review_exchange_record(
                     exchange,
                     reference_exchange_id.as_deref(),
-                    &valid_output_internal_ids,
-                    output_exchange_count,
+                    &valid_exchange_internal_ids,
+                    reference_exchange_count,
                 )
             })
             .collect(),
@@ -955,8 +948,8 @@ fn process_exchange_items(process_json: &Value) -> Vec<&Value> {
 fn review_exchange_record(
     exchange_json: &Value,
     reference_exchange_id: Option<&str>,
-    valid_output_internal_ids: &HashSet<String>,
-    output_exchange_count: usize,
+    valid_exchange_internal_ids: &HashSet<String>,
+    reference_exchange_count: usize,
 ) -> Option<ReviewExchangeRecord> {
     Some(ReviewExchangeRecord {
         exchange_id: exchange_id(exchange_json),
@@ -968,8 +961,8 @@ fn review_exchange_record(
         allocation_fraction: allocation_fraction(
             exchange_json,
             reference_exchange_id,
-            valid_output_internal_ids,
-            output_exchange_count,
+            valid_exchange_internal_ids,
+            reference_exchange_count,
         ),
     })
 }
@@ -993,8 +986,8 @@ fn exchange_amount(exchange_json: &Value) -> Option<String> {
 fn allocation_fraction(
     exchange_json: &Value,
     reference_exchange_id: Option<&str>,
-    valid_output_internal_ids: &HashSet<String>,
-    output_exchange_count: usize,
+    valid_exchange_internal_ids: &HashSet<String>,
+    reference_exchange_count: usize,
 ) -> Option<String> {
     exchange_json.get("allocations")?;
     let Some(reference_exchange_id) = reference_exchange_id else {
@@ -1003,8 +996,8 @@ fn allocation_fraction(
     match crate::tidas_process_semantics::resolve_tidas_exchange_allocation(
         exchange_json,
         reference_exchange_id,
-        valid_output_internal_ids,
-        output_exchange_count,
+        valid_exchange_internal_ids,
+        reference_exchange_count,
     ) {
         Ok(
             crate::tidas_process_semantics::TidasAllocationResolution::Undeclared
@@ -1228,7 +1221,7 @@ mod tests {
     }
 
     #[test]
-    fn build_review_process_record_rejects_ambiguous_targetless_allocation() {
+    fn build_review_process_record_infers_targetless_allocation_from_unique_reference() {
         let reference_flow = Uuid::new_v4();
         let coproduct_flow = Uuid::new_v4();
         let input_flow = Uuid::new_v4();
@@ -1273,9 +1266,8 @@ mod tests {
         let allocation = record.exchanges[2]
             .allocation_fraction
             .as_deref()
-            .expect("invalid allocation projection");
-        assert!(allocation.starts_with("invalid:"));
-        assert!(allocation.contains("exactly one Output"));
+            .expect("inferred allocation projection");
+        assert_eq!(allocation, "100");
     }
 
     #[test]

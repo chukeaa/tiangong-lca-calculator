@@ -835,8 +835,9 @@ fn reference_is_valid(
         return false;
     };
     if matching_exchanges.next().is_some()
-        || normalized_direction(&exchange.direction).as_deref() != Some("output")
-        || !parse_numeric_text(exchange.amount.as_deref()).is_ok_and(|amount| amount > epsilon)
+        || normalized_direction(&exchange.direction).is_none()
+        || !parse_numeric_text(exchange.amount.as_deref())
+            .is_ok_and(|amount| amount.abs() > epsilon)
     {
         return false;
     }
@@ -845,7 +846,7 @@ fn reference_is_valid(
         graph
             .flows
             .iter()
-            .any(|flow| flow.flow_id == exchange.flow_id && flow.kind == CompiledFlowKind::Product)
+            .any(|flow| flow.flow_id == exchange.flow_id)
     })
 }
 
@@ -1238,18 +1239,17 @@ mod tests {
     }
 
     #[test]
-    fn blocks_quantitative_reference_that_is_not_an_output() {
+    fn accepts_input_quantitative_reference() {
         let mut input = clean_input();
         input.process_records[1].exchanges[0].direction = "Input".to_owned();
 
         let report = verify_review_submit_gate(&input);
 
-        assert!(has_blocker(&report, "missing_or_zero_reference"));
-        assert!(!report.metrics.probe.factorization_checked);
+        assert!(!has_blocker(&report, "missing_or_zero_reference"));
     }
 
     #[test]
-    fn blocks_quantitative_reference_to_non_product_flow() {
+    fn accepts_quantitative_reference_to_non_product_flow() {
         let mut input = clean_input();
         let elementary_flow_id = input
             .compiled_graph
@@ -1266,14 +1266,23 @@ mod tests {
 
         let report = verify_review_submit_gate(&input);
 
-        assert!(has_blocker(&report, "missing_or_zero_reference"));
-        assert!(!report.metrics.probe.factorization_checked);
+        assert!(!has_blocker(&report, "missing_or_zero_reference"));
     }
 
     #[test]
-    fn blocks_non_positive_quantitative_reference_amount() {
+    fn accepts_negative_quantitative_reference_amount() {
         let mut input = clean_input();
         input.process_records[1].exchanges[0].amount = Some("-1.0".to_owned());
+
+        let report = verify_review_submit_gate(&input);
+
+        assert!(!has_blocker(&report, "missing_or_zero_reference"));
+    }
+
+    #[test]
+    fn blocks_zero_quantitative_reference_amount() {
+        let mut input = clean_input();
+        input.process_records[1].exchanges[0].amount = Some("0".to_owned());
 
         let report = verify_review_submit_gate(&input);
 
@@ -1533,13 +1542,20 @@ mod tests {
                         flow_idx: 0,
                         flow_id: product_flow_id,
                         kind: CompiledFlowKind::Product,
+                        space: crate::compiled_graph::CompiledFlowSpace::Technosphere,
+                        source_type: crate::compiled_graph::CompiledSourceFlowType::Product,
                     },
                     CompiledFlow {
                         flow_idx: 1,
                         flow_id: elementary_flow_id,
                         kind: CompiledFlowKind::Elementary,
+                        space: crate::compiled_graph::CompiledFlowSpace::Biosphere,
+                        source_type: crate::compiled_graph::CompiledSourceFlowType::Elementary,
                     },
                 ],
+                reference_ports: Vec::new(),
+                balance_resolutions: Vec::new(),
+                unresolved_balances: Vec::new(),
                 provider_outputs: Vec::new(),
                 provider_decisions: vec![CompiledProviderDecision {
                     consumer_idx: 1,
@@ -1621,6 +1637,8 @@ mod tests {
                 matched_multi_unresolved: 0,
                 matched_multi_fallback_equal: 0,
                 a_input_edges_written: i64::from(provider_closed),
+                residual_edges_total: 1,
+                a_balance_edges_written: i64::from(provider_closed),
                 a_write_pct: if provider_closed { 100.0 } else { 0.0 },
                 provider_present_resolved_pct: if provider_closed { 100.0 } else { 0.0 },
                 unique_provider_match_pct: if provider_closed { 100.0 } else { 0.0 },
@@ -1645,6 +1663,7 @@ mod tests {
                 allocation_fraction_invalid_count: 0,
                 legacy_empty_allocation_as_undeclared_count: 0,
                 legacy_single_output_target_inferred_count: 0,
+                legacy_single_reference_target_inferred_count: 0,
             },
             singular_risk: SnapshotSingularRisk {
                 risk_level: "low".to_owned(),

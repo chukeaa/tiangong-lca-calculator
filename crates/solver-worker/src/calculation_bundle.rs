@@ -30,12 +30,38 @@ use crate::{
     storage::ObjectStoreClient,
 };
 
-pub const CALCULATION_BUNDLE_FORMAT: &str = "tiangong.calculation-bundle.v1";
+pub const CALCULATION_BUNDLE_FORMAT: &str = "tiangong.calculation-bundle.v2";
 pub const CALCULATION_BUNDLE_MANIFEST_CONTENT_TYPE: &str = "application/json";
 pub const CALCULATION_BUNDLE_CHUNK_PROCESS_COUNT: usize = 256;
 const CALCULATION_BUNDLE_GZIP_CONTENT_TYPE: &str = "application/gzip";
 const CALCULATION_CONTRACT_VERSION: &str = "1.0.0";
 const GZIP_LEVEL: u32 = 6;
+
+fn calculation_solver_contract(config: &SnapshotBuildConfig) -> Value {
+    json!({
+        "engineVersion": env!("CARGO_PKG_VERSION"),
+        "numericalPolicy": {
+            "equation": "M=I-A; Mx=y",
+            "backend": "umfpack",
+            "unitDemandAmount": 1,
+        },
+        "providerPolicy": { "rule": config.provider_rule },
+        "allocationPolicy": {
+            "semanticsVersion": config.allocation_semantics_version,
+            "mode": config.allocation_fraction_mode,
+        },
+        "linkPolicy": {
+            "semanticsVersion": config.link_semantics_version,
+            "candidateEligibility": config.provider_candidate_eligibility_mode,
+            "technosphereBoundary": config.technosphere_boundary_policy,
+            "flowIdentity": config.flow_identity_policy,
+        },
+        "zeroPolicy": {
+            "directionalLci": "retain_finite_nonzero",
+            "lcia": "retain_finite_including_zero",
+        },
+    })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -273,12 +299,14 @@ struct LciaRecord {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TechnosphereRecord<'a> {
-    consumer_process_index: usize,
-    consumer_input_exchange_internal_id: &'a str,
-    provider_process_index: usize,
-    provider_output_exchange_internal_id: &'a str,
-    provider_weight: f64,
-    normalized_amount: f64,
+    dependent_process_index: usize,
+    residual_exchange_internal_id: &'a str,
+    balancing_process_index: usize,
+    balancing_reference_exchange_internal_id: &'a str,
+    residual_coefficient: f64,
+    reference_coefficient: f64,
+    routing_weight: f64,
+    activity_requirement: f64,
     flow: GlobalReference,
     location: Option<&'a str>,
 }
@@ -667,23 +695,7 @@ impl CalculationBundleWriter {
                 flow_count: self.snapshot_flow_count,
                 impact_count,
             },
-            solver: json!({
-                "engineVersion": env!("CARGO_PKG_VERSION"),
-                "numericalPolicy": {
-                    "equation": "M=I-A; Mx=y",
-                    "backend": "umfpack",
-                    "unitDemandAmount": 1,
-                },
-                "providerPolicy": { "rule": self.config.provider_rule },
-                "allocationPolicy": {
-                    "semanticsVersion": self.config.allocation_semantics_version,
-                    "mode": self.config.allocation_fraction_mode,
-                },
-                "zeroPolicy": {
-                    "directionalLci": "retain_finite_nonzero",
-                    "lcia": "retain_finite_including_zero",
-                },
-            }),
+            solver: calculation_solver_contract(&self.config),
             method_set: json!({
                 "schemaVersion": "lcia.static_cache_bundle.v1",
                 "bundleVersion": RELEASE_BUNDLE_VERSION,
@@ -815,48 +827,61 @@ impl CalculationBundleWriter {
                 .technosphere_edges
                 .iter()
                 .filter(|edge| {
-                    usize::try_from(edge.consumer_process_idx)
+                    usize::try_from(edge.dependent_process_idx)
                         .is_ok_and(|index| index >= first_process_index && index < end)
                 })
                 .collect::<Vec<_>>();
             technosphere.sort_by(|left, right| {
-                left.consumer_process_idx
-                    .cmp(&right.consumer_process_idx)
+                left.dependent_process_idx
+                    .cmp(&right.dependent_process_idx)
                     .then_with(|| {
-                        left.consumer_input_exchange_internal_id
-                            .cmp(&right.consumer_input_exchange_internal_id)
+                        left.residual_exchange_internal_id
+                            .cmp(&right.residual_exchange_internal_id)
                     })
-                    .then_with(|| left.provider_process_idx.cmp(&right.provider_process_idx))
+                    .then_with(|| left.balancing_process_idx.cmp(&right.balancing_process_idx))
             });
             for edge in technosphere {
                 validate_version(&edge.flow_version, "technosphere.flow.version")?;
                 require_nonempty(
-                    &edge.consumer_input_exchange_internal_id,
-                    "technosphere.consumerInputExchangeInternalId",
+                    &edge.residual_exchange_internal_id,
+                    "technosphere.residualExchangeInternalId",
                 )?;
                 require_nonempty(
-                    &edge.provider_output_exchange_internal_id,
-                    "technosphere.providerOutputExchangeInternalId",
+                    &edge.balancing_reference_exchange_internal_id,
+                    "technosphere.balancingReferenceExchangeInternalId",
                 )?;
-                ensure_finite(edge.provider_weight, "technosphere.providerWeight")?;
-                ensure_finite(edge.normalized_amount, "technosphere.normalizedAmount")?;
-                let consumer_process_index = usize::try_from(edge.consumer_process_idx)?;
-                let provider_process_index = usize::try_from(edge.provider_process_idx)?;
-                if consumer_process_index >= self.processes.len()
-                    || provider_process_index >= self.processes.len()
+                ensure_finite(
+                    edge.residual_coefficient,
+                    "technosphere.residualCoefficient",
+                )?;
+                ensure_finite(
+                    edge.reference_coefficient,
+                    "technosphere.referenceCoefficient",
+                )?;
+                ensure_finite(edge.routing_weight, "technosphere.routingWeight")?;
+                ensure_finite(
+                    edge.activity_requirement,
+                    "technosphere.activityRequirement",
+                )?;
+                let dependent_process_index = usize::try_from(edge.dependent_process_idx)?;
+                let balancing_process_index = usize::try_from(edge.balancing_process_idx)?;
+                if dependent_process_index >= self.processes.len()
+                    || balancing_process_index >= self.processes.len()
                 {
                     return Err(anyhow::anyhow!(
                         "technosphere edge process index is outside process axis"
                     ));
                 }
                 technosphere_writer.write(&TechnosphereRecord {
-                    consumer_process_index,
-                    consumer_input_exchange_internal_id: &edge.consumer_input_exchange_internal_id,
-                    provider_process_index,
-                    provider_output_exchange_internal_id: &edge
-                        .provider_output_exchange_internal_id,
-                    provider_weight: edge.provider_weight,
-                    normalized_amount: edge.normalized_amount,
+                    dependent_process_index,
+                    residual_exchange_internal_id: &edge.residual_exchange_internal_id,
+                    balancing_process_index,
+                    balancing_reference_exchange_internal_id: &edge
+                        .balancing_reference_exchange_internal_id,
+                    residual_coefficient: edge.residual_coefficient,
+                    reference_coefficient: edge.reference_coefficient,
+                    routing_weight: edge.routing_weight,
+                    activity_requirement: edge.activity_requirement,
                     flow: GlobalReference {
                         id: edge.flow_id,
                         version: edge.flow_version.clone(),
@@ -866,7 +891,7 @@ impl CalculationBundleWriter {
             }
             self.push_finished_ndjson(
                 "technosphere_edges",
-                "tiangong.calculation-bundle.technosphere-edges.v1",
+                "tiangong.calculation-bundle.technosphere-edges.v2",
                 technosphere_path,
                 first_process_index,
                 last_process_index,
@@ -1451,6 +1476,10 @@ mod tests {
                 quantitative_reference_flow_version: "01.00.000".to_owned(),
                 reference_unit: "kg".to_owned(),
                 normalized_mean_amount: 1.0,
+                reference_direction: Some(CompiledExchangeDirection::Output),
+                raw_reference_amount: Some(1.0),
+                signed_raw_reference_coefficient: Some(1.0),
+                normalized_reference_coefficient: Some(1.0),
             }],
             inventory_exchanges: vec![CompiledReleaseInventoryExchange {
                 process_idx: 0,
@@ -1463,14 +1492,17 @@ mod tests {
                 normalized_mean_amount: 0.25,
                 allocation_target_internal_id: "0".to_owned(),
                 allocation_fraction: 1.0,
+                signed_normalized_coefficient: Some(0.25),
             }],
             technosphere_edges: vec![CompiledReleaseTechnosphereEdge {
-                consumer_process_idx: 0,
-                consumer_input_exchange_internal_id: "input-1".to_owned(),
-                provider_process_idx: 0,
-                provider_output_exchange_internal_id: "0".to_owned(),
-                provider_weight: 0.25,
-                normalized_amount: 2.0,
+                dependent_process_idx: 0,
+                residual_exchange_internal_id: "input-1".to_owned(),
+                balancing_process_idx: 0,
+                balancing_reference_exchange_internal_id: "0".to_owned(),
+                residual_coefficient: -2.0,
+                reference_coefficient: 1.0,
+                routing_weight: 0.25,
+                activity_requirement: 0.5,
                 flow_id,
                 flow_version: "01.00.000".to_owned(),
                 location: Some("GLO".to_owned()),
@@ -1486,6 +1518,7 @@ mod tests {
                 normalized_mean_amount: 0.25,
                 allocation_target_internal_id: "0".to_owned(),
                 allocation_fraction: 1.0,
+                signed_normalized_coefficient: Some(0.25),
             }],
             source_datasets: vec![CompiledReleaseSourceDataset {
                 dataset_type: CompiledReleaseSourceDatasetType::Process,
@@ -1547,9 +1580,10 @@ mod tests {
         let mut decoder = GzDecoder::new(File::open(&technosphere.local_path).unwrap());
         let mut body = String::new();
         decoder.read_to_string(&mut body).unwrap();
-        assert!(body.contains("\"consumerInputExchangeInternalId\":\"input-1\""));
-        assert!(body.contains("\"providerOutputExchangeInternalId\":\"0\""));
-        assert!(body.contains("\"providerWeight\":0.25"));
+        assert!(body.contains("\"residualExchangeInternalId\":\"input-1\""));
+        assert!(body.contains("\"balancingReferenceExchangeInternalId\":\"0\""));
+        assert!(body.contains("\"routingWeight\":0.25"));
+        assert!(body.contains("\"activityRequirement\":0.5"));
 
         let inventory = built
             .artifacts

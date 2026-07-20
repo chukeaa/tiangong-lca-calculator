@@ -11,6 +11,25 @@ pub enum CompiledFlowKind {
     Elementary,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompiledFlowSpace {
+    Technosphere,
+    Biosphere,
+    #[default]
+    Reporting,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompiledSourceFlowType {
+    Product,
+    Waste,
+    Elementary,
+    #[default]
+    Other,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum CompiledExchangeDirection {
@@ -67,6 +86,52 @@ pub struct CompiledFlow {
     pub flow_idx: i32,
     pub flow_id: Uuid,
     pub kind: CompiledFlowKind,
+    #[serde(default)]
+    pub space: CompiledFlowSpace,
+    #[serde(default)]
+    pub source_type: CompiledSourceFlowType,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompiledReferencePort {
+    pub process_idx: i32,
+    pub flow_id: Uuid,
+    #[serde(default)]
+    pub flow_version: String,
+    pub reference_exchange_internal_id: String,
+    pub coefficient: f64,
+    pub raw_direction: CompiledExchangeDirection,
+    pub raw_amount: f64,
+    pub signed_raw_coefficient: f64,
+    pub source_flow_type: CompiledSourceFlowType,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompiledBalanceResolution {
+    pub dependent_process_idx: i32,
+    pub residual_exchange_internal_id: String,
+    pub balancing_process_idx: i32,
+    pub balancing_reference_exchange_internal_id: String,
+    pub flow_id: Uuid,
+    #[serde(default)]
+    pub flow_version: String,
+    pub residual_coefficient: f64,
+    pub reference_coefficient: f64,
+    pub routing_weight: f64,
+    pub activity_requirement: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompiledUnresolvedBalance {
+    pub dependent_process_idx: i32,
+    pub residual_exchange_internal_id: String,
+    pub flow_id: Uuid,
+    #[serde(default)]
+    pub flow_version: String,
+    pub residual_coefficient: f64,
+    pub required_reference_sign: f64,
+    pub candidate_count: i32,
+    pub opposite_sign_candidate_count: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +147,8 @@ pub enum CompiledProviderCandidateEligibility {
     Unknown,
     AcceptedReferenceOutput,
     RejectedNonReferenceOutput,
+    AcceptedOppositeSignReference,
+    RejectedSameSignReference,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +183,10 @@ pub struct CompiledProviderCandidate {
     pub reference_year: Option<i32>,
     #[serde(default)]
     pub annual_supply_or_production_volume: Option<f64>,
+    #[serde(default)]
+    pub reference_exchange_internal_id: Option<String>,
+    #[serde(default)]
+    pub reference_coefficient: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +237,7 @@ pub enum CompiledProviderFailureReason {
     Top1BelowTop1MinScore,
     Top1Top2RatioTooClose,
     ScoreSumNonPositive,
+    NoOppositeSignReference,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,6 +301,10 @@ pub struct CompiledProviderOutput {
     pub output_allocation_state: CompiledProviderOutputAllocationState,
     #[serde(default)]
     pub eligibility: CompiledProviderCandidateEligibility,
+    #[serde(default)]
+    pub reference_coefficient: Option<f64>,
+    #[serde(default)]
+    pub reference_direction: Option<CompiledExchangeDirection>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -248,6 +324,8 @@ pub struct CompiledAllocationStats {
     pub legacy_empty_allocation_as_undeclared_count: i64,
     #[serde(default)]
     pub legacy_single_output_target_inferred_count: i64,
+    #[serde(default)]
+    pub legacy_single_reference_target_inferred_count: i64,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -260,12 +338,22 @@ pub struct CompiledMatchingStats {
     pub matched_multi_unresolved: i64,
     pub matched_multi_fallback_equal: i64,
     pub a_input_edges_written: i64,
+    #[serde(default)]
+    pub residual_edges_total: i64,
+    #[serde(default)]
+    pub a_balance_edges_written: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompiledGraph {
     pub processes: Vec<CompiledProcess>,
     pub flows: Vec<CompiledFlow>,
+    #[serde(default)]
+    pub reference_ports: Vec<CompiledReferencePort>,
+    #[serde(default)]
+    pub balance_resolutions: Vec<CompiledBalanceResolution>,
+    #[serde(default)]
+    pub unresolved_balances: Vec<CompiledUnresolvedBalance>,
     #[serde(default)]
     pub provider_outputs: Vec<CompiledProviderOutput>,
     pub provider_decisions: Vec<CompiledProviderDecision>,
@@ -397,6 +485,14 @@ pub struct CompiledReleaseProcess {
     pub quantitative_reference_flow_version: String,
     pub reference_unit: String,
     pub normalized_mean_amount: f64,
+    #[serde(default)]
+    pub reference_direction: Option<CompiledExchangeDirection>,
+    #[serde(default)]
+    pub raw_reference_amount: Option<f64>,
+    #[serde(default)]
+    pub signed_raw_reference_coefficient: Option<f64>,
+    #[serde(default)]
+    pub normalized_reference_coefficient: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -413,16 +509,20 @@ pub struct CompiledReleaseInventoryExchange {
     pub normalized_mean_amount: f64,
     pub allocation_target_internal_id: String,
     pub allocation_fraction: f64,
+    #[serde(default)]
+    pub signed_normalized_coefficient: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompiledReleaseTechnosphereEdge {
-    pub consumer_process_idx: i32,
-    pub consumer_input_exchange_internal_id: String,
-    pub provider_process_idx: i32,
-    pub provider_output_exchange_internal_id: String,
-    pub provider_weight: f64,
-    pub normalized_amount: f64,
+    pub dependent_process_idx: i32,
+    pub residual_exchange_internal_id: String,
+    pub balancing_process_idx: i32,
+    pub balancing_reference_exchange_internal_id: String,
+    pub residual_coefficient: f64,
+    pub reference_coefficient: f64,
+    pub routing_weight: f64,
+    pub activity_requirement: f64,
     pub flow_id: Uuid,
     pub flow_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -465,5 +565,6 @@ mod tests {
 
         assert_eq!(stats.legacy_empty_allocation_as_undeclared_count, 0);
         assert_eq!(stats.legacy_single_output_target_inferred_count, 0);
+        assert_eq!(stats.legacy_single_reference_target_inferred_count, 0);
     }
 }

@@ -26,7 +26,7 @@ pub const SNAPSHOT_ARTIFACT_EXTENSION: &str = "h5";
 /// Snapshot artifact content type.
 pub const SNAPSHOT_ARTIFACT_CONTENT_TYPE: &str = "application/x-hdf5";
 /// Snapshot coverage JSON schema identifier.
-pub const SNAPSHOT_COVERAGE_SCHEMA_VERSION: &str = "snapshot_coverage.v2";
+pub const SNAPSHOT_COVERAGE_SCHEMA_VERSION: &str = "snapshot_coverage.v3";
 
 /// Snapshot build options persisted in artifact metadata.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -67,6 +67,15 @@ pub struct SnapshotBuildConfig {
     /// Versioned TIDAS allocation/reference semantics used by matrix compilation.
     #[serde(default = "default_legacy_allocation_semantics_version")]
     pub allocation_semantics_version: String,
+    /// Versioned signed-flow balance/link semantics used to derive activity requirements.
+    #[serde(default = "default_legacy_link_semantics_version")]
+    pub link_semantics_version: String,
+    /// Explicit policy for unresolved non-zero technosphere balance coefficients.
+    #[serde(default = "default_closed_boundary_policy")]
+    pub technosphere_boundary_policy: String,
+    /// Versioned exact flow identity and unit compatibility policy.
+    #[serde(default = "default_flow_identity_policy")]
+    pub flow_identity_policy: String,
     /// Biosphere sign convention (`signed`/`gross`).
     #[serde(default = "default_biosphere_sign_mode")]
     pub biosphere_sign_mode: String,
@@ -211,6 +220,10 @@ pub struct SnapshotMatchingCoverage {
     #[serde(default)]
     pub a_input_edges_written: i64,
     #[serde(default)]
+    pub residual_edges_total: i64,
+    #[serde(default)]
+    pub a_balance_edges_written: i64,
+    #[serde(default)]
     pub a_write_pct: f64,
     #[serde(default)]
     pub provider_present_resolved_pct: f64,
@@ -250,6 +263,8 @@ pub struct SnapshotAllocationCoverage {
     pub legacy_empty_allocation_as_undeclared_count: i64,
     #[serde(default)]
     pub legacy_single_output_target_inferred_count: i64,
+    #[serde(default)]
+    pub legacy_single_reference_target_inferred_count: i64,
 }
 
 /// Singular risk diagnostics.
@@ -299,6 +314,18 @@ fn default_strict_mode() -> String {
 
 fn default_legacy_allocation_semantics_version() -> String {
     "legacy-unscoped-v0".to_owned()
+}
+
+fn default_legacy_link_semantics_version() -> String {
+    "legacy-directional-link-v0".to_owned()
+}
+
+fn default_closed_boundary_policy() -> String {
+    "closed".to_owned()
+}
+
+fn default_flow_identity_policy() -> String {
+    "exact-flow-version-reference-unit-v1".to_owned()
 }
 
 fn default_biosphere_sign_mode() -> String {
@@ -495,6 +522,9 @@ mod tests {
             reference_normalization_mode: "strict".to_owned(),
             allocation_fraction_mode: "strict".to_owned(),
             allocation_semantics_version: "tidas-quantitative-reference-v2".to_owned(),
+            link_semantics_version: "legacy-directional-link-v0".to_owned(),
+            technosphere_boundary_policy: "closed".to_owned(),
+            flow_identity_policy: "exact-flow-version-reference-unit-v1".to_owned(),
             biosphere_sign_mode: "gross".to_owned(),
             self_loop_cutoff: 0.999_999,
             singular_eps: 1e-12,
@@ -516,6 +546,8 @@ mod tests {
                 matched_multi_unresolved: 1,
                 matched_multi_fallback_equal: 0,
                 a_input_edges_written: 8,
+                residual_edges_total: 10,
+                a_balance_edges_written: 8,
                 a_write_pct: 80.0,
                 provider_present_resolved_pct: 88.888_888_888_888_89,
                 unique_provider_match_pct: 70.0,
@@ -554,6 +586,7 @@ mod tests {
                 allocation_fraction_invalid_count: 0,
                 legacy_empty_allocation_as_undeclared_count: 2,
                 legacy_single_output_target_inferred_count: 1,
+                legacy_single_reference_target_inferred_count: 0,
             },
             singular_risk: SnapshotSingularRisk {
                 risk_level: "low".to_owned(),
@@ -638,7 +671,12 @@ mod tests {
                 flow_idx: 0,
                 flow_id: product_flow_id,
                 kind: CompiledFlowKind::Product,
+                space: crate::compiled_graph::CompiledFlowSpace::Technosphere,
+                source_type: crate::compiled_graph::CompiledSourceFlowType::Product,
             }],
+            reference_ports: Vec::new(),
+            balance_resolutions: Vec::new(),
+            unresolved_balances: Vec::new(),
             provider_outputs: Vec::new(),
             provider_decisions: Vec::new(),
             technosphere_edges: Vec::new(),

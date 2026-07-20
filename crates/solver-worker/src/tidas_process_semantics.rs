@@ -6,8 +6,14 @@ use std::hash::BuildHasher;
 use anyhow::{Context, bail};
 use serde_json::Value;
 
-/// Versioned TIDAS process semantics applied by worker calculations.
-pub const TIDAS_PROCESS_SEMANTICS_VERSION: &str = "tidas-quantitative-reference-v2";
+/// Versioned allocation semantics applied before signed-flow linking.
+pub const TIDAS_ALLOCATION_SEMANTICS_VERSION: &str = "tidas-reference-allocation-v3";
+
+/// Versioned signed-flow linking semantics applied after allocation.
+pub const SIGNED_FLOW_LINK_SEMANTICS_VERSION: &str = "signed-flow-balance-v1";
+
+/// Backward-compatible name for the active allocation semantics identity.
+pub const TIDAS_PROCESS_SEMANTICS_VERSION: &str = TIDAS_ALLOCATION_SEMANTICS_VERSION;
 
 // TIDAS `Perc` permits at most three decimal places. Allow a one-unit difference
 // in the least-significant percentage digit when checking a closed allocation
@@ -23,7 +29,7 @@ pub enum TidasAllocationResolution {
     LegacyEmptyUndeclared,
     /// The allocation vector explicitly contains the quantitative reference.
     Explicit { fraction: f64 },
-    /// A single targetless full allocation was safely inferred for the only output.
+    /// A single targetless full allocation was safely inferred for the unique reference pivot.
     LegacyInferredReference { fraction: f64 },
     /// The closed sparse vector omits the quantitative reference, implying zero.
     SparseZero,
@@ -34,16 +40,16 @@ pub enum TidasAllocationResolution {
 /// TIDAS stores `@allocatedFraction` as `Perc`, so both JSON strings and numbers
 /// are interpreted as percentages and divided by 100. A declared allocation is
 /// accepted only when its object/array is non-empty, every target is a unique
-/// known output, every fraction is finite and within 0..=100, and the complete
+/// known exchange, every fraction is finite and within 0..=100, and the complete
 /// vector sums to 100% within the three-decimal `Perc` tolerance. Two bounded
 /// legacy shapes are normalized: a scalar empty object is undeclared, and one
 /// targetless full allocation is attributed to the quantitative reference only
-/// when the Process has exactly one Output and that Output is the reference.
+/// when the reference internal ID uniquely resolves to one Process exchange.
 pub fn resolve_tidas_exchange_allocation<S: BuildHasher>(
     exchange: &Value,
     reference_internal_id: &str,
-    valid_output_internal_ids: &HashSet<String, S>,
-    output_exchange_count: usize,
+    valid_exchange_internal_ids: &HashSet<String, S>,
+    reference_exchange_count: usize,
 ) -> anyhow::Result<TidasAllocationResolution> {
     let reference_internal_id = reference_internal_id.trim();
     if reference_internal_id.is_empty() {
@@ -79,12 +85,11 @@ pub fn resolve_tidas_exchange_allocation<S: BuildHasher>(
             .as_object()
             .context("allocations.allocation[0] must be an object")?;
         if !entry.contains_key("@internalReferenceToCoProduct") {
-            if output_exchange_count != 1
-                || valid_output_internal_ids.len() != 1
-                || !valid_output_internal_ids.contains(reference_internal_id)
+            if reference_exchange_count != 1
+                || !valid_exchange_internal_ids.contains(reference_internal_id)
             {
                 bail!(
-                    "targetless allocation can only be inferred when the Process has exactly one Output and it is the quantitative reference"
+                    "targetless allocation can only be inferred when the quantitative reference uniquely identifies one Process exchange"
                 );
             }
             let raw_fraction = entry.get("@allocatedFraction").context(
@@ -116,8 +121,10 @@ pub fn resolve_tidas_exchange_allocation<S: BuildHasher>(
                 )
             })?;
 
-        if !valid_output_internal_ids.contains(target) {
-            bail!("allocations.allocation[{index}] references unknown output internal ID {target}");
+        if !valid_exchange_internal_ids.contains(target) {
+            bail!(
+                "allocations.allocation[{index}] references unknown exchange internal ID {target}"
+            );
         }
         if !seen_targets.insert(target.to_owned()) {
             bail!("duplicate allocation target internal ID {target}");
@@ -210,6 +217,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
+        SIGNED_FLOW_LINK_SEMANTICS_VERSION, TIDAS_ALLOCATION_SEMANTICS_VERSION,
         TIDAS_PROCESS_SEMANTICS_VERSION, TidasAllocationResolution,
         preferred_calculation_amount_value,
         resolve_tidas_exchange_allocation as resolve_tidas_exchange_allocation_with_count,
@@ -222,13 +230,13 @@ mod tests {
     fn resolve_tidas_exchange_allocation(
         exchange: &Value,
         reference_internal_id: &str,
-        valid_output_internal_ids: &HashSet<String>,
+        valid_exchange_internal_ids: &HashSet<String>,
     ) -> anyhow::Result<TidasAllocationResolution> {
         resolve_tidas_exchange_allocation_with_count(
             exchange,
             reference_internal_id,
-            valid_output_internal_ids,
-            valid_output_internal_ids.len(),
+            valid_exchange_internal_ids,
+            usize::from(valid_exchange_internal_ids.contains(reference_internal_id)),
         )
     }
 
@@ -243,8 +251,13 @@ mod tests {
     fn semantics_version_is_stable() {
         assert_eq!(
             TIDAS_PROCESS_SEMANTICS_VERSION,
-            "tidas-quantitative-reference-v2"
+            "tidas-reference-allocation-v3"
         );
+        assert_eq!(
+            TIDAS_ALLOCATION_SEMANTICS_VERSION,
+            "tidas-reference-allocation-v3"
+        );
+        assert_eq!(SIGNED_FLOW_LINK_SEMANTICS_VERSION, "signed-flow-balance-v1");
     }
 
     #[test]
@@ -266,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn targetless_full_allocation_is_inferred_for_the_only_reference_output() {
+    fn targetless_full_allocation_is_inferred_for_the_unique_reference_exchange() {
         for fraction in [json!("100"), json!("100.000"), json!(100), json!("100%")] {
             let exchange = json!({
                 "allocations": {
@@ -298,7 +311,7 @@ mod tests {
     }
 
     #[test]
-    fn targetless_allocation_requires_exactly_one_physical_reference_output() {
+    fn targetless_allocation_requires_exactly_one_reference_exchange() {
         let exchange = json!({
             "allocations": {
                 "allocation": { "@allocatedFraction": "100" }
@@ -306,15 +319,15 @@ mod tests {
         });
         let valid_outputs = outputs(&["1"]);
 
-        for output_exchange_count in [0, 2] {
+        for reference_exchange_count in [0, 2] {
             let error = resolve_tidas_exchange_allocation_with_count(
                 &exchange,
                 "1",
                 &valid_outputs,
-                output_exchange_count,
+                reference_exchange_count,
             )
-            .expect_err("reject non-single physical output");
-            assert!(error.to_string().contains("exactly one Output"));
+            .expect_err("reject non-unique reference exchange");
+            assert!(error.to_string().contains("uniquely identifies"));
         }
 
         let error = resolve_tidas_exchange_allocation_with_count(&exchange, "2", &valid_outputs, 1)
@@ -349,17 +362,21 @@ mod tests {
     }
 
     #[test]
-    fn targetless_entries_remain_invalid_for_multiple_outputs_or_entries() {
-        let multiple_outputs = json!({
+    fn targetless_reference_inference_does_not_depend_on_other_exchange_directions() {
+        let multiple_exchanges = json!({
             "allocations": {
                 "allocation": { "@allocatedFraction": "100" }
             }
         });
-        assert!(
-            resolve_tidas_exchange_allocation(&multiple_outputs, "1", &outputs(&["1", "2"]),)
-                .is_err()
+        assert_eq!(
+            resolve_tidas_exchange_allocation(&multiple_exchanges, "1", &outputs(&["1", "2"]))
+                .expect("infer unique reference among multiple exchanges"),
+            TidasAllocationResolution::LegacyInferredReference { fraction: 1.0 }
         );
+    }
 
+    #[test]
+    fn multiple_targetless_entries_remain_invalid() {
         let multiple_entries = json!({
             "allocations": {
                 "allocation": [
@@ -573,7 +590,7 @@ mod tests {
         });
         let error = resolve_tidas_exchange_allocation(&exchange, "1", &outputs(&["1"]))
             .expect_err("reject unknown target");
-        assert!(error.to_string().contains("unknown output"));
+        assert!(error.to_string().contains("unknown exchange"));
     }
 
     #[test]

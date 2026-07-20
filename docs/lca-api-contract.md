@@ -143,7 +143,7 @@ legacy `lca_jobs.job_type` 与 worker payload `type` 必须一致。`worker_jobs
 - worker 会按 `unit_batch_size` 分块构造单位需求向量（每个 process 一条 `amount=1`）。
 - 为控制结果体积，`solve_all_unit` 仅支持 `return_h=true` 且 `return_x/return_g=false`。
 - 对调用者仍只返回/保留 H；worker 内部会在固定 256-process artifact chunk 内临时请求 `x+h`，用 snapshot 的 exact directional biosphere evidence 计算 LCI，写完该 chunk 后立即释放 `x`。完整 `x`、`G` 或 directional LCI 矩阵不会在内存中跨 chunk 聚合。
-- 每个成功的新 `solve_all_unit` 同时生成不可变 `tiangong.calculation-bundle.v1`。旧 snapshot 若没有 exact release evidence，任务以明确错误要求重建 snapshot；worker 不从 A/B 或数据库当前态猜测 exchange identity。
+- 每个成功的新 `solve_all_unit` 同时生成不可变 `tiangong.calculation-bundle.v2`。旧 snapshot 若没有 exact signed-flow release evidence，任务以明确错误要求重建 snapshot；worker 不从 A/B 或数据库当前态猜测 exchange identity。
 
 ### 3.5 兼容字段
 
@@ -238,7 +238,7 @@ legacy pgmq/debug 路径语义：
 
 `snapshot` artifact 当前格式：`snapshot-hdf5:v1`。
 
-### 5.1 Calculation Bundle v1
+### 5.1 Calculation Bundle v2
 
 `solve_all_unit` 的 canonical release evidence 是 manifest + deterministic gzip NDJSON sidecars：
 
@@ -257,35 +257,35 @@ evidence/coverage.json
 - 每个 canonical chunk 固定覆盖最多 256 个连续 process index；NDJSON record 使用 canonical JSON 和单个换行，gzip 固定 level 6、mtime 0、无文件名/comment。
 - manifest 的 `artifacts[]` 按 path 排序，记录 compressed/uncompressed SHA-256、byte size、record count 与 process-index boundary；`bundleContentHash` 不包含生成时间、对象存储 URL 或自身 hash。
 - `source/source-closure.ndjson.gz` 使用 `tiangong.source-closure.bundle.v1`，每条 `tiangong.source-closure.dataset.v1` record 固化 dataset type、role、TIDAS UUID/version、目标包内 path、canonical document SHA-256 与完整 TIDAS JSON。Process role 固定为 `unit_process`，其余为 `support`；它是 Calculation Bundle 的原始输入证据，不是由结果反推的派生视图。
-- process axis 固化 Process UUID/version 和唯一 quantitative reference 的 exchange internal ID、Flow UUID/version、reference unit 与归一化 amount；inventory axis 逐 exchange 保存 allocation target 与 selected fraction。
+- process axis 固化 Process UUID/version 和唯一 quantitative reference 的 exchange internal ID、Flow UUID/version、reference unit、raw direction/amount/coefficient 与 signed normalized pivot；inventory axis逐 exchange 保存 raw/signed/normalized coefficient、allocation target 与 selected fraction。
 - 普通 fresh snapshot 与 review-submit overlay snapshot 都必须把 `compiled_graph.release_evidence` 及 `source_datasets` 写入 snapshot artifact。source closure 从本次 snapshot 精确选择的 Process/Flow revision 和已审 LCIA Method identity 出发，递归解析 Contact、Flow Property、Source、Unit Group 与 LCIA Method reference；显式版本只允许 exact match，省略的 support version 选择最高 fixed-width ILCD version，缺失、歧义、无效 UUID/version 或同 identity/version 内容漂移均 fail closed。Process/Flow 仍受 snapshot scope 约束；被这些可发布根文档精确引用的 support document 按 UUID/version 展开，不在 solve 时重新查询。
 - 若 exchange 的 Flow 引用省略 `@version`，release evidence 使用本次 snapshot 实际选择的 Flow metadata version；若引用显式给出版本，则该版本保持绑定，且 unit metadata 只允许来自同一版本，不能静默回退到另一版本。任何未能得到合法 Flow version 或 reference unit 的情况都在 Calculation Bundle 构建时 fail closed。
 - 已审 LCIA static-cache 中方法 UUID 与 artifact locator 不同的已知 alias，只允许 locator 用于精确读取源文档；source closure、LCIA axis 与最终发布始终使用文档内的 canonical method UUID/version。25 个方法任一 identity/locator/document UUID 不一致都 fail closed。
-- technosphere evidence 固化 consumer input / provider output exchange internal ID、provider weight、未分摊 normalized input amount、Flow UUID/version 和 location；split-provider 每个最终 provider 一条 edge。
+- technosphere evidence 使用中性字段固化 `dependent_process_idx`、`residual_exchange_internal_id`、`balancing_process_idx`、`balancing_reference_exchange_internal_id`、residual/reference coefficient、routing weight、activity requirement、Flow UUID/version 和 location；每个最终 balancing reference port 一条 edge。
 - directional LCI key 固定为 Flow UUID/version + Input/Output + reference unit + optional location；LCIA 固定绑定已审查 static-cache bundle 1.2.4 的 25 个 method UUID/version。
 - object path 使用 `calculation-bundles/<calculation-id>/<bundle-content-hash>/...`，先上传 sidecars，最后上传 manifest。job diagnostics 的 `calculation_bundle`（package build 中为 `artifactManifest.calculationBundle`）保存 manifest URL/hash/byte size 和 bundle content hash。
 - `hdf5:v1` 与 `all-unit-query:v1` 继续作为兼容/查询视图；它们不是 canonical release evidence。旧 snapshot 缺少 frozen `source_datasets` 时必须重建，禁止在 solve 或 release 阶段从数据库当前态补齐。
 
-Snapshot 的 Process 身份契约是：一个完整 TIDAS Process revision 只代表其 `quantitativeReference.referenceToReferenceFlow`，并且只对应一个 process index / 矩阵列。非 reference co-product output 不生成派生 Process、矩阵列或 eligible provider；若 co-product `B` 需要参与计算，上游必须提供另一个完整、独立、以 `B` 为 quantitative reference 的 Process revision。
+Snapshot 的 Process 身份契约是：一个完整 TIDAS Process revision 只对应一个 process index / 矩阵列，其 `quantitativeReference.referenceToReferenceFlow` 选择 signed normalization pivot。Reference 可以是 Input/Output、正/负 amount、任一 source flow type；有效性不由 Product/Waste 或方向决定。Non-reference exchange 不生成派生 Process；需要独立 activity pivot 时，上游必须提供另一个完整 Process revision。
 
-Snapshot build 对 exchange allocation 使用 target-aware 语义：object/array 都按 `@internalReferenceToCoProduct` 匹配当前 quantitative reference，TIDAS `Perc` 统一除以 `100`；闭合 allocation vector 中缺少当前 target 表示稀疏零，完全未声明 allocation 表示 fraction `1`。Legacy compatibility 只允许两个有界 fallback：仅 scalar `allocations.allocation = {}` 按 undeclared/fraction `1` 处理；单个 targetless full allocation 仅在 Process 的物理 `Output` 恰好为 `1`、该 Output 的唯一有效 internal ID 等于 quantitative reference、且 fraction 为 canonical `100` 或 legacy string 精确 `"100%"` 时推断 target 为当前 reference、fraction 为 `1`。空数组、`[{}]`、multiple-output / multiple-entry targetless、非 full targetless fraction、无效 Output ID、无法命中 quantitative reference 以及其他无效声明均 fail closed。
+Snapshot build 对 exchange allocation 使用 target-aware 语义：object/array 都按 `@internalReferenceToCoProduct` 匹配当前 quantitative reference，TIDAS `Perc` 统一除以 `100`；闭合 allocation vector 中缺少当前 target 表示稀疏零，完全未声明 allocation 表示 fraction `1`。Legacy compatibility 只允许两个有界 fallback：scalar `{}` 按 undeclared 处理；单个 targetless full allocation 仅在 reference exchange 和 internal ID 唯一时推断。方向不参与 target validity；multiple-entry targetless、多个 quantitative reference、坏 ID 或其他无效声明均 fail closed。Reference pivot 本身不乘 allocation fraction。
 
-当前语义通过 build config 的 `allocation_semantics_version = tidas-quantitative-reference-v2` 记录，并进入 source fingerprint，避免复用 v1 或更早语义 snapshot。
+Build config 记录 `allocation_semantics_version = tidas-reference-allocation-v3`、`link_semantics_version = signed-flow-balance-v1`、`technosphere_boundary_policy` 与 `flow_identity_policy = exact-flow-version-reference-unit-v1`；所有字段进入 source/review fingerprint，并写入 bundle `solver.linkPolicy`。
 
 显式零或稀疏零 allocation 得到的 Input 不展开 provider closure、不产生 provider-gap diagnostics，也不写入 `A`；零 attributed elementary exchange 也不写入 `B`，不参与 LCIA direction 与 factor-coverage evidence。它只表示该 exchange 对当前 quantitative reference 没有 attributed burden。
 
-snapshot coverage diagnostics 会暴露 snapshot 构建阶段的 provider linking 和矩阵写入质量统计，用于解释供应链连接完整性。当前 coverage schema 为 `snapshot_coverage.v2`，在保留 `provider_decision_diagnostics` 兼容字段的同时，新增按用途分组的 summary：
+Snapshot coverage diagnostics 暴露 signed-flow balance 与矩阵写入质量。当前 coverage schema 为 `snapshot_coverage.v3`，使用 `residual_edges_total` / `a_balance_edges_written` 作为中性计数，同时保留 provider/input compatibility fields。
 
-`allocation_semantics_version` 属于 snapshot build config / source identity。本次语义变更不升级 `snapshot_coverage.v2`，但以 additive、default-zero 字段增加两个兼容计数；旧 artifact 缺少它们时按 `0` 读取：
+Allocation summary 的兼容计数为：
 
 - `allocation.legacy_empty_allocation_as_undeclared_count`：按 scalar `{}` legacy fallback 视为 undeclared 的 exchange 数。
-- `allocation.legacy_single_output_target_inferred_count`：在唯一物理 Output 的有效 internal ID 等于 quantitative reference 时，安全推断 full targetless allocation 的 exchange 数。
+- `allocation.legacy_single_reference_target_inferred_count`：在 reference exchange/internal ID 唯一时安全推断 full targetless allocation 的 exchange 数；旧 output 命名字段只作为 default-zero 兼容投影。
 
 这两个字段用于审计 compatibility normalization，不产生新的通用 fallback，也不把其他 invalid allocation 降级为 warning。
 
 Provider-link 的运行时决策顺序、默认 provider rule、candidate eligibility 和 provider diagnostics 维护在 `docs/provider-linking.md`。本文档只定义 worker/API 消费这些 coverage 与 artifact 字段的契约边界。
 
-- `candidate_summary`：eligible provider candidate 数量分布。自动 provider linking 默认只把 reference output 计入 eligible candidate；同 flow 的非 reference output 通过 `provider_decision_diagnostics.candidate_eligibility_counts` 和逐条 candidate evidence 解释为 rejected diagnostics。
+- `candidate_summary`：same-flow reference-port candidate 数量分布。只有 exact-flow、different-process、opposite-sign reference port eligible；same-sign reference 和 non-reference exchange 作为 rejected evidence。
 - `resolution_summary`：resolved strategy 与 unresolved reason 分布。
 - `geography_summary`：地理层级、strategy × geography tier、supply-region anchor 来源、exchange location 覆盖情况和 location 粒度分布。
 - `volume_weight_summary`：基于 `annualSupplyOrProductionVolume` 的权重数据可用性与 fallback-to-one 情况。
@@ -322,26 +322,26 @@ cargo run -p solver-worker --bin matrix_readiness -- \
   --out matrix-readiness-report.json
 ```
 
-fresh `snapshot_builder` run 也会在 `report_dir` 下尝试写出 `matrix-readiness-<snapshot_id>.json`；该本地文件受 `SNAPSHOT_REPORT_*` retention 和低磁盘 guard 保护，跳过本地写入不改变 snapshot artifact 或 report schema。输入 `matrix_readiness_input.v1` 包含：
+fresh `snapshot_builder` run 也会在 `report_dir` 下尝试写出 `matrix-readiness-<snapshot_id>.json`；该本地文件受 `SNAPSHOT_REPORT_*` retention 和低磁盘 guard 保护，跳过本地写入不改变 snapshot artifact 或 report schema。输入 `matrix_readiness_input.v2` 包含：
 
 - `coverage`: snapshot coverage report。
 - `payload`: `ModelSparseData` sparse payload。
-- `compiled_graph`（可选）：fresh build 时包含逐边 provider decision、candidate providers、allocation weights、geography tier 和 failure reason。没有该字段时仍可验证 coverage/compute，但 provider evidence 会降级为空。
+- `compiled_graph`（可选）：fresh build 时包含 reference ports、resolved/unresolved signed balances 和兼容 provider evidence。没有该字段时仍可验证 coverage/compute，但逐边 balance evidence 会为空。
 - `policy`: provider write percentage、unmatched / unresolved provider 容忍度、singular risk、LCIA factor、factorization 和 negative LCIA anomaly 策略。
 
-输出 `matrix_readiness_report.v1` 包含：
+输出 `matrix_readiness_report.v2` 包含：
 
 - `status`: `passed` 或 `failed`。
 - `next_action`: 例如 `publish_ready`、`repair_provider_closure_then_recheck`、`repair_compute_stability_then_recheck`。
-- `metrics.provider_closure`: input edge、written edge、unmatched provider、multi-provider unresolved 和 equal-fallback 统计。
+- `metrics.provider_closure`: residual/written balance、unmatched opposite-sign reference、multi-candidate unresolved 和 equal-fallback 统计。
 - `metrics.graph_readiness`: process/flow/impact scale、A/B/C/M nnz、reference/allocation closure 和 singular risk。
 - `metrics.compute_stability`: factorization readiness、matrix validation report、sample unit solves、non-finite count 和 negative LCIA count。
-- `provider_evidence`: 每条 input edge 的 consumer、flow、candidate providers、resolution strategy、failure reason、allocation weights、ambiguity 和 confidence。
+- `balance_evidence` / `unresolved_balances`: signed coefficient、routing weight、activity requirement、closure residual 和未闭合原因；`provider_evidence` 作为兼容投影保留。
 - `findings` / `blockers`: machine-readable issue codes、severity、message 和 detail payload。
 
 当前 matrix-readiness 只通过 worker CLI 与 `snapshot_builder` report artifact 暴露；本节不表示 Edge/API 已提供 HTTP 调用入口。稳定 code、`blockers` / `findings` / `next_action` 规则、policy 默认值和调用方消费约束由 `docs/matrix-readiness-report-contract.md` 维护。
 
-Foundry、CLI 或 Edge adapter 只能消费该 report 的 `status`、`next_action`、`blockers`、`metrics` 和 `provider_evidence`；不应在外部复制 worker runtime 的 provider resolution、singular-risk 或 UMFPACK readiness 规则。
+Foundry、CLI 或 Edge adapter 只能消费该 report 的 `status`、`next_action`、`blockers`、`metrics`、`balance_evidence` 和 `unresolved_balances`；不应在外部复制 worker runtime 的 balance、routing、singular-risk 或 UMFPACK readiness 规则。
 
 ### 5.2 Review-submit fast gate report
 
@@ -388,7 +388,7 @@ Edge/API 不直接运行数值 gate。legacy 路径中，Edge 通过数据库 RP
 
 该 gate 先执行 revision/process/provider/flow/sparse 结构检查；只有没有结构 blocker 时才执行 sparse factorization readiness 与 targeted RHS solve。默认 targeted probe 只验证 `x/g` 稳定性，不计算 LCIA `h`。它不 materialize inverse，也不要求 full `solve_all_unit`。
 
-稳定 blocker code、policy 默认值、快速验证顺序和 caller consumption 约束由 `docs/review-submit-fast-gate-contract.md` 维护。Edge 或 Next 在提交审核链路中应消费 DB gate result 里的 status、blockingReasons 和 calculatorReport，不应直接把 `matrix_readiness_report.v1` 的 blocker 当成提交审核结论。
+稳定 blocker code、policy 默认值、快速验证顺序和 caller consumption 约束由 `docs/review-submit-fast-gate-contract.md` 维护。Edge 或 Next 在提交审核链路中应消费 DB gate result 里的 status、blockingReasons 和 calculatorReport，不应直接把 `matrix_readiness_report.v2` 的 blocker 当成提交审核结论。
 
 ## 6. 幂等与请求缓存（建议约束）
 

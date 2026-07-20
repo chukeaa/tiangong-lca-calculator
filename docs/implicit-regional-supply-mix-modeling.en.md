@@ -7,12 +7,12 @@ authoritative: false
 owner: worker
 language: en
 whenToUse:
-  - when reasoning about provider link semantics based on process annual supply or production volume
-  - when reasoning about explicit exchange location as the supply-region anchor for provider linking
-  - when evaluating whether a regional product supply mix can be represented without an explicit market process
-  - when implementing or reviewing calculator provider allocation weights
+  - when reasoning about signed-flow routing based on process annual supply or production volume
+  - when reasoning about explicit exchange location as a supply-region anchor
+  - when evaluating whether a regional technosphere mix can be represented without an explicit market process
+  - when implementing or reviewing calculator routing weights
 whenToUpdate:
-  - when provider allocation semantics change
+  - when signed-flow candidate or routing semantics change
   - when exchange location supply-region semantics change
   - when annual supply or production volume parsing semantics change
   - when calculator starts materializing explicit market processes instead of implicit direct links
@@ -22,9 +22,10 @@ checkPaths:
   - docs/implicit-regional-supply-mix-modeling.en.md
   - crates/solver-worker/src/bin/snapshot_builder.rs
   - crates/solver-worker/src/compiled_graph.rs
+  - crates/solver-worker/src/signed_flow.rs
   - crates/solver-worker/src/snapshot_artifacts.rs
-lastReviewedAt: 2026-07-17
-lastReviewedCommit: 6d61068445ebfad0fb3e07469f6d0468d692574a
+lastReviewedAt: 2026-07-20
+lastReviewedCommit: 4001a5f367ba1eb3a2405e71042d1fe0987acf88
 related:
   - AGENTS.md
   - docs/agents/repo-architecture.md
@@ -35,371 +36,127 @@ related:
 
 # Implicit Regional Supply Mix Modeling
 
-Implicit Regional Supply Mix Modeling is the calculator's regional supply-mix method for provider linking. Without materializing an explicit market process, it selects a supply region for a product input exchange and allocates that input demand to multiple providers of the same product/reference flow.
+This document explains where regional supply-mix routing sits in the signed-flow linker. `docs/provider-linking.md` is the runtime contract.
 
-The method is defined by this sequence:
+## Definition
+
+An implicit regional supply mix does not decide which exchange is a demand or a supply. After a technosphere residual has multiple mathematically eligible reference ports, it uses model, geography, and annual-volume evidence to choose routing weights without materializing an additional market process.
 
 ```text
-product input demand
-  -> model-consistent provider scope
+signed coefficient / reference pivot
+  -> exact same-flow, opposite-sign candidates
+  -> same-model scope, if available
   -> supply-region anchor
-  -> geography tier
-  -> provider set
-  -> volume-based provider shares
-  -> technosphere matrix links
+  -> best non-empty geography tier
+  -> annual-volume routing weights
+  -> non-negative activity requirements
 ```
 
-It determines which providers supply a product input demand and what share each provider receives. It does not change the consumer process's total demand for the product/reference flow, and it does not treat annual supply or production volume as an exchange amount.
+## Signed-flow basis
 
-## Core Assumptions
-
-### 1. Providers in the Same Supply Region Can Form a Representative Supply Mix
-
-For the same product/reference flow, multiple providers in the same geography tier can be interpreted as the representative supply structure for that flow in that supply region.
-
-The method does not require every provider to be a complete market participant in an external market statistic. It requires two conditions:
-
-- the providers supply the same product/reference flow;
-- the providers belong to the selected supply-region tier.
-
-Automatic provider linking treats only a process's quantitative reference output as evidence that the process supplies the product/reference flow. In practice, the Output exchange `@dataSetInternalID` must equal the process `quantitativeReference.referenceToReferenceFlow`. Same-`flow_id` non-reference outputs are exposed as rejected candidate diagnostics and do not automatically enter the provider set.
-
-Within that scope, `annualSupplyOrProductionVolume` can be used as a structured signal for relative provider supply scale. It is a share weight, not an additional technical input.
-
-### 2. Providers in the Same Model Mean the Model Explicitly Declares an Internal Supply Relationship
-
-A `model_id` means that a group of processes belongs to the same lifecycle model or data-modeling context. A consumer and provider inside the same model usually share a more consistent system boundary, data source, modeling assumption set, technology scope, and version context.
-
-More directly: when a consumer process input exchange demands a product/reference flow and another process inside the same model has that same flow as its quantitative reference output, the data author has placed both the demand side and the supply side inside one model. The calculator interprets that structure as the model's explicit declaration of an internal supply relationship: this input demand already has an intended supplier candidate inside the model boundary.
-
-This priority is not direct evidence of physical distance, market share, or real transaction relationships, and it does not mean that the input exchange structurally points to one provider process. It expresses an in-model supply relationship at the product-flow level: inside the same product system or data package, the supply-side process has already been explicitly modeled, so the internal technical chain should stay closed before the calculator stitches in providers from external models.
-
-If no provider is available inside the same model, the calculator returns to the regional supply mix assumption: it constructs a representative supply mix from the wider provider universe using the supply-region anchor, geography tier, and annual volume. This preserves the model-internal closure priority without turning an otherwise linkable input demand into a no-provider case only because model metadata is incomplete.
-
-### 3. An Input Exchange Can Explicitly Declare the Supply Region
-
-On a product input exchange, `processDataSet.exchanges.exchange[].location` is the supply-region anchor. It declares the geographic supply mix from which the input demand should be supplied.
-
-For example:
+Each exchange first becomes a signed coefficient:
 
 ```text
-exchange.location = "CN"
+c = direction_sign * calculation_amount
+direction_sign(Input)  = -1
+direction_sign(Output) = +1
 ```
 
-means that the input demand uses the representative supply structure for China.
+Direction and amount sign are independent. Product/Waste type does not define a link role. The Process quantitative reference selects a pivot exchange whose raw coefficient is normalized to `+1` or `-1`.
+
+A non-reference technosphere exchange forms residual `c_r`. Reference port `i` is eligible only when it has an exact compatible flow identity, belongs to another Process, is that Process's quantitative reference exchange, and satisfies `sign(c_i) = -sign(c_r)`.
+
+Flow source type only selects the computation space: Product/Waste are technosphere, Elementary is biosphere, and Other is reporting-only.
+
+## Routing is separate from balance
+
+Signed-flow math defines eligibility. The regional supply mix only defines routing weight `w_i` among eligible candidates:
 
 ```text
-exchange.location = "GLO"
+w_i >= 0
+sum(w_i) = 1
+activity_requirement_i = (-c_r / c_i) * w_i
+c_r + sum(c_i * activity_requirement_i) = 0
 ```
 
-means that the input demand uses a global supply mix.
+Opposite signs guarantee non-negative activity requirements. Annual volume, geography, and model metadata must not alter coefficient signs, the reference pivot, or the magnitude to be balanced.
 
-The field is a plain location string. Recommended values are TIDAS/ILCD location category codes such as `CN`, `CN-BJ`, `RER`, and `GLO`. It is not localized text, not an exchange amount or unit, and not a biosphere LCIA geography.
+## Same-model priority
 
-### 4. Missing Exchange Location Uses the Local-First Default
+When the dependent Process has a `model_id` and at least one candidate has the same `model_id`, routing first narrows to that subset. This is a hard routing filter, not an exchange-level provider pointer or evidence of a real transaction.
 
-If the input exchange does not provide a usable `location`, the calculator uses the consumer process's `locationOfOperationSupplyOrProduction` as the default supply-region anchor.
+Without a same-model candidate, routing uses the wider eligible universe. This fallback never relaxes exact-flow, opposite-sign, reference-port, or self-link rules.
 
-This default follows local-first selection:
+## Supply-region anchor
 
-```text
-consumer local / subnational
-same country / national average
-same region
-global
-other
-```
-
-This means supply is assumed to come first from the consumer's location. If no local provider is available, the search expands to national, regional, or global providers.
-
-### 5. Geography Tier Selection Comes Before Volume Weighting
-
-The calculator first selects the geography tier and only then computes provider shares from annual volume within that tier.
-
-Providers from all geography tiers must not be globally ranked by annual volume. Otherwise, a large global provider could override providers in the intended local or explicitly selected supply region.
-
-Annual volume is comparable only within this scope:
+The geographic anchor resolves in this order:
 
 ```text
-same product/reference flow
-same selected geography tier
-```
-
-### 6. Annual Volume Determines Provider Share, Not Demand Amount
-
-Exchange amount represents the consumer process's technical input demand per reference unit. Annual supply or production volume represents the provider process's annual supply scale.
-
-Their meanings are separate:
-
-```text
-exchange amount -> demand size
-annual volume   -> provider allocation share
-```
-
-Annual volume only determines how one demand is split across providers. It must not be multiplied into the consumer input demand as an additional demand quantity.
-
-## Modeling Link Logic
-
-For each product input exchange, the calculator applies the following link decision.
-
-### Step 1: Determine the Product/Reference Flow
-
-The calculator identifies the demanded product/reference flow `f` from the input exchange. Provider candidates must provide the same `f`. Under the default automatic linking rule, only a reference output proves that a process supplies that product/reference flow. A non-reference output with the same `flow_id` does not become a provider only because it is geographically closer or has an allocation fraction.
-
-If no reference-output provider is available, the calculator should not fabricate one and should not fall back to arbitrary non-reference outputs. The exchange should be reported through provider-link diagnostics and resolved through data repair, additional provider data, or explicit market/co-product process modeling.
-
-### Step 2: Determine the Model-Consistent Provider Scope
-
-Among same-product/reference-flow reference-output providers, the calculator first checks whether any provider belongs to the same `model_id` as the consumer.
-
-If such providers exist, they form the provider scope for the later regional supply mix decision. That scope means the current lifecycle model has explicitly provided internal supplier candidates for this input demand.
-
-If no such provider exists, the provider scope remains all eligible providers, and the later regional supply mix rules select the supply region and provider shares.
-
-### Step 3: Determine the Supply-Region Anchor
-
-The supply-region anchor priority is:
-
-```text
-exchange.location
-consumer process location
+residual exchange.location
+dependent process location
 unspecified
 ```
 
-If `exchange.location` is present and can be parsed into a usable location descriptor, it becomes `g_jf`. If it is missing or unusable, the calculator uses the consumer process's `locationOfOperationSupplyOrProduction`. If neither is usable, the calculator enters unspecified matching logic and should expose that in diagnostics.
+Exchange location wins because it can express the desired supply region for this balance. Process location is the default.
 
-An effective `exchange.location` must not be overridden by the consumer process location. Consumer location only supplies the default region.
+## Geography tier
 
-### Step 4: Select the Geography Tier
-
-Given the supply-region anchor `g_jf`, the calculator selects the most appropriate geography tier among provider candidates.
-
-If the anchor comes from `exchange.location`, tier search is centered on that explicit supply region. For example, with `exchange.location = "CN"`, the calculator first selects providers in the China tier. Only when that tier has no provider should the search expand outward from the China target region.
-
-If the anchor comes from the consumer process location, the calculator uses local-first tier order:
+Routing selects the first non-empty tier:
 
 ```text
 local / subnational
-same country / national average
+same country
 same region
 global
 other
 ```
 
-The calculator selects the first non-empty tier.
+Annual volume is never compared across tiers. Select the tier first, then distribute within it.
 
-### Step 5: Compute Provider Shares Within the Selected Tier
+## Annual-volume weight
 
-Within the selected geography tier, providers of the same product/reference flow are weighted by annual volume.
-
-Annual volume is not compared across tiers.
-
-### Step 6: Write Technosphere Matrix Links
-
-The consumer input demand is split by provider shares and written to `A[p_i, j]`. After writing, the total demand for that input must be conserved.
-
-## Mathematical Form
-
-Let `j` be the consumer process. Its normalized input demand for product/reference flow `f` is:
+Within the selected tier:
 
 ```text
-q_jf
+raw_weight_i = annualSupplyOrProductionVolume_i, if finite and > 0
+raw_weight_i = 1.0, otherwise
+w_i = raw_weight_i / sum(raw_weight)
 ```
 
-The supply-region anchor for that demand is:
+The `1.0` fallback is a fixed positive routing weight, not a claim that real annual output equals one. Diagnostics must count its use.
+
+## Equivalent and different Waste references
+
+`Waste Input +1000` gives `c_ref = -1000`, normalized to `-1`. `Waste Output -1000` also gives `c_ref = -1000`, normalized to `-1`. They are mathematically equivalent reference ports and can both balance a positive residual.
+
+`Waste Output +1000` instead normalizes to `+1` and can only balance a negative residual. The distinction comes from the signed coefficient, not an implicit rule such as “every waste output is a demand.”
+
+## Allocation boundary
+
+Allocation runs before routing and determines the non-reference exchange residual attributed to the current quantitative reference:
 
 ```text
-g_jf = exchange.location, if present and usable
-g_jf = consumer process location, otherwise
+normalized residual = raw coefficient * reference_scale * selected allocation fraction
 ```
 
-After reference-output eligibility, optional same-model scope, and geography tier selection for `g_jf`, the provider set is:
+The reference pivot itself is not multiplied by allocation. Target-aware allocation uses the quantitative-reference internal ID; direction does not determine target validity. One targetless full allocation may be inferred only when the reference exchange and ID are unique. Multiple targetless entries or multiple quantitative references fail closed.
 
-```text
-P_{f,g} = { p_1, p_2, ..., p_n }
-```
+Allocation fraction and routing weight are different: the former changes residual magnitude; the latter distributes an already determined balance across reference ports.
 
-For each provider `p_i`, parse the numeric prefix from `annualSupplyOrProductionVolume` and define the raw weight:
+## Boundary policy
 
-```text
-r_i = annual_volume_i, if annual_volume_i is finite and > 0
-r_i = 1.0,             otherwise
-```
+- `closed`: every non-zero technosphere residual must close; this is the production default.
+- `open`: an unresolved balance may remain outside the system boundary.
+- `cutoff`: a balance may be omitted under an explicit cutoff boundary.
 
-The `1.0` value is a fixed positive default weight. It keeps the provider in the mix when supply scale is unknown. It does not mean that real annual output equals `1`, and it does not mean that the provider is necessarily the smallest supplier.
+`open/cutoff` must participate in snapshot config and fingerprints and must produce readiness warnings plus per-edge unresolved evidence. They are not silent fallbacks.
 
-Provider share is:
+## Audit evidence
 
-```text
-s_i = r_i / sum(r_k for p_k in P_{f,g})
-```
+Snapshot, release, and readiness evidence retain flow UUID/version/reference unit, flow space/source type, raw direction/amount/coefficient, normalized reference/residual coefficient, candidate eligibility, routing strategy/weight, activity requirement, closure residual, boundary policy, and unresolved reason.
 
-The calculator writes the split demand into the technosphere matrix:
+Build identity uses `tidas-reference-allocation-v3`, `signed-flow-balance-v1`, and `exact-flow-version-reference-unit-v1`. Coverage is `snapshot_coverage.v3`; readiness input/report are v2; calculation bundles are v2.
 
-```text
-A[p_i, j] += q_jf * s_i
-```
+## Limitation
 
-Because:
-
-```text
-sum(s_i) = 1
-```
-
-the input demand is conserved:
-
-```text
-sum(A[p_i, j] for p_i in P_{f,g}) = q_jf
-```
-
-This equality is the core matrix constraint of the method. Provider allocation changes the provider distribution, not the total demand in the consumer column.
-
-## Meaning of the `1.0` Fallback
-
-The `1.0` fallback is used when annual volume is missing, invalid, non-finite, or non-positive.
-
-It creates three interpretable states:
-
-- all providers have valid volume: shares are fully volume-driven;
-- no provider has valid volume: all raw weights are `1.0`, so the mix becomes equal-weighted;
-- some providers have valid volume and some do not: valid volume provides stronger supply-scale evidence, while missing-volume providers stay in the mix with the fixed positive default.
-
-The third state is intentional. Missing volume should not automatically remove a provider. Diagnostics must report fallback-to-one counts and ratios so the pseudocount is not mistaken for observed supply scale.
-
-If a non-positive volume means that a provider is unavailable, that meaning should be represented through data relationships, availability, or candidate filtering, not by letting the non-positive value enter the matrix as a raw weight.
-
-## Boundary Between Allocation Fraction and Provider Eligibility
-
-A complete TIDAS Process represents only its `quantitativeReference.referenceToReferenceFlow` and contributes exactly one process index / matrix column to a snapshot. Other co-product outputs in that Process do not create derived columns and do not gain provider eligibility. If co-product `B` must participate independently in calculation or supply another Process, upstream must provide another complete, independent TIDAS Process whose quantitative reference is `B`.
-
-`allocation_fraction` is used to attribute exchange amounts to the current quantitative reference:
-
-```text
-normalized exchange amount = calculation amount * reference_scale * selected allocation fraction
-```
-
-The calculation amount is selected in `resultingAmount -> meanAmount -> meanValue` order. `allocations.allocation` may be an object or an array; the worker selects the entry whose `@internalReferenceToCoProduct` equals `quantitativeReference.referenceToReferenceFlow`. `@allocatedFraction` uses TIDAS `Perc` semantics, so strings and numbers are percentages divided by `100`; a `%` suffix is invalid.
-
-If a declared allocation vector's non-zero entries close to `100%` but omit the current reference target, the omission is a sparse zero and the selected fraction is `0`. If an exchange does not declare `allocations` at all, its selected fraction is `1`.
-
-For legacy data, the worker accepts only two bounded fallbacks:
-
-- a scalar `allocations.allocation = {}` is treated as legacy undeclared, with selected fraction `1`; an empty array, `[{}]`, a missing `allocation` field, or a non-empty object that lacks a target/fraction does not qualify;
-- one targetless entry is inferred for the current reference only when the Process has exactly one physical `Output` exchange, that Output's sole valid internal ID equals the quantitative reference, and the fraction is canonical full `100` or the exact legacy string `"100%"`; the selected fraction is then `1`.
-
-All other targetless declarations remain ambiguous and fail closed, including multiple Outputs, multiple entries, non-full fractions, invalid Output IDs, or a reference that cannot be matched. Duplicate or unknown targets, non-finite or out-of-range fractions, non-closing totals, and other malformed structures likewise cannot fall back to `1`. These bounds prevent compatibility normalization from silently attributing one co-product's allocation to another quantitative reference.
-
-Allocation may scale attributed input, output, or elementary exchange amounts, but it does not grant provider eligibility. A non-reference output with an amount and allocation fraction only shows that the exchange participates in the current Process's allocation accounting; it does not mean that the Process can automatically supply product input demand for that output flow.
-
-Snapshot build config records `allocation_semantics_version = tidas-quantitative-reference-v2` and includes it in the source fingerprint so snapshots built under v1 or earlier semantics are not reused. The coverage schema remains `snapshot_coverage.v2`, with two additive default-zero compatibility counters in its allocation summary: `legacy_empty_allocation_as_undeclared_count` and `legacy_single_output_target_inferred_count`. Older artifacts that omit them deserialize both as `0`.
-
-## Relationship to an Explicit Market Process
-
-The method can be interpreted as inlining a linear regional market process.
-
-If an explicit market process `m_f,g` exists, consumer `j` can link to the market:
-
-```text
-A[m_f,g, j] += q_jf
-```
-
-The market then links to providers by share:
-
-```text
-A[p_i, m_f,g] += s_i
-```
-
-If this market process is only a pass-through supply mix and does not introduce additional production technology, losses, price constraints, trade transformations, or coproduct handling, the market node can be eliminated during matrix construction:
-
-```text
-A[p_i, j] += q_jf * s_i
-```
-
-The method therefore does not ignore the market mix. It represents the market mix directly in provider links. The solver still uses the same linear system:
-
-```text
-M = I - A
-```
-
-The difference is that the market mix is not exposed as a separate process in the process index. Its observability must come from provider allocation diagnostics.
-
-If a model needs explicit market processes, import shares, trade constraints, market losses, price-driven allocation, or transformation activities, those semantics should be represented by materialized market processes rather than direct provider links.
-
-## Matrix Properties
-
-### Dimensional Consistency
-
-`q_jf` is the product input amount per reference unit. `s_i` is a dimensionless share. `q_jf * s_i` remains a valid technosphere coefficient.
-
-Annual volume does not enter `A` directly. It is normalized into a share first, so annual production scale is not mixed into the technology coefficient matrix.
-
-### Column Demand Conservation
-
-For one input demand, provider shares sum to `1`. Therefore changes in provider count or share distribution do not change the consumer process's total input demand.
-
-### Non-Negativity and Numerical Stability
-
-Raw weights accept only positive numbers. Missing or invalid volume uses `1.0`. Provider shares are therefore non-negative, and the normalization denominator is never `0`.
-
-This avoids division by zero and prevents negative annual volume from creating provider edges with unclear reverse or cancellation semantics.
-
-### Effect on `M = I - A`
-
-The method does not change the solver's matrix form. It only changes the row distribution of selected product input demands in `A`.
-
-If new provider links reveal self-loops, provider loops, or singular risk, those risks should be observed through existing diagnostics rather than hidden by changing the share definition.
-
-## Data Semantics
-
-### `exchange.location`
-
-On a product input exchange, `exchange.location` means supply region:
-
-- it is compatible with plain string values;
-- TIDAS/ILCD location category codes are recommended;
-- it does not use `StringMultiLang`;
-- it does not represent exchange amount, unit, or localized label;
-- it must not be mixed with biosphere LCIA geography.
-
-### `annualSupplyOrProductionVolume`
-
-`annualSupplyOrProductionVolume` remains `StringMultiLang` and should satisfy:
-
-```text
-number + space + text
-```
-
-The calculator uses the numeric prefix as the share weight. The trailing text preserves unit, reference-flow, or statistical-scope information. Data producers should keep provider volumes comparable for the same product/reference flow.
-
-## Scope and Boundaries
-
-This method applies to:
-
-- provider allocation for product flows;
-- multiple providers of the same product/reference flow within one geography tier;
-- input exchanges that need explicit or default supply-region semantics;
-- datasets where annual supply or production volume is a relative supply-scale signal;
-- snapshot construction that needs a regional supply mix without materializing market processes.
-
-This method does not apply to:
-
-- elementary-flow biosphere matrix construction;
-- provider sets whose annual volume units or statistical scopes are not comparable;
-- user-facing models that require explicit market nodes;
-- market modeling that requires trade, import, price, loss, or transformation processes;
-- cases where `exchange.location` is used as LCIA geography rather than product-input supply region.
-
-## Diagnostics
-
-Provider-link diagnostics should record at least:
-
-- source of the supply-region anchor: `exchange.location`, consumer process location, or unspecified;
-- reference-output status and eligibility outcome for each same-flow output;
-- selected geography tier;
-- provider candidates and final provider set;
-- annual-volume parse status for each provider;
-- raw weight, normalized share, and fallback-to-one flag;
-- no-provider, self-loop, provider-loop, and singular-risk behavior;
-- whether matrix entries conserve the input demand after allocation.
-
-These diagnostics are part of the method's external interpretability. Because the market mix is not materialized as a separate process, provider allocation diagnostics are the main way users inspect the resulting supply mix.
+An implicit mix is a calculation-time routing policy, not a standalone market dataset. It must not be interpreted as a persisted market Process, procurement relationship, or statistical supply chain. Model a complete explicit Process when a reusable, publishable market identity is required.
