@@ -2253,8 +2253,12 @@ pub(crate) async fn handle_lcia_result_package_build_worker_job(
     };
 
     let result_job_id = *build_id;
-    let request_roots = lcia_result_package_request_roots(input_manifest)?;
-    let (snapshot_id, snapshot_source) = if package_snapshot_execution_mode(*closure_check_id)
+    let snapshot_execution_mode = package_snapshot_execution_mode(*closure_check_id);
+    let request_roots = lcia_result_package_request_roots(
+        input_manifest,
+        snapshot_execution_mode == PackageSnapshotExecutionMode::LegacyLiveBuild,
+    )?;
+    let (snapshot_id, snapshot_source) = if snapshot_execution_mode
         == PackageSnapshotExecutionMode::CertifiedReuse
     {
         let snapshot_id = closure_snapshot_id
@@ -3673,6 +3677,7 @@ fn build_single_rhs(process_count: usize, process_index: usize, amount: f64) -> 
 
 fn lcia_result_package_request_roots(
     input_manifest: &Value,
+    require_published_state: bool,
 ) -> anyhow::Result<Vec<RequestRootProcess>> {
     let processes = input_manifest
         .get("processes")
@@ -3706,14 +3711,16 @@ fn lcia_result_package_request_roots(
         let state_code = process
             .get("stateCode")
             .or_else(|| process.get("state_code"))
-            .and_then(Value::as_i64)
-            .ok_or_else(|| {
+            .and_then(Value::as_i64);
+        if require_published_state {
+            let state_code = state_code.ok_or_else(|| {
                 anyhow::anyhow!("LCIA result package process[{idx}] is missing stateCode")
             })?;
-        if !(100..=199).contains(&state_code) {
-            return Err(anyhow::anyhow!(
-                "LCIA result package process[{idx}] must use a published process state, got {state_code}"
-            ));
+            if !(100..=199).contains(&state_code) {
+                return Err(anyhow::anyhow!(
+                    "LCIA result package process[{idx}] must use a published process state, got {state_code}"
+                ));
+            }
         }
 
         roots.push(RequestRootProcess::new(process_id, process_version));
@@ -4000,7 +4007,7 @@ mod tests {
             ]
         });
 
-        let roots = lcia_result_package_request_roots(&manifest).expect("roots");
+        let roots = lcia_result_package_request_roots(&manifest, true).expect("roots");
 
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0].process_id, process_id);
@@ -4019,9 +4026,50 @@ mod tests {
             ]
         });
 
-        let err = lcia_result_package_request_roots(&manifest).expect_err("draft rejected");
+        let err = lcia_result_package_request_roots(&manifest, true).expect_err("draft rejected");
 
         assert!(err.to_string().contains("published process state"));
+    }
+
+    #[test]
+    fn certified_package_manifest_uses_exact_axis_without_live_state() {
+        let process_id = Uuid::new_v4();
+        let manifest = json!({
+            "predicateVersion": "published-state-code-100-199:v1",
+            "selectionMode": "closure_certificate",
+            "processes": [{"id": process_id, "version": "01.00.000"}]
+        });
+
+        let roots = lcia_result_package_request_roots(&manifest, false)
+            .expect("certificate-owned exact process axis");
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].process_id, process_id);
+        assert_eq!(roots[0].process_version, "01.00.000");
+
+        let error = lcia_result_package_request_roots(&manifest, true)
+            .expect_err("legacy live build still requires a published state");
+        assert!(error.to_string().contains("missing stateCode"));
+
+        let mut forged_state = manifest;
+        forged_state["processes"][0]["stateCode"] = json!(0);
+        let forged_roots = lcia_result_package_request_roots(&forged_state, false)
+            .expect("certified path ignores client-style state metadata");
+        assert_eq!(forged_roots, roots);
+    }
+
+    #[test]
+    fn legacy_package_manifest_rejects_non_public_inputs() {
+        let manifest = json!({
+            "processes": [{
+                "id": Uuid::new_v4(),
+                "version": "01.00.000",
+                "stateCode": 200
+            }]
+        });
+
+        let error = lcia_result_package_request_roots(&manifest, true)
+            .expect_err("non-public legacy input rejected");
+        assert!(error.to_string().contains("published process state"));
     }
 
     #[test]
