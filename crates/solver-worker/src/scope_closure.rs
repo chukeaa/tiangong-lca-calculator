@@ -1676,6 +1676,7 @@ pub struct ScopeClosureEvidence {
     pub source_fingerprint: String,
     pub resolution_map_hash: String,
     pub closure_bundle_hash: String,
+    pub closure_bundle_artifact_id: Uuid,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2017,6 +2018,7 @@ fn administrative_only_evidence(
     source_fingerprint: String,
     resolution_map_hash: String,
     closure_bundle_hash: String,
+    closure_bundle_artifact_id: Uuid,
     report_artifact_manifest_hash: String,
 ) -> ScopeClosureEvidence {
     ScopeClosureEvidence {
@@ -2024,6 +2026,7 @@ fn administrative_only_evidence(
         source_fingerprint,
         resolution_map_hash,
         closure_bundle_hash,
+        closure_bundle_artifact_id,
         snapshot_id: None,
         snapshot_hash: None,
         snapshot_artifact_id: None,
@@ -2039,6 +2042,7 @@ fn evidence_from_snapshot_facts(
     source_fingerprint: String,
     resolution_map_hash: String,
     closure_bundle_hash: String,
+    closure_bundle_artifact_id: Uuid,
     report_artifact_manifest_hash: String,
     facts: &ScopeClosureSnapshotFacts,
 ) -> ScopeClosureEvidence {
@@ -2046,6 +2050,7 @@ fn evidence_from_snapshot_facts(
         source_fingerprint.as_str(),
         resolution_map_hash.as_str(),
         closure_bundle_hash.as_str(),
+        closure_bundle_artifact_id,
         facts,
     );
     ScopeClosureEvidence {
@@ -2053,6 +2058,7 @@ fn evidence_from_snapshot_facts(
         source_fingerprint,
         resolution_map_hash,
         closure_bundle_hash,
+        closure_bundle_artifact_id,
         snapshot_id: Some(facts.snapshot_id),
         snapshot_hash: Some(facts.snapshot_hash.clone()),
         snapshot_artifact_id: Some(facts.snapshot_artifact_id),
@@ -2391,6 +2397,7 @@ pub async fn execute_scope_closure_job(
             source_fingerprint,
             resolution_map_hash,
             closure_bundle_hash,
+            closure_bundle_artifact_id,
             report_artifact_manifest_hash,
             &facts,
         );
@@ -2401,6 +2408,7 @@ pub async fn execute_scope_closure_job(
                 source_fingerprint,
                 resolution_map_hash,
                 closure_bundle_hash,
+                closure_bundle_artifact_id,
                 report_artifact_manifest_hash,
             ),
             None,
@@ -2595,6 +2603,8 @@ async fn reuse_completed_scan_execution(
         source_fingerprint: required_json_text(evidence_json, "sourceFingerprint")?,
         resolution_map_hash: required_json_text(evidence_json, "resolutionMapHash")?,
         closure_bundle_hash: required_json_text(evidence_json, "closureBundleHash")?,
+        closure_bundle_artifact_id: required_json_text(evidence_json, "closureBundleArtifactId")?
+            .parse()?,
         snapshot_id: Some(required_json_text(evidence_json, "snapshotId")?.parse()?),
         snapshot_hash: Some(required_json_text(evidence_json, "snapshotHash")?),
         snapshot_artifact_id: Some(
@@ -2882,6 +2892,7 @@ async fn record_scope_closure_result_v3(
     closure_bundle_artifact_id: Uuid,
     snapshot_artifact_id: Option<Uuid>,
 ) -> anyhow::Result<Value> {
+    ensure_closure_bundle_artifact_projection(evidence, closure_bundle_artifact_id)?;
     let issues = issues.iter().map(issue_rpc_projection).collect::<Vec<_>>();
     record_scope_closure_result_v3_raw(
         pool,
@@ -2900,6 +2911,19 @@ async fn record_scope_closure_result_v3(
         snapshot_artifact_id,
     )
     .await
+}
+
+fn ensure_closure_bundle_artifact_projection(
+    evidence: &ScopeClosureEvidence,
+    rpc_argument: Uuid,
+) -> anyhow::Result<()> {
+    if evidence.closure_bundle_artifact_id != rpc_argument {
+        return Err(anyhow::anyhow!(
+            "scope closure evidence bundle artifact differs from the record_result_v3 argument: evidence={} argument={rpc_argument}",
+            evidence.closure_bundle_artifact_id
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4786,6 +4810,7 @@ mod tests {
             "1".repeat(64),
             "2".repeat(64),
             "3".repeat(64),
+            id("90909090-9090-4090-8090-909090909090"),
             "4".repeat(64),
         );
         assert_eq!(evidence.snapshot_id, None);
@@ -4828,15 +4853,21 @@ mod tests {
         let source_fingerprint = "1".repeat(64);
         let resolution_map_hash = "2".repeat(64);
         let closure_bundle_hash = "3".repeat(64);
+        let closure_bundle_artifact_id = id("94949494-9494-4494-8494-949494949494");
         let evidence = evidence_from_snapshot_facts(
             source_fingerprint.clone(),
             resolution_map_hash.clone(),
             closure_bundle_hash.clone(),
+            closure_bundle_artifact_id,
             "4".repeat(64),
             &facts,
         );
 
         assert_eq!(evidence.schema_version, "lcia.scope-closure-evidence.v2");
+        assert_eq!(
+            evidence.closure_bundle_artifact_id,
+            closure_bundle_artifact_id
+        );
         assert_eq!(evidence.snapshot_id, Some(facts.snapshot_id));
         assert_eq!(
             evidence.snapshot_hash.as_deref(),
@@ -4864,8 +4895,37 @@ mod tests {
                 source_fingerprint.as_str(),
                 resolution_map_hash.as_str(),
                 closure_bundle_hash.as_str(),
+                closure_bundle_artifact_id,
                 &facts,
             ))
+        );
+        assert_ne!(
+            evidence.evidence_hash,
+            Some(scope_closure_evidence_hash(
+                source_fingerprint.as_str(),
+                resolution_map_hash.as_str(),
+                closure_bundle_hash.as_str(),
+                id("95959595-9595-4595-8595-959595959595"),
+                &facts,
+            ))
+        );
+
+        let mut missing_bundle_artifact_id = serde_json::to_value(&evidence).unwrap();
+        missing_bundle_artifact_id
+            .as_object_mut()
+            .unwrap()
+            .remove("closureBundleArtifactId");
+        assert!(
+            serde_json::from_value::<ScopeClosureEvidence>(missing_bundle_artifact_id).is_err()
+        );
+        ensure_closure_bundle_artifact_projection(&evidence, closure_bundle_artifact_id)
+            .expect("evidence and record_result_v3 projection agree");
+        assert!(
+            ensure_closure_bundle_artifact_projection(
+                &evidence,
+                id("96969696-9696-4696-8696-969696969696")
+            )
+            .is_err()
         );
     }
 

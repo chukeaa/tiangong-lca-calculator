@@ -2727,14 +2727,16 @@ pub(crate) fn scope_closure_evidence_hash(
     source_fingerprint: &str,
     resolution_map_hash: &str,
     closure_bundle_hash: &str,
+    closure_bundle_artifact_id: Uuid,
     facts: &ScopeClosureSnapshotFacts,
 ) -> String {
     hex::encode(Sha256::digest(
         format!(
-            "lcia.scope-closure-evidence.v2\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            "lcia.scope-closure-evidence.v2\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             source_fingerprint,
             resolution_map_hash,
             closure_bundle_hash,
+            closure_bundle_artifact_id,
             facts.snapshot_id,
             facts.snapshot_hash,
             facts.snapshot_artifact_id,
