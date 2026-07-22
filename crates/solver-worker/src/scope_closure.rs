@@ -1499,6 +1499,35 @@ fn coalesce_issues(issues: Vec<ClosureIssue>) -> Vec<ClosureIssue> {
     output.into_values().collect()
 }
 
+fn normalize_database_issue_severities(issues: &mut [ClosureIssue]) -> anyhow::Result<()> {
+    for issue in issues {
+        issue.severity = match (issue.blocking, issue.severity.as_str()) {
+            (true, "blocker" | "error" | "fatal") => "blocker".to_owned(),
+            (false, "warning") => "warning".to_owned(),
+            (false, "info") => "info".to_owned(),
+            (true, severity @ ("warning" | "info")) => {
+                return Err(anyhow::anyhow!(
+                    "blocking closure issue {} cannot use non-blocking severity {severity}",
+                    issue.issue_code
+                ));
+            }
+            (false, severity @ ("blocker" | "error" | "fatal")) => {
+                return Err(anyhow::anyhow!(
+                    "non-blocking closure issue {} cannot use blocking severity {severity}",
+                    issue.issue_code
+                ));
+            }
+            (_, severity) => {
+                return Err(anyhow::anyhow!(
+                    "closure issue {} has unsupported severity {severity}",
+                    issue.issue_code
+                ));
+            }
+        };
+    }
+    Ok(())
+}
+
 async fn fetch_exact_documents(
     pool: &PgPool,
     identities: &[ExactDatasetIdentity],
@@ -2244,6 +2273,8 @@ pub async fn execute_scope_closure_job(
         scan.issues.sort_by_key(canonical_value);
     }
 
+    normalize_database_issue_severities(&mut scan.issues)?;
+    scan.issues.sort_by_key(canonical_value);
     let (closure_bundle_bytes, closure_bundle_hash) =
         build_closure_bundle(&input, &validation, &scan)?;
     let source_fingerprint = source_fingerprint(&scan.documents)?;
@@ -4849,5 +4880,32 @@ mod tests {
             multiple.build().sql(),
             "SELECT id, btrim(version::text) AS version, COALESCE(json, json_ordered::jsonb) AS document FROM public.lciamethods WHERE (id, btrim(version::text)) IN (($1, $2), ($3, $4)) ORDER BY id, btrim(version::text)"
         );
+    }
+
+    #[test]
+    fn database_issue_projection_normalizes_only_supported_severities() {
+        let target = identity(
+            DatasetCategory::Processes,
+            "98989898-9898-9898-9898-989898989898",
+        );
+        let mut blocking = missing_dataset_issue(&target, true);
+        blocking.severity = "error".to_owned();
+        let mut warning = blocking.clone();
+        warning.blocking = false;
+        warning.severity = "warning".to_owned();
+        let mut info = warning.clone();
+        info.severity = "info".to_owned();
+        let mut issues = vec![blocking, warning, info];
+
+        normalize_database_issue_severities(&mut issues).expect("supported projection");
+        assert_eq!(issues[0].severity, "blocker");
+        assert_eq!(issues[1].severity, "warning");
+        assert_eq!(issues[2].severity, "info");
+
+        issues[1].severity = "error".to_owned();
+        assert!(normalize_database_issue_severities(&mut issues).is_err());
+        issues[1].severity = "warning".to_owned();
+        issues[2].severity = "unknown".to_owned();
+        assert!(normalize_database_issue_severities(&mut issues).is_err());
     }
 }
