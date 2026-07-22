@@ -184,10 +184,11 @@ impl RequestedScopeManifest {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ScopeClosureWorkerInput {
     pub closure_check_id: Uuid,
     pub scan_execution_id: Uuid,
+    pub numerical_snapshot_id: Uuid,
     pub requested_scope: RequestedScopeManifest,
     pub requested_scope_hash: String,
     pub policy_fingerprint: String,
@@ -2364,10 +2365,9 @@ pub async fn execute_scope_closure_job(
             input.data_snapshot_token.as_str(),
             closure_bundle_hash.as_str(),
         )?;
-        let requested_snapshot_id = deterministic_uuid_from_hash(closure_bundle_hash.as_str())?;
         let built = run_scope_closure_snapshot_builder(
             state,
-            requested_snapshot_id,
+            input.numerical_snapshot_id,
             frozen_process_axis.as_slice(),
             &ScopeClosureSnapshotBuilderArgs {
                 mode: ScopeClosureSnapshotBuilderMode::Build,
@@ -2376,6 +2376,10 @@ pub async fn execute_scope_closure_job(
             },
         )
         .await?;
+        ensure_preallocated_snapshot_identity(
+            input.numerical_snapshot_id,
+            built.resolved_snapshot_id,
+        )?;
         let facts = fetch_scope_closure_snapshot_facts(
             state,
             built.resolved_snapshot_id,
@@ -3985,6 +3989,15 @@ fn deterministic_uuid_from_hash(hash: &str) -> anyhow::Result<Uuid> {
     Ok(Uuid::from_bytes(uuid_bytes))
 }
 
+fn ensure_preallocated_snapshot_identity(expected: Uuid, resolved: Uuid) -> anyhow::Result<()> {
+    if expected != resolved {
+        return Err(anyhow::anyhow!(
+            "scope closure snapshot builder changed the database-preallocated identity: expected={expected} got={resolved}"
+        ));
+    }
+    Ok(())
+}
+
 /// Verifies that a package-build payload is bound to reusable frozen evidence.
 pub async fn validate_package_closure_binding(
     pool: &PgPool,
@@ -4166,6 +4179,39 @@ mod tests {
 
     fn id(value: &str) -> Uuid {
         value.parse().unwrap()
+    }
+
+    fn scope_closure_worker_input_json() -> Value {
+        json!({
+            "closureCheckId": "10101010-1010-4010-8010-101010101010",
+            "scanExecutionId": "20202020-2020-4020-8020-202020202020",
+            "numericalSnapshotId": "30303030-3030-4030-8030-303030303030",
+            "requestedScope": {
+                "schemaVersion": "lcia.scope-manifest.v1",
+                "coverageMode": "subset",
+                "eligibilityPredicateVersion": "published-state-code-100-199:v1",
+                "processes": [],
+                "lciaMethods": [],
+                "versionResolutionPolicy": "reference-version-resolution-v1",
+                "legacyOmittedVersionPolicy": "reject",
+                "certificateFreshnessPolicy": "frozen-artifact-reusable-v1",
+                "linkPolicy": {
+                    "linkSemanticsVersion": "signed-flow-balance-v1",
+                    "flowIdentityPolicy": "exact-flow-version-reference-unit-v2",
+                    "allocationSemanticsVersion": "tidas-reference-allocation-v3",
+                    "technosphereBoundaryPolicy": "closed",
+                    "providerUniversePolicy": "scope_only"
+                }
+            },
+            "requestedScopeHash": "1".repeat(64),
+            "policyFingerprint": "2".repeat(64),
+            "dataSnapshotToken": "3".repeat(64),
+            "dataSnapshotManifest": {},
+            "dataSnapshotManifestHash": "4".repeat(64),
+            "publicationEpoch": 1,
+            "expectedValidatorScannerFingerprint": "scope-closure-validator-scanner.v1",
+            "requestFingerprint": "5".repeat(64)
+        })
     }
 
     fn identity(category: DatasetCategory, value: &str) -> ExactDatasetIdentity {
@@ -4907,5 +4953,44 @@ mod tests {
         issues[1].severity = "warning".to_owned();
         issues[2].severity = "unknown".to_owned();
         assert!(normalize_database_issue_severities(&mut issues).is_err());
+    }
+
+    #[test]
+    fn worker_input_requires_the_database_preallocated_snapshot_identity() {
+        let value = scope_closure_worker_input_json();
+        let input: ScopeClosureWorkerInput =
+            serde_json::from_value(value.clone()).expect("exact database worker input");
+        assert_eq!(
+            input.numerical_snapshot_id,
+            id("30303030-3030-4030-8030-303030303030")
+        );
+
+        let mut missing = value.clone();
+        missing
+            .as_object_mut()
+            .expect("worker input object")
+            .remove("numericalSnapshotId");
+        assert!(serde_json::from_value::<ScopeClosureWorkerInput>(missing).is_err());
+
+        let mut unknown = value;
+        unknown
+            .as_object_mut()
+            .expect("worker input object")
+            .insert("unexpectedField".to_owned(), json!(true));
+        assert!(serde_json::from_value::<ScopeClosureWorkerInput>(unknown).is_err());
+    }
+
+    #[test]
+    fn final_builder_must_preserve_the_database_preallocated_snapshot_identity() {
+        let expected = id("40404040-4040-4040-8040-404040404040");
+        ensure_preallocated_snapshot_identity(expected, expected)
+            .expect("matching preallocated snapshot identity");
+
+        let error = ensure_preallocated_snapshot_identity(
+            expected,
+            id("50505050-5050-4050-8050-505050505050"),
+        )
+        .expect_err("builder identity drift must fail closed");
+        assert!(error.to_string().contains("database-preallocated identity"));
     }
 }
