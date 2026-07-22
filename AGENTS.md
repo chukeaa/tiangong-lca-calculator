@@ -42,7 +42,7 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-22
-lastReviewedCommit: 084843a069459c60c14cc2e99fe7d5374b375c8a
+lastReviewedCommit: ba78268a2b5352058ac0ed7287841cb0615f6ce1
 lastReviewedNote: "Added the Issue #139 certificate-grade scope-closure execution, immutable public-release boundary, and package-build evidence-binding contract."
 related:
   - .docpact/config.yaml
