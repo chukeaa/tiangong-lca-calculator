@@ -25,7 +25,7 @@ checkPaths:
   - docs/agents/repo-architecture.md
   - docs/agents/repo-validation.md
 lastReviewedAt: 2026-07-22
-lastReviewedCommit: bc40e015e60effd62fd159f1a61cb99b09a5556b
+lastReviewedCommit: 9990d44
 lastReviewedNote: "Added the Issue #139 certificate-grade scope-closure executor and package-build evidence binding."
 related:
   - AGENTS.md

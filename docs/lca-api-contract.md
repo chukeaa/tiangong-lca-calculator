@@ -24,7 +24,7 @@ checkPaths:
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
 lastReviewedAt: 2026-07-22
-lastReviewedCommit: bc40e015e60effd62fd159f1a61cb99b09a5556b
+lastReviewedCommit: 9990d44
 lastReviewedNote: "Added Issue #139 scope-closure job/result semantics and certificate-bound package Build V2 consumption."
 related:
   - AGENTS.md

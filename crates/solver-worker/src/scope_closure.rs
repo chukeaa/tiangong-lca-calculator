@@ -293,7 +293,7 @@ pub struct ReferenceExtractionResult {
     pub issues: Vec<ReferenceExtractionIssue>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClosureIssue {
     pub issue_key: String,
@@ -309,9 +309,22 @@ pub struct ClosureIssue {
     pub message: String,
     pub suggested_action: Option<String>,
     pub occurrence_count: u32,
+    #[serde(default)]
+    pub occurrences: Vec<ClosureIssueOccurrence>,
     pub affected_roots: Vec<ExactDatasetIdentity>,
     pub affected_root_witness_paths: Vec<Vec<ExactDatasetIdentity>>,
     pub witness_path: Vec<ExactDatasetIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClosureIssueOccurrence {
+    pub occurrence_key: String,
+    pub source: Option<ExactDatasetIdentity>,
+    pub json_path: Option<String>,
+    pub reference_role: Option<String>,
+    #[serde(default)]
+    pub details: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -444,12 +457,11 @@ impl ScopeClosureProvider for PgScopeClosureProvider<'_> {
         &self,
         identities: &[ExactDatasetIdentity],
     ) -> anyhow::Result<ProviderFetchResult> {
-        let allowed = identities
-            .iter()
-            .filter(|identity| self.snapshot_universe.contains_key(*identity))
-            .cloned()
-            .collect::<Vec<_>>();
-        let live_documents = fetch_exact_documents(self.pool, &allowed).await?;
+        // Read the exact requested identities, including identities absent from
+        // the release allowlist.  We never accept a live-only row, but observing
+        // it is required to distinguish an ineligible substitution (incomplete)
+        // from a complete negative exact-version finding.
+        let live_documents = fetch_exact_documents(self.pool, identities).await?;
         enforce_snapshot_boundary(identities, &self.snapshot_universe, live_documents)
     }
 
@@ -481,13 +493,15 @@ fn enforce_snapshot_boundary(
     let mut result = ProviderFetchResult::default();
     for identity in identities {
         let Some(snapshot_entry) = snapshot_universe.get(identity) else {
-            result.issues.push(provider_boundary_issue(
-                "snapshot_dataset_not_allowed",
-                identity,
-                "The exact dataset is absent from the frozen public-release manifest.",
-                &json!({"snapshotAllowed": false}),
-            ));
-            result.incomplete_identities.insert(identity.clone());
+            if live_by_identity.contains_key(identity) {
+                result.issues.push(provider_boundary_issue(
+                    "snapshot_dataset_not_allowed",
+                    identity,
+                    "A live exact dataset exists but is absent from the frozen public-release manifest.",
+                    &json!({"snapshotAllowed": false, "liveOnly": true}),
+                ));
+                result.incomplete_identities.insert(identity.clone());
+            }
             continue;
         };
         let Some(document) = live_by_identity.get(identity).cloned() else {
@@ -757,7 +771,7 @@ async fn collect_scope_closure<P: ScopeClosureProvider>(
     let mut documents = BTreeMap::<ExactDatasetIdentity, ClosureDocument>::new();
     let mut graph = BTreeMap::<ExactDatasetIdentity, BTreeSet<ExactDatasetIdentity>>::new();
     let mut edges = Vec::new();
-    let mut resolved_references = Vec::new();
+    let mut resolved_references = Vec::<ResolvedReference>::new();
     let mut omitted_version_resolutions = Vec::new();
     let mut raw_issues = Vec::<ClosureIssue>::new();
     let mut complete = true;
@@ -784,7 +798,11 @@ async fn collect_scope_closure<P: ScopeClosureProvider>(
         for requested in batch {
             let Some(document) = fetched_map.get(&requested).cloned() else {
                 if !incomplete_identities.contains(&requested) {
-                    raw_issues.push(missing_dataset_issue(&requested));
+                    let explicitly_requested = resolved_references.iter().any(|reference| {
+                        reference.target == requested
+                            && reference.requested_version_state == "explicit"
+                    });
+                    raw_issues.push(missing_dataset_issue(&requested, explicitly_requested));
                 }
                 continue;
             };
@@ -810,7 +828,7 @@ async fn collect_scope_closure<P: ScopeClosureProvider>(
                     (Some(id), "explicit", Some(version)) => Some(ExactDatasetIdentity {
                         category: target_category,
                         id,
-                        version: version.to_owned(),
+                        version: normalize_exact_version(version)?,
                     }),
                     (Some(id), "omitted", _) => {
                         let resolution = provider
@@ -875,6 +893,7 @@ async fn collect_scope_closure<P: ScopeClosureProvider>(
     edges.sort_by_key(canonical_value);
     resolved_references.sort();
     omitted_version_resolutions.sort_by_key(canonical_value);
+    attach_reference_occurrences(&mut raw_issues, &resolved_references);
     let mut issues = coalesce_issues(raw_issues);
     for issue in &mut issues {
         if let Some(source) = issue.source.as_ref() {
@@ -884,7 +903,7 @@ async fn collect_scope_closure<P: ScopeClosureProvider>(
             issue.affected_root_witness_paths = witnesses;
         }
     }
-    issues.sort();
+    issues.sort_by_key(canonical_value);
 
     Ok(ScopeClosureScan {
         schema_version: "lcia.scope-closure-scan.v1".to_owned(),
@@ -901,6 +920,46 @@ async fn collect_scope_closure<P: ScopeClosureProvider>(
         frontier: Vec::new(),
         provider_universe: scheduled.into_iter().collect(),
     })
+}
+
+fn attach_reference_occurrences(issues: &mut [ClosureIssue], references: &[ResolvedReference]) {
+    for issue in issues {
+        let Some(target) = issue.source.as_ref().filter(|source| {
+            issue.requested_target_id == Some(source.id)
+                && issue.requested_target_version.as_deref() == Some(source.version.as_str())
+        }) else {
+            continue;
+        };
+        let mut occurrences = references
+            .iter()
+            .filter(|reference| &reference.target == target)
+            .map(|reference| ClosureIssueOccurrence {
+                occurrence_key: canonical_json_sha256(&json!({
+                    "issueKey": issue.issue_key,
+                    "source": reference.source,
+                    "jsonPath": reference.json_path,
+                    "referenceRole": reference.reference_role,
+                }))
+                .unwrap_or_else(|_| Uuid::new_v4().simple().to_string()),
+                source: Some(reference.source.clone()),
+                json_path: Some(reference.json_path.clone()),
+                reference_role: Some(reference.reference_role.clone()),
+                details: json!({
+                    "requestedVersionState": reference.requested_version_state,
+                    "target": reference.target,
+                }),
+            })
+            .collect::<Vec<_>>();
+        occurrences.sort_by(|left, right| left.occurrence_key.cmp(&right.occurrence_key));
+        occurrences.dedup_by(|left, right| left.occurrence_key == right.occurrence_key);
+        if !occurrences.is_empty() {
+            issue.occurrence_count = u32::try_from(occurrences.len()).unwrap_or(u32::MAX);
+            issue.reference_role = occurrences
+                .first()
+                .and_then(|occurrence| occurrence.reference_role.clone());
+            issue.occurrences = occurrences;
+        }
+    }
 }
 
 fn affected_roots_and_witness(
@@ -950,7 +1009,7 @@ fn populate_affected_roots(scan: &mut ScopeClosureScan) {
             issue.affected_root_witness_paths = witnesses;
         }
     }
-    scan.issues.sort();
+    scan.issues.sort_by_key(canonical_value);
 }
 
 #[must_use]
@@ -1176,6 +1235,15 @@ fn validate_version(version: &str) -> anyhow::Result<()> {
     }
 }
 
+fn normalize_exact_version(version: &str) -> anyhow::Result<String> {
+    validate_version(version)?;
+    if version.matches('.').count() == 1 {
+        Ok(format!("{version}.000"))
+    } else {
+        Ok(version.to_owned())
+    }
+}
+
 fn parse_category(value: &str) -> anyhow::Result<DatasetCategory> {
     match value {
         "contacts" => Ok(DatasetCategory::Contacts),
@@ -1204,7 +1272,7 @@ fn extraction_issue(
     }))
     .unwrap_or_else(|_| Uuid::new_v4().simple().to_string());
     ClosureIssue {
-        issue_key,
+        issue_key: issue_key.clone(),
         severity: "blocker".to_owned(),
         blocking: true,
         issue_code: issue.issue_code.clone(),
@@ -1219,21 +1287,35 @@ fn extraction_issue(
             "Repair the source reference and rerun closure preflight.".to_owned(),
         ),
         occurrence_count: 1,
+        occurrences: vec![ClosureIssueOccurrence {
+            occurrence_key: format!("{issue_key}:0"),
+            source: Some(source.clone()),
+            json_path: Some(issue.json_path.clone()),
+            reference_role: Some(issue.reference_role.clone()),
+            details: issue.details.clone(),
+        }],
         affected_roots: Vec::new(),
         affected_root_witness_paths: Vec::new(),
         witness_path: Vec::new(),
     }
 }
 
-fn missing_dataset_issue(target: &ExactDatasetIdentity) -> ClosureIssue {
-    let issue_key =
-        canonical_json_sha256(&json!({"code": "reference_target_missing", "target": target}))
-            .unwrap_or_else(|_| Uuid::new_v4().simple().to_string());
+fn missing_dataset_issue(
+    target: &ExactDatasetIdentity,
+    explicitly_requested: bool,
+) -> ClosureIssue {
+    let issue_code = if explicitly_requested {
+        "reference_exact_version_missing"
+    } else {
+        "reference_target_missing"
+    };
+    let issue_key = canonical_json_sha256(&json!({"code": issue_code, "target": target}))
+        .unwrap_or_else(|_| Uuid::new_v4().simple().to_string());
     ClosureIssue {
-        issue_key,
+        issue_key: issue_key.clone(),
         severity: "blocker".to_owned(),
         blocking: true,
-        issue_code: "reference_target_missing".to_owned(),
+        issue_code: issue_code.to_owned(),
         source: Some(target.clone()),
         json_path: None,
         reference_role: None,
@@ -1246,6 +1328,13 @@ fn missing_dataset_issue(target: &ExactDatasetIdentity) -> ClosureIssue {
         ),
         suggested_action: Some("Publish or repair the exact referenced revision.".to_owned()),
         occurrence_count: 1,
+        occurrences: vec![ClosureIssueOccurrence {
+            occurrence_key: format!("{issue_key}:0"),
+            source: Some(target.clone()),
+            json_path: None,
+            reference_role: None,
+            details: json!({}),
+        }],
         affected_roots: Vec::new(),
         affected_root_witness_paths: Vec::new(),
         witness_path: Vec::new(),
@@ -1265,7 +1354,7 @@ fn provider_boundary_issue(
     .unwrap_or_else(|_| Uuid::new_v4().simple().to_string());
     let evidence = canonical_value(&details);
     ClosureIssue {
-        issue_key,
+        issue_key: issue_key.clone(),
         severity: "blocker".to_owned(),
         blocking: true,
         issue_code: code.to_owned(),
@@ -1280,6 +1369,13 @@ fn provider_boundary_issue(
             "Recreate the closure request from a consistent published release snapshot.".to_owned(),
         ),
         occurrence_count: 1,
+        occurrences: vec![ClosureIssueOccurrence {
+            occurrence_key: format!("{issue_key}:0"),
+            source: Some(identity.clone()),
+            json_path: None,
+            reference_role: None,
+            details: details.clone(),
+        }],
         affected_roots: Vec::new(),
         affected_root_witness_paths: Vec::new(),
         witness_path: Vec::new(),
@@ -1299,7 +1395,7 @@ fn provider_outside_universe_issue(
     }))
     .unwrap_or_else(|_| Uuid::new_v4().simple().to_string());
     ClosureIssue {
-        issue_key,
+        issue_key: issue_key.clone(),
         severity: "blocker".to_owned(),
         blocking: true,
         issue_code: "provider_outside_scope_universe".to_owned(),
@@ -1316,6 +1412,13 @@ fn provider_outside_universe_issue(
                 .to_owned(),
         ),
         occurrence_count: 1,
+        occurrences: vec![ClosureIssueOccurrence {
+            occurrence_key: format!("{issue_key}:0"),
+            source: Some(source.clone()),
+            json_path: Some(edge.json_path.clone()),
+            reference_role: Some(edge.reference_role.clone()),
+            details: json!({"target": target}),
+        }],
         affected_roots: Vec::new(),
         affected_root_witness_paths: Vec::new(),
         witness_path: Vec::new(),
@@ -1335,7 +1438,7 @@ fn omitted_version_issue(
     }))
     .unwrap_or_else(|_| Uuid::new_v4().simple().to_string());
     ClosureIssue {
-        issue_key,
+        issue_key: issue_key.clone(),
         severity: "blocker".to_owned(),
         blocking: true,
         issue_code: "reference_version_omitted".to_owned(),
@@ -1348,6 +1451,13 @@ fn omitted_version_issue(
         message: "Reference omits @version and the selected policy did not resolve it.".to_owned(),
         suggested_action: Some("Bind the reference to an exact published version.".to_owned()),
         occurrence_count: 1,
+        occurrences: vec![ClosureIssueOccurrence {
+            occurrence_key: format!("{issue_key}:0"),
+            source: Some(source.clone()),
+            json_path: Some(edge.json_path.clone()),
+            reference_role: Some(edge.reference_role.clone()),
+            details: json!({"targetId": target_id}),
+        }],
         affected_roots: Vec::new(),
         affected_root_witness_paths: Vec::new(),
         witness_path: Vec::new(),
@@ -1356,10 +1466,27 @@ fn omitted_version_issue(
 
 fn coalesce_issues(issues: Vec<ClosureIssue>) -> Vec<ClosureIssue> {
     let mut output = BTreeMap::<String, ClosureIssue>::new();
-    for issue in issues {
+    for mut issue in issues {
+        issue
+            .occurrences
+            .sort_by(|left, right| left.occurrence_key.cmp(&right.occurrence_key));
+        issue
+            .occurrences
+            .dedup_by(|left, right| left.occurrence_key == right.occurrence_key);
+        issue.occurrence_count = u32::try_from(issue.occurrences.len()).unwrap_or(u32::MAX);
         output
             .entry(issue.issue_key.clone())
-            .and_modify(|existing| existing.occurrence_count += issue.occurrence_count)
+            .and_modify(|existing| {
+                existing.occurrences.extend(issue.occurrences.clone());
+                existing
+                    .occurrences
+                    .sort_by(|left, right| left.occurrence_key.cmp(&right.occurrence_key));
+                existing
+                    .occurrences
+                    .dedup_by(|left, right| left.occurrence_key == right.occurrence_key);
+                existing.occurrence_count =
+                    u32::try_from(existing.occurrences.len()).unwrap_or(u32::MAX);
+            })
             .or_insert(issue);
     }
     output.into_values().collect()
@@ -1687,7 +1814,7 @@ pub async fn execute_scope_closure_job(
             })),
         )
         .await?;
-    scan.issues.sort();
+    scan.issues.sort_by_key(canonical_value);
 
     progress
         .heartbeat(
@@ -1984,6 +2111,11 @@ async fn reuse_completed_scan_execution(
         "schemaVersion": "lcia.scope-closure-summary.v1",
         "issueCount": issues.len(),
         "blockerCount": issues.iter().filter(|issue| issue.blocking).count(),
+        "evidenceHash": required_json_text(
+            data.get("evidence")
+                .ok_or_else(|| anyhow::anyhow!("reusable scan omitted evidence"))?,
+            "evidenceHash",
+        )?,
         "artifacts": persisted,
         "reusedFromCheckId": completed_check_id,
         "reportArtifactId": report_artifact_id,
@@ -2080,6 +2212,7 @@ fn required_json_text(value: &Value, key: &str) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("reusable scan omitted {key}"))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn load_reused_issues(
     pool: &PgPool,
     completed_check_id: Uuid,
@@ -2091,6 +2224,19 @@ async fn load_reused_issues(
                json_path, reference_role, requested_target_type,
                requested_target_id, requested_target_version, message,
                suggested_action, occurrence_count, affected_root_count,
+               COALESCE((
+                 SELECT jsonb_agg(jsonb_build_object(
+                   'occurrenceKey', o.occurrence_key,
+                   'sourceDatasetType', o.source_dataset_type,
+                   'sourceDatasetId', o.source_dataset_id,
+                   'sourceDatasetVersion', o.source_dataset_version,
+                   'jsonPath', o.json_path,
+                   'referenceRole', o.reference_role,
+                   'details', o.details
+                 ) ORDER BY o.occurrence_key)
+                 FROM public.lcia_scope_closure_issue_occurrences o
+                 WHERE o.closure_issue_id = i.id
+               ), '[]'::jsonb) AS occurrences,
                COALESCE((
                  SELECT jsonb_agg(jsonb_build_object(
                    'datasetType', r.root_dataset_type,
@@ -2157,6 +2303,52 @@ async fn load_reused_issues(
                 .first()
                 .cloned()
                 .unwrap_or_default();
+            let occurrences = row
+                .try_get::<Value, _>("occurrences")?
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|occurrence| {
+                    let source_category = occurrence
+                        .get("sourceDatasetType")
+                        .and_then(Value::as_str)
+                        .map(parse_category)
+                        .transpose()?;
+                    let source_id = occurrence
+                        .get("sourceDatasetId")
+                        .and_then(Value::as_str)
+                        .map(Uuid::parse_str)
+                        .transpose()?;
+                    let source_version = occurrence
+                        .get("sourceDatasetVersion")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let source = match (source_category, source_id, source_version) {
+                        (Some(category), Some(id), Some(version)) => Some(ExactDatasetIdentity {
+                            category,
+                            id,
+                            version,
+                        }),
+                        _ => None,
+                    };
+                    Ok(ClosureIssueOccurrence {
+                        occurrence_key: required_json_text(occurrence, "occurrenceKey")?,
+                        source,
+                        json_path: occurrence
+                            .get("jsonPath")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        reference_role: occurrence
+                            .get("referenceRole")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        details: occurrence
+                            .get("details")
+                            .cloned()
+                            .unwrap_or_else(|| json!({})),
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
             Ok(ClosureIssue {
                 issue_key: row.try_get("issue_key")?,
                 severity: row.try_get("severity")?,
@@ -2171,6 +2363,7 @@ async fn load_reused_issues(
                 message: row.try_get("message")?,
                 suggested_action: row.try_get("suggested_action")?,
                 occurrence_count: u32::try_from(row.try_get::<i32, _>("occurrence_count")?.max(1))?,
+                occurrences,
                 affected_roots,
                 affected_root_witness_paths,
                 witness_path,
@@ -2286,15 +2479,21 @@ async fn record_scope_closure_result_v2_raw(
 }
 
 fn issue_rpc_projection(issue: &ClosureIssue) -> Value {
-    let occurrence = json!({
-        "occurrenceKey": format!("{}:0", issue.issue_key),
-        "sourceDatasetType": issue.source.as_ref().map(|item| item.category.table_name()),
-        "sourceDatasetId": issue.source.as_ref().map(|item| item.id),
-        "sourceDatasetVersion": issue.source.as_ref().map(|item| item.version.as_str()),
-        "jsonPath": issue.json_path,
-        "referenceRole": issue.reference_role,
-        "details": {"witnessPath": issue.witness_path},
-    });
+    let occurrences = issue
+        .occurrences
+        .iter()
+        .map(|occurrence| {
+            json!({
+                "occurrenceKey": occurrence.occurrence_key,
+                "sourceDatasetType": occurrence.source.as_ref().map(|item| item.category.table_name()),
+                "sourceDatasetId": occurrence.source.as_ref().map(|item| item.id),
+                "sourceDatasetVersion": occurrence.source.as_ref().map(|item| item.version.as_str()),
+                "jsonPath": occurrence.json_path,
+                "referenceRole": occurrence.reference_role,
+                "details": occurrence.details,
+            })
+        })
+        .collect::<Vec<_>>();
     let affected_roots = issue
         .affected_roots
         .iter()
@@ -2329,7 +2528,7 @@ fn issue_rpc_projection(issue: &ClosureIssue) -> Value {
         "occurrenceCount": issue.occurrence_count,
         "affectedRootCount": issue.affected_roots.len(),
         "details": {"witnessPath": issue.witness_path},
-        "occurrences": [occurrence],
+        "occurrences": occurrences,
         "affectedRoots": affected_roots,
     })
 }
@@ -2432,23 +2631,44 @@ async fn persist_closure_artifacts(
     artifacts: &[PreparedArtifact],
     content_artifact_manifest_hash: &str,
 ) -> anyhow::Result<BTreeMap<String, Uuid>> {
-    let mut persisted = BTreeMap::new();
+    let write_set_id = Uuid::new_v4();
+    let mut uploaded = Vec::<String>::new();
+    let mut staged = Vec::<(&PreparedArtifact, String)>::new();
     for artifact in artifacts {
         let relative_key = format!(
-            "scope-closure/{closure_check_id}/{}",
+            "scope-closure/{closure_check_id}/{write_set_id}/{}",
             artifact.descriptor.file_name
         );
         let object_key = state.object_store.prefixed_object_key(&relative_key)?;
-        state
+        if let Err(error) = state
             .object_store
             .upload_object_key(
                 object_key.as_str(),
                 artifact.descriptor.content_type.as_str(),
                 artifact.bytes.clone(),
             )
-            .await?;
+            .await
+        {
+            cleanup_uploaded_artifacts(state, &uploaded).await;
+            return Err(error.context("failed to upload closure artifact write set"));
+        }
+        uploaded.push(object_key.clone());
+        staged.push((artifact, object_key));
+    }
+
+    let mut transaction = match state.pool.begin().await {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            cleanup_uploaded_artifacts(state, &uploaded).await;
+            return Err(anyhow::anyhow!(
+                "failed to begin closure artifact metadata transaction: {error}"
+            ));
+        }
+    };
+    let mut persisted = BTreeMap::new();
+    for (artifact, object_key) in &staged {
         let byte_size = i64::try_from(artifact.descriptor.byte_size)?;
-        let row = sqlx::query(
+        let row = match sqlx::query(
             r"
             INSERT INTO public.worker_job_artifacts (
                 job_id, artifact_type, storage_path, content_type, byte_size,
@@ -2466,17 +2686,46 @@ async fn persist_closure_artifacts(
         .bind(json!({
             "schemaVersion": "lcia.scope-closure-artifact.v1",
             "closureCheckId": closure_check_id,
+            "writeSetId": write_set_id,
             "fileName": artifact.descriptor.file_name,
             "contentArtifactManifestHash": content_artifact_manifest_hash,
         }))
-        .fetch_one(&state.pool)
-        .await?;
+        .fetch_one(&mut *transaction)
+        .await
+        {
+            Ok(row) => row,
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                cleanup_uploaded_artifacts(state, &uploaded).await;
+                return Err(anyhow::anyhow!(
+                    "failed to persist closure artifact metadata write set: {error}"
+                ));
+            }
+        };
         persisted.insert(
             artifact.descriptor.artifact_type.clone(),
             row.try_get::<Uuid, _>("id")?,
         );
     }
+    if let Err(error) = transaction.commit().await {
+        cleanup_uploaded_artifacts(state, &uploaded).await;
+        return Err(anyhow::anyhow!(
+            "failed to commit closure artifact metadata write set: {error}"
+        ));
+    }
     Ok(persisted)
+}
+
+async fn cleanup_uploaded_artifacts(state: &AppState, object_keys: &[String]) {
+    for object_key in object_keys {
+        if let Err(error) = state.object_store.delete_object_key(object_key).await {
+            tracing::warn!(
+                object_key,
+                error = %error,
+                "failed to compensate closure artifact upload"
+            );
+        }
+    }
 }
 
 async fn report_artifact_manifest_hash(pool: &PgPool, artifact_id: Uuid) -> anyhow::Result<String> {
@@ -2982,12 +3231,12 @@ fn merge_tidas_validation_issues(scan: &mut ScopeClosureScan, events: &[Value]) 
         }))
         .unwrap_or_else(|_| Uuid::new_v4().simple().to_string());
         scan.issues.push(ClosureIssue {
-            issue_key,
+            issue_key: issue_key.clone(),
             severity: "blocker".to_owned(),
             blocking: true,
             issue_code: format!("tidas_{issue_code}"),
-            source,
-            json_path: location,
+            source: source.clone(),
+            json_path: location.clone(),
             reference_role: None,
             requested_target_type: None,
             requested_target_id: None,
@@ -3001,6 +3250,13 @@ fn merge_tidas_validation_issues(scan: &mut ScopeClosureScan, events: &[Value]) 
                 "Repair the schema-invalid document and rerun closure preflight.".to_owned(),
             ),
             occurrence_count: 1,
+            occurrences: vec![ClosureIssueOccurrence {
+                occurrence_key: format!("{issue_key}:0"),
+                source: source.clone(),
+                json_path: location.clone(),
+                reference_role: None,
+                details: issue,
+            }],
             affected_roots: Vec::new(),
             affected_root_witness_paths: Vec::new(),
             witness_path: Vec::new(),
@@ -3010,20 +3266,51 @@ fn merge_tidas_validation_issues(scan: &mut ScopeClosureScan, events: &[Value]) 
     populate_affected_roots(scan);
 }
 
+#[allow(clippy::too_many_lines)]
 fn build_xlsx_report(closure_check_id: Uuid, issues: &[ClosureIssue]) -> anyhow::Result<Vec<u8>> {
     let cursor = Cursor::new(Vec::new());
     let mut zip = ZipWriter::new(cursor);
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     zip.start_file("[Content_Types].xml", options)?;
-    zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#)?;
+    zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet3.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet4.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#)?;
     zip.start_file("_rels/.rels", options)?;
     zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#)?;
     zip.start_file("xl/workbook.xml", options)?;
-    zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Closure issues" sheetId="1" r:id="rId1"/></sheets></workbook>"#)?;
+    zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Summary" sheetId="1" r:id="rId1"/><sheet name="Closure Issues" sheetId="2" r:id="rId2"/><sheet name="Occurrences" sheetId="3" r:id="rId3"/><sheet name="Affected Datasets" sheetId="4" r:id="rId4"/></sheets></workbook>"#)?;
     zip.start_file("xl/_rels/workbook.xml.rels", options)?;
-    zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#)?;
-    zip.start_file("xl/worksheets/sheet1.xml", options)?;
+    zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet3.xml"/><Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet4.xml"/></Relationships>"#)?;
+
+    let blocker_count = issues.iter().filter(|issue| issue.blocking).count();
+    let warning_count = issues.len().saturating_sub(blocker_count);
+    let occurrence_count = issues
+        .iter()
+        .map(|issue| issue.occurrences.len())
+        .sum::<usize>();
+    let affected_dataset_count = issues
+        .iter()
+        .flat_map(|issue| issue.affected_roots.iter())
+        .collect::<BTreeSet<_>>()
+        .len();
+    write_xlsx_worksheet(
+        &mut zip,
+        options,
+        1,
+        [
+            vec!["Metric".to_owned(), "Value".to_owned()],
+            vec!["Closure check ID".to_owned(), closure_check_id.to_string()],
+            vec!["Issue count".to_owned(), issues.len().to_string()],
+            vec!["Blocker count".to_owned(), blocker_count.to_string()],
+            vec!["Warning count".to_owned(), warning_count.to_string()],
+            vec!["Occurrence count".to_owned(), occurrence_count.to_string()],
+            vec![
+                "Affected dataset count".to_owned(),
+                affected_dataset_count.to_string(),
+            ],
+        ],
+    )?;
+
     let headers = [
+        "Issue key",
         "Issue code",
         "Severity",
         "Message",
@@ -3039,46 +3326,108 @@ fn build_xlsx_report(closure_check_id: Uuid, issues: &[ClosureIssue]) -> anyhow:
         "Affected roots",
         "Suggested action",
     ];
-    let mut xml = String::from(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData>",
-    );
-    append_xlsx_row(
-        &mut xml,
-        1,
-        ["Closure check ID".to_owned(), closure_check_id.to_string()],
-    );
-    append_xlsx_row(&mut xml, 2, headers.iter().map(|value| (*value).to_owned()));
-    for (index, issue) in issues.iter().enumerate() {
+    let mut issue_rows = vec![headers.iter().map(|value| (*value).to_owned()).collect()];
+    for issue in issues {
         let source = issue.source.as_ref();
-        append_xlsx_row(
-            &mut xml,
-            index + 3,
-            [
-                issue.issue_code.clone(),
-                issue.severity.clone(),
-                issue.message.clone(),
+        issue_rows.push(vec![
+            issue.issue_key.clone(),
+            issue.issue_code.clone(),
+            issue.severity.clone(),
+            issue.message.clone(),
+            source
+                .map(|item| item.category.table_name().to_owned())
+                .unwrap_or_default(),
+            source.map(|item| item.id.to_string()).unwrap_or_default(),
+            source.map(|item| item.version.clone()).unwrap_or_default(),
+            issue.json_path.clone().unwrap_or_default(),
+            issue.reference_role.clone().unwrap_or_default(),
+            issue.requested_target_type.clone().unwrap_or_default(),
+            issue
+                .requested_target_id
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
+            issue.requested_target_version.clone().unwrap_or_default(),
+            issue.occurrence_count.to_string(),
+            issue.affected_roots.len().to_string(),
+            issue.suggested_action.clone().unwrap_or_default(),
+        ]);
+    }
+    write_xlsx_worksheet(&mut zip, options, 2, issue_rows)?;
+
+    let mut occurrence_rows = vec![vec![
+        "Issue key".to_owned(),
+        "Occurrence key".to_owned(),
+        "Source type".to_owned(),
+        "Source id".to_owned(),
+        "Source version".to_owned(),
+        "JSON path".to_owned(),
+        "Reference role".to_owned(),
+        "Details".to_owned(),
+    ]];
+    for issue in issues {
+        for occurrence in &issue.occurrences {
+            let source = occurrence.source.as_ref();
+            occurrence_rows.push(vec![
+                issue.issue_key.clone(),
+                occurrence.occurrence_key.clone(),
                 source
                     .map(|item| item.category.table_name().to_owned())
                     .unwrap_or_default(),
                 source.map(|item| item.id.to_string()).unwrap_or_default(),
                 source.map(|item| item.version.clone()).unwrap_or_default(),
-                issue.json_path.clone().unwrap_or_default(),
-                issue.reference_role.clone().unwrap_or_default(),
-                issue.requested_target_type.clone().unwrap_or_default(),
-                issue
-                    .requested_target_id
-                    .map(|id| id.to_string())
-                    .unwrap_or_default(),
-                issue.requested_target_version.clone().unwrap_or_default(),
-                issue.occurrence_count.to_string(),
-                issue.affected_roots.len().to_string(),
-                issue.suggested_action.clone().unwrap_or_default(),
-            ],
-        );
+                occurrence.json_path.clone().unwrap_or_default(),
+                occurrence.reference_role.clone().unwrap_or_default(),
+                canonical_value(&occurrence.details),
+            ]);
+        }
+    }
+    write_xlsx_worksheet(&mut zip, options, 3, occurrence_rows)?;
+
+    let mut affected_rows = vec![vec![
+        "Issue key".to_owned(),
+        "Dataset type".to_owned(),
+        "Dataset id".to_owned(),
+        "Dataset version".to_owned(),
+        "Witness path".to_owned(),
+    ]];
+    for issue in issues {
+        for (index, root) in issue.affected_roots.iter().enumerate() {
+            let witness = issue
+                .affected_root_witness_paths
+                .get(index)
+                .unwrap_or(&issue.witness_path);
+            affected_rows.push(vec![
+                issue.issue_key.clone(),
+                root.category.table_name().to_owned(),
+                root.id.to_string(),
+                root.version.clone(),
+                canonical_value(witness),
+            ]);
+        }
+    }
+    write_xlsx_worksheet(&mut zip, options, 4, affected_rows)?;
+    Ok(zip.finish()?.into_inner())
+}
+
+fn write_xlsx_worksheet<I>(
+    zip: &mut ZipWriter<Cursor<Vec<u8>>>,
+    options: SimpleFileOptions,
+    sheet_number: usize,
+    rows: I,
+) -> anyhow::Result<()>
+where
+    I: IntoIterator<Item = Vec<String>>,
+{
+    zip.start_file(format!("xl/worksheets/sheet{sheet_number}.xml"), options)?;
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData>",
+    );
+    for (index, row) in rows.into_iter().enumerate() {
+        append_xlsx_row(&mut xml, index + 1, row);
     }
     xml.push_str("</sheetData></worksheet>");
     zip.write_all(xml.as_bytes())?;
-    Ok(zip.finish()?.into_inner())
+    Ok(())
 }
 
 fn append_xlsx_row<I>(xml: &mut String, row: usize, values: I)
@@ -3152,6 +3501,7 @@ pub async fn validate_package_closure_binding(
                c.data_snapshot_token, c.source_fingerprint, c.resolution_map_hash,
                c.closure_bundle_hash, c.snapshot_id, c.snapshot_hash,
                c.report_artifact_manifest_hash, c.evidence_hash,
+               c.requested_scope_manifest->>'certificateFreshnessPolicy' AS freshness_policy,
                EXISTS (
                  SELECT 1
                  FROM public.lcia_scope_closure_data_snapshots s
@@ -3176,6 +3526,10 @@ pub async fn validate_package_closure_binding(
     let actual_certificate_hash = row.try_get::<Option<String>, _>("certificate_hash")?;
     let actual_scope_hash = row.try_get::<Option<String>, _>("effective_scope_hash")?;
     let actual_snapshot_token = row.try_get::<String, _>("data_snapshot_token")?;
+    let freshness_policy = row
+        .try_get::<Option<String>, _>("freshness_policy")?
+        .unwrap_or_else(|| "frozen-artifact-reusable-v1".to_owned());
+    let current_release_matches = row.try_get::<bool, _>("current_release_matches")?;
     let complete_evidence = [
         row.try_get::<Option<String>, _>("source_fingerprint")?,
         row.try_get::<Option<String>, _>("resolution_map_hash")?,
@@ -3191,7 +3545,10 @@ pub async fn validate_package_closure_binding(
     if status != "passed"
         || scan_completeness != "complete"
         || certificate_status != "valid"
-        || !row.try_get::<bool, _>("current_release_matches")?
+        || !freshness_policy_accepts_current_release(
+            freshness_policy.as_str(),
+            current_release_matches,
+        )
         || actual_certificate_hash.as_deref() != Some(binding.closure_certificate_hash)
         || actual_scope_hash.as_deref() != Some(binding.effective_scope_hash)
         || actual_snapshot_token != binding.data_snapshot_token
@@ -3213,6 +3570,14 @@ pub async fn validate_package_closure_binding(
         return Err(anyhow::anyhow!("closure_evidence_mismatch"));
     }
     Ok(())
+}
+
+fn freshness_policy_accepts_current_release(policy: &str, current_release_matches: bool) -> bool {
+    match policy {
+        "frozen-artifact-reusable-v1" => true,
+        "current-membership-required-v1" => current_release_matches,
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3469,7 +3834,7 @@ mod tests {
         assert_eq!(scan.documents.len(), 3);
         assert_eq!(scan.edges.len(), 5);
         assert_eq!(scan.issues.len(), 1);
-        assert_eq!(scan.issues[0].issue_code, "reference_target_missing");
+        assert_eq!(scan.issues[0].issue_code, "reference_exact_version_missing");
         assert_eq!(scan.issues[0].affected_roots.len(), 2);
         let fetched = provider.fetches.lock().unwrap();
         assert_eq!(
@@ -3510,7 +3875,7 @@ mod tests {
         assert!(
             scan.issues
                 .iter()
-                .any(|issue| issue.issue_code == "reference_target_missing")
+                .any(|issue| issue.issue_code == "reference_exact_version_missing")
         );
         let omitted = scan
             .issues
@@ -3728,6 +4093,20 @@ mod tests {
         let closure_check_id = Uuid::new_v4();
         let bytes = build_xlsx_report(closure_check_id, &[]).unwrap();
         let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut workbook = String::new();
+        std::io::Read::read_to_string(
+            &mut archive.by_name("xl/workbook.xml").unwrap(),
+            &mut workbook,
+        )
+        .unwrap();
+        for name in [
+            "Summary",
+            "Closure Issues",
+            "Occurrences",
+            "Affected Datasets",
+        ] {
+            assert!(workbook.contains(format!("name=\"{name}\"").as_str()));
+        }
         let mut worksheet = String::new();
         std::io::Read::read_to_string(
             &mut archive.by_name("xl/worksheets/sheet1.xml").unwrap(),
@@ -3735,6 +4114,86 @@ mod tests {
         )
         .unwrap();
         assert!(worksheet.contains(closure_check_id.to_string().as_str()));
+        for sheet_number in 2..=4 {
+            assert!(
+                archive
+                    .by_name(format!("xl/worksheets/sheet{sheet_number}.xml").as_str())
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn short_exact_versions_are_normalized_without_changing_omitted_semantics() {
+        assert_eq!(normalize_exact_version("01.02").unwrap(), "01.02.000");
+        assert_eq!(normalize_exact_version("01.02.003").unwrap(), "01.02.003");
+        assert!(normalize_exact_version("01").is_err());
+    }
+
+    #[test]
+    fn frozen_artifact_freshness_does_not_require_current_membership() {
+        assert!(freshness_policy_accepts_current_release(
+            "frozen-artifact-reusable-v1",
+            false
+        ));
+        assert!(!freshness_policy_accepts_current_release(
+            "current-membership-required-v1",
+            false
+        ));
+        assert!(freshness_policy_accepts_current_release(
+            "current-membership-required-v1",
+            true
+        ));
+        assert!(!freshness_policy_accepts_current_release("unknown", true));
+    }
+
+    #[test]
+    fn coalesced_issue_preserves_each_reference_occurrence() {
+        let target = identity(
+            DatasetCategory::Flows,
+            "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
+        );
+        let mut process_issue = missing_dataset_issue(&target, true);
+        process_issue.occurrences = vec![ClosureIssueOccurrence {
+            occurrence_key: "process-exchange".to_owned(),
+            source: Some(identity(
+                DatasetCategory::Processes,
+                "ffffffff-ffff-ffff-ffff-ffffffffffff",
+            )),
+            json_path: Some("$.exchanges[0]".to_owned()),
+            reference_role: Some("exchange_flow".to_owned()),
+            details: json!({}),
+        }];
+        let mut method_issue = process_issue.clone();
+        method_issue.occurrences = vec![ClosureIssueOccurrence {
+            occurrence_key: "lcia-factor".to_owned(),
+            source: Some(identity(
+                DatasetCategory::Lciamethods,
+                "abababab-abab-abab-abab-abababababab",
+            )),
+            json_path: Some("$.factors[0]".to_owned()),
+            reference_role: Some("lcia_factor_flow".to_owned()),
+            details: json!({}),
+        }];
+
+        let issues = coalesce_issues(vec![process_issue, method_issue]);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].occurrence_count, 2);
+        assert_eq!(
+            issues[0]
+                .occurrences
+                .iter()
+                .filter_map(|occurrence| occurrence.reference_role.as_deref())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["exchange_flow", "lcia_factor_flow"])
+        );
+        assert_eq!(
+            issue_rpc_projection(&issues[0])["occurrences"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]

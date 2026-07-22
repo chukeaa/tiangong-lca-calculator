@@ -40,7 +40,7 @@ checkPaths:
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
 lastReviewedAt: 2026-07-22
-lastReviewedCommit: bc40e015e60effd62fd159f1a61cb99b09a5556b
+lastReviewedCommit: 9990d44
 lastReviewedNote: "Added Issue #139 proof for immutable-release closure traversal, TIDAS parity, artifacts, concurrency, and package certificate binding."
 related:
   - ../../AGENTS.md
