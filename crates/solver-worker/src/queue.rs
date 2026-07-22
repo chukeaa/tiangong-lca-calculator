@@ -451,16 +451,24 @@ async fn process_solver_worker_job(state: &AppState, job: WorkerJob, lease_secon
 
     let execution_result = match &payload {
         JobPayload::LciaResultPackageBuild { .. } => {
-            let closure_binding_result =
-                if job.payload_schema_version == LCIA_RESULT_PACKAGE_BUILD_V2 {
-                    fetch_authoritative_package_closure_binding(&state.pool, job.id)
-                        .await
-                        .and_then(|binding| {
-                            validate_authoritative_package_closure_binding(&payload, &binding)
-                        })
-                } else {
-                    Ok(())
-                };
+            let closure_binding_result = if job.payload_schema_version
+                == LCIA_RESULT_PACKAGE_BUILD_V2
+            {
+                match fetch_authoritative_package_closure_binding(&state.pool, job.id).await {
+                    Ok(binding) => {
+                        match validate_authoritative_package_closure_binding(&payload, &binding) {
+                            Ok(()) => {
+                                validate_authoritative_package_closure_hashes(&state.pool, &binding)
+                                    .await
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
+            } else {
+                Ok(())
+            };
             match closure_binding_result {
                 Ok(()) => handle_lcia_result_package_build_worker_job(state, job.id, &payload)
                     .await
@@ -577,16 +585,6 @@ fn validate_authoritative_package_closure_binding(
         ));
     }
 
-    if canonical_json_sha256(&binding.effective_scope)? != binding.effective_scope_hash {
-        return Err(anyhow::anyhow!(
-            "authoritative effective scope does not match its canonical hash"
-        ));
-    }
-    if canonical_json_sha256(&binding.input_manifest)? != binding.input_manifest_hash {
-        return Err(anyhow::anyhow!(
-            "authoritative input manifest does not match its canonical hash"
-        ));
-    }
     if binding.effective_scope.get("coverageMode")
         != Some(&Value::String(binding.coverage_mode.clone()))
     {
@@ -610,6 +608,37 @@ fn validate_authoritative_package_closure_binding(
     if input_processes != effective_processes {
         return Err(anyhow::anyhow!(
             "package input process axis differs from authoritative effective scope"
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_authoritative_package_closure_hashes(
+    pool: &sqlx::PgPool,
+    binding: &AuthoritativePackageClosureBinding,
+) -> anyhow::Result<()> {
+    let row = sqlx::query(
+        r"
+        WITH _service_role AS (
+            SELECT set_config('request.jwt.claim.role', 'service_role', true)
+        )
+        SELECT public.lcia_scope_closure_sha256($1::jsonb) AS effective_scope_hash,
+               public.lcia_scope_closure_sha256($2::jsonb) AS input_manifest_hash
+        FROM _service_role
+        ",
+    )
+    .bind(&binding.effective_scope)
+    .bind(&binding.input_manifest)
+    .fetch_one(pool)
+    .await?;
+    if row.try_get::<String, _>("effective_scope_hash")? != binding.effective_scope_hash {
+        return Err(anyhow::anyhow!(
+            "authoritative effective scope does not match its database hash"
+        ));
+    }
+    if row.try_get::<String, _>("input_manifest_hash")? != binding.input_manifest_hash {
+        return Err(anyhow::anyhow!(
+            "authoritative input manifest does not match its database hash"
         ));
     }
     Ok(())
