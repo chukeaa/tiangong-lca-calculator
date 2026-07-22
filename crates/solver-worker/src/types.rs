@@ -236,6 +236,41 @@ pub enum JobPayload {
         /// Post-processing manifest, no-op for the MVP package build.
         #[serde(default)]
         postprocess_manifest: Option<Value>,
+        /// Scope-closure certificate consumed without re-running administrative closure.
+        #[serde(default)]
+        closure_check_id: Option<Uuid>,
+        /// Certificate hash calculated and stored by the database completion RPC.
+        #[serde(default)]
+        closure_certificate_hash: Option<String>,
+        /// Hash of the effective exact-version manifest certified by the preflight.
+        #[serde(default)]
+        effective_scope_hash: Option<String>,
+        /// Frozen membership token bound into closure evidence.
+        #[serde(default)]
+        data_snapshot_token: Option<String>,
+        /// Immutable administrative closure snapshot identity.
+        #[serde(default)]
+        snapshot_id: Option<Uuid>,
+        /// Hash of the immutable administrative closure snapshot.
+        #[serde(default)]
+        snapshot_hash: Option<String>,
+        /// Hash of the closure bundle used to produce the snapshot.
+        #[serde(default)]
+        closure_bundle_hash: Option<String>,
+        /// Persisted report artifact metadata hash bound by the certificate.
+        #[serde(default)]
+        report_artifact_manifest_hash: Option<String>,
+    },
+    /// Validate and freeze one immutable data-product scope closure.
+    ScopeClosureCheck {
+        /// Domain identifier in `lcia_scope_closure_checks`.
+        closure_check_id: Uuid,
+        /// Shared immutable scan execution selected by the database request RPC.
+        scan_execution_id: Uuid,
+        /// Frozen membership token included in the job envelope for drift checks.
+        data_snapshot_token: String,
+        /// Stable fingerprint over the complete request contract.
+        request_fingerprint: String,
     },
 }
 

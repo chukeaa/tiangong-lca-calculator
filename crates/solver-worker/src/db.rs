@@ -1715,6 +1715,11 @@ async fn handle_job_payload_with_worker_lease(
                 "lcia_result package build execution requires worker_jobs context"
             ));
         }
+        JobPayload::ScopeClosureCheck { .. } => {
+            return Err(anyhow::anyhow!(
+                "scope closure execution requires worker_jobs context"
+            ));
+        }
     }
 
     Ok(())
@@ -2133,6 +2138,14 @@ pub(crate) async fn handle_lcia_result_package_build_worker_job(
         input_manifest,
         input_manifest_hash,
         default_impact_category,
+        closure_check_id,
+        closure_certificate_hash,
+        effective_scope_hash,
+        data_snapshot_token,
+        snapshot_id: closure_snapshot_id,
+        snapshot_hash: closure_snapshot_hash,
+        closure_bundle_hash,
+        report_artifact_manifest_hash,
         ..
     } = payload
     else {
@@ -2173,6 +2186,16 @@ pub(crate) async fn handle_lcia_result_package_build_worker_job(
             "artifactFormat": artifacts.query_artifact_meta.format.clone(),
         },
         "calculationBundle": artifacts.calculation_bundle.clone(),
+        "scopeClosureEvidence": closure_check_id.map(|closure_check_id| serde_json::json!({
+            "closureCheckId": closure_check_id,
+            "certificateHash": closure_certificate_hash,
+            "effectiveScopeHash": effective_scope_hash,
+            "dataSnapshotToken": data_snapshot_token,
+            "snapshotId": closure_snapshot_id,
+            "snapshotHash": closure_snapshot_hash,
+            "closureBundleHash": closure_bundle_hash,
+            "reportArtifactManifestHash": report_artifact_manifest_hash,
+        })),
     });
 
     let mark_ready = mark_lcia_result_package_ready(
@@ -2198,6 +2221,8 @@ pub(crate) async fn handle_lcia_result_package_build_worker_job(
                 "buildId": build_id,
                 "buildWorkerJobId": build_worker_job_id,
                 "snapshotId": snapshot_id,
+                "closureCheckId": closure_check_id,
+                "closureCertificateHash": closure_certificate_hash,
                 "resultId": artifacts.result_id,
                 "latestAllUnitResultId": artifacts.latest_all_unit_result_id,
             }),

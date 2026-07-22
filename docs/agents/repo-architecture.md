@@ -23,6 +23,7 @@ checkPaths:
   - tools/bw25-validator/**
   - supabase/migrations/**
   - docs/lca-api-contract.md
+  - docs/scope-closure-contract.md
   - docs/matrix-readiness-report-contract.md
   - docs/review-submit-fast-gate-contract.md
   - docs/provider-linking.md
@@ -33,14 +34,15 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-07-21
+lastReviewedAt: 2026-07-22
 lastReviewedCommit: bc40e015e60effd62fd159f1a61cb99b09a5556b
-lastReviewedNote: "Reviewed review-submit gate ownership for Issue #133; the runtime family and crate map are unchanged."
+lastReviewedNote: "Added the Issue #139 scope-closure runtime family, frozen-release source boundary, and certificate-bound package flow."
 related:
   - ../../AGENTS.md
   - ../../.docpact/config.yaml
   - ./repo-validation.md
   - ../../docs/lca-api-contract.md
+  - ../../docs/scope-closure-contract.md
   - ../../docs/matrix-readiness-report-contract.md
   - ../../docs/review-submit-fast-gate-contract.md
 ---
@@ -71,11 +73,13 @@ Keep these constraints in mind before editing `crates/solver-core/**` or worker 
 | `crates/suitesparse-ffi/**` | CSC matrix representation and SuiteSparse bindings |
 | `crates/solver-core/**` | matrix build, factorization cache, solve orchestration, provider matching |
 | `crates/solver-worker/src/**` | queue workers, package worker, snapshot builder, matrix-readiness verification, result persistence |
+| `crates/solver-worker/src/scope_closure.rs` | frozen-release closure traversal, TIDAS validation, evidence artifacts, scan reuse, and package certificate verification |
 | `crates/solver-worker/src/signed_flow.rs` | direction-neutral signed coefficient, reference pivot, boundary policy, and balance-closure primitives |
 | `scripts/**` | manual validation, debug, diagnostics, and snapshot helpers |
 | `tools/bw25-validator/**` | manual Brightway comparison tooling |
 | `supabase/migrations/**` | local runtime-facing SQL expectations referenced by the worker runtime |
 | `docs/lca-api-contract.md` | shared jobs/results/payload/status contract for edge and frontend consumers |
+| `docs/scope-closure-contract.md` | closure traversal, immutable source, validation, artifact, reuse, and build-binding contract |
 | `docs/matrix-readiness-report-contract.md` | worker-owned matrix-readiness report schema, blocker/finding codes, and next-action contract |
 | `docs/review-submit-fast-gate-contract.md` | worker-owned review-submit fast gate schema, blocker codes, and targeted probe contract |
 | `docs/edge-function-integration.md` | edge-facing enqueue, polling, and service-role integration contract |
@@ -99,10 +103,17 @@ The worker currently covers families such as:
 - `analyze_contribution_path`
 - `build_snapshot`
 - `lcia_result_package_build`
+- `lcia.scope_closure_check`
 
 These flows belong to the worker runtime, not to the API repo.
 
-The main solver worker has two queue backends. The default `SOLVER_QUEUE_BACKEND=worker-jobs` path claims `public.worker_jobs` rows from `worker_queue=solver`, maps `job_kind=lca.*` and `job_kind=lcia_result.package_build` payloads back to internal `JobPayload` variants, heartbeats `phase/progress`, records terminal results through `worker_record_job_result`, and links LCA domain rows back to the canonical `worker_jobs` id where applicable. Ordinary solve jobs link `lca_results` / cache / latest / factorization rows; LCIA result package builds use `lca_results` plus `lca_latest_all_unit_results` as the worker-produced artifacts and then mark `lcia_result_packages` preview-ready through the database service-role command. Optional `lca_jobs` rows are best-effort compatibility only for ordinary LCA jobs; production worker_jobs paths must run when `public.lca_jobs` is absent. The `SOLVER_QUEUE_BACKEND=pgmq` path is legacy compatibility/debug only, consumes `pgmq` messages from `PGMQ_QUEUE`, and requires the explicit `ALLOW_LEGACY_JOB_TABLE_BACKEND=true` / `--allow-legacy-job-table-backend` guard.
+The main solver worker has two queue backends. The default `SOLVER_QUEUE_BACKEND=worker-jobs` path claims `public.worker_jobs` rows from `worker_queue=solver`, maps `job_kind=lca.*`, `job_kind=lcia_result.package_build`, and `job_kind=lcia.scope_closure_check` payloads back to internal `JobPayload` variants, heartbeats `phase/progress`, and records lease-fenced terminal results. Ordinary solve jobs link LCA domain rows and use `worker_record_job_result`; scope closure uses its V2 result or reuse-finalizer RPC because that same transaction persists issue provenance, evidence, certificate state, and the terminal Worker result. LCIA result package builds use `lca_results` plus `lca_latest_all_unit_results` as Worker-produced artifacts and then mark `lcia_result_packages` preview-ready through the database service-role command. Optional `lca_jobs` rows are best-effort compatibility only for ordinary LCA jobs; production worker_jobs paths must run when `public.lca_jobs` is absent. The `SOLVER_QUEUE_BACKEND=pgmq` path is legacy compatibility/debug only, consumes `pgmq` messages from `PGMQ_QUEUE`, and requires the explicit `ALLOW_LEGACY_JOB_TABLE_BACKEND=true` / `--allow-legacy-job-table-backend` guard.
+
+### Scope closure and certificate-bound build
+
+`crates/solver-worker/src/scope_closure.rs` owns deterministic union traversal and report production for `lcia.scope_closure_check`. It reads only exact identities from `lcia.scope-closure-data-snapshot.v2`, which is populated from the current public release manifest. Every fetched document is rehashed; an allowlisted missing row, a hash-drifted row, or a live-only row makes the scan incomplete. Bounded breadth-first traversal remains cycle-safe and non-fail-fast, while accepted transitive process providers become part of the effective scope.
+
+The same module invokes TIDAS `document-validation-batch.v1`, keys reusable document evidence by full content and validator fingerprints, writes deterministic bundle/snapshot/JSONL/XLSX artifacts, and coordinates lease-fenced shared scan reuse. Reuse preserves immutable evidence but creates a current-run XLSX, summary, report binding, and certificate. Before `lcia_result.package_build`, the queue validates the full certificate/scope/snapshot/bundle/report binding against the database. The package numerical path is otherwise unchanged. See `docs/scope-closure-contract.md` for the exact contract.
 
 Versioned `public_plus_owner_draft` snapshot builds keep actor visibility limited to process/flow rows and load LCIA methods from the reviewed, release-pinned static cache through `crates/solver-worker/src/static_lcia_cache.rs`. That module owns trusted-base retrieval, byte/decompression limits, raw and canonical hash verification, method/locator alias validation, and streaming factor normalization. `calculation_evidence.rs` owns the v2 source/bundle/25-method coverage binding. Gap evidence is deterministically spooled as JSONL rather than retained as an exchange-by-method object graph. Build-snapshot terminal projection comes from canonical `worker_jobs` diagnostics, including reuse-resolved snapshot ID and evidence, so optional `lca_jobs` is never required. Singular/factorization diagnostics use only the exact process/version pairs in the snapshot index.
 

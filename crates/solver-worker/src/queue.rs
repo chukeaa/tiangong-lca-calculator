@@ -17,6 +17,10 @@ use crate::{
         latest_result_id_for_job, mark_result_cache_failed, read_one_queue_message,
         update_job_status,
     },
+    scope_closure::{
+        PackageClosureBinding, SCOPE_CLOSURE_JOB_KIND, SCOPE_CLOSURE_REQUEST_SCHEMA_VERSION,
+        execute_scope_closure_job, record_scope_closure_failure, validate_package_closure_binding,
+    },
     types::JobPayload,
     worker_jobs::{WorkerJob, WorkerJobResult, claim_worker_jobs, record_worker_job_result},
 };
@@ -32,7 +36,9 @@ fn extract_snapshot_id(payload: &JobPayload) -> Option<Uuid> {
         | JobPayload::AnalyzeContributionPath { snapshot_id, .. }
         | JobPayload::InvalidateFactorization { snapshot_id, .. }
         | JobPayload::RebuildFactorization { snapshot_id, .. } => Some(*snapshot_id),
-        JobPayload::BuildSnapshot { .. } | JobPayload::LciaResultPackageBuild { .. } => None,
+        JobPayload::BuildSnapshot { .. }
+        | JobPayload::LciaResultPackageBuild { .. }
+        | JobPayload::ScopeClosureCheck { .. } => None,
     }
 }
 
@@ -313,6 +319,7 @@ pub async fn run_solver_worker_jobs_loop(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn process_solver_worker_job(state: &AppState, job: WorkerJob, lease_seconds: i32) {
     let payload = match solver_worker_job_payload(&job) {
         Ok(payload) => payload,
@@ -328,6 +335,12 @@ async fn process_solver_worker_job(state: &AppState, job: WorkerJob, lease_secon
     let heartbeat_details = match &payload {
         JobPayload::LciaResultPackageBuild { build_id, .. } => json!({
             "buildId": build_id,
+            "payloadType": payload_type_name(&payload),
+        }),
+        JobPayload::ScopeClosureCheck {
+            closure_check_id, ..
+        } => json!({
+            "closureCheckId": closure_check_id,
             "payloadType": payload_type_name(&payload),
         }),
         _ => json!({
@@ -355,12 +368,117 @@ async fn process_solver_worker_job(state: &AppState, job: WorkerJob, lease_secon
         return;
     }
 
-    let execution_result = match &payload {
-        JobPayload::LciaResultPackageBuild { .. } => {
-            handle_lcia_result_package_build_worker_job(state, job.id, &payload)
+    if let JobPayload::ScopeClosureCheck {
+        closure_check_id,
+        scan_execution_id,
+        data_snapshot_token,
+        request_fingerprint,
+    } = &payload
+    {
+        match execute_scope_closure_job(
+            state,
+            job.id,
+            job.lease_token,
+            lease_seconds,
+            *closure_check_id,
+            *scan_execution_id,
+            data_snapshot_token,
+            request_fingerprint,
+        )
+        .await
+        {
+            Ok(outcome) => {
+                info!(
+                    worker_job_id = %job.id,
+                    closure_check_id = %closure_check_id,
+                    status = %outcome.status,
+                    "scope closure worker job completed"
+                );
+            }
+            Err(err) => {
+                let message = err.to_string();
+                error!(
+                    error = %message,
+                    worker_job_id = %job.id,
+                    closure_check_id = %closure_check_id,
+                    "scope closure worker job failed"
+                );
+                if let Err(record_err) = record_scope_closure_failure(
+                    &state.pool,
+                    *closure_check_id,
+                    job.id,
+                    job.lease_token,
+                    message.as_str(),
+                )
                 .await
-                .map(|_| ())
+                {
+                    error!(
+                        error = %record_err,
+                        worker_job_id = %job.id,
+                        "failed to record scope closure terminal failure"
+                    );
+                }
+            }
         }
+        return;
+    }
+
+    let execution_result = match &payload {
+        JobPayload::LciaResultPackageBuild {
+            closure_check_id,
+            closure_certificate_hash,
+            effective_scope_hash,
+            data_snapshot_token,
+            snapshot_id,
+            snapshot_hash,
+            closure_bundle_hash,
+            report_artifact_manifest_hash,
+            ..
+        } => {
+            let closure_binding_result = if let (
+                Some(closure_check_id),
+                Some(closure_certificate_hash),
+                Some(effective_scope_hash),
+                Some(data_snapshot_token),
+                Some(snapshot_id),
+                Some(snapshot_hash),
+                Some(closure_bundle_hash),
+                Some(report_artifact_manifest_hash),
+            ) = (
+                closure_check_id,
+                closure_certificate_hash.as_deref(),
+                effective_scope_hash.as_deref(),
+                data_snapshot_token.as_deref(),
+                snapshot_id,
+                snapshot_hash.as_deref(),
+                closure_bundle_hash.as_deref(),
+                report_artifact_manifest_hash.as_deref(),
+            ) {
+                validate_package_closure_binding(
+                    &state.pool,
+                    &PackageClosureBinding {
+                        closure_check_id: *closure_check_id,
+                        closure_certificate_hash,
+                        effective_scope_hash,
+                        data_snapshot_token,
+                        snapshot_id: *snapshot_id,
+                        snapshot_hash,
+                        closure_bundle_hash,
+                        report_artifact_manifest_hash,
+                    },
+                )
+                .await
+            } else {
+                Ok(())
+            };
+            match closure_binding_result {
+                Ok(()) => handle_lcia_result_package_build_worker_job(state, job.id, &payload)
+                    .await
+                    .map(|_| ()),
+                Err(err) => Err(err),
+            }
+        }
+        JobPayload::ScopeClosureCheck { .. } => unreachable!("handled above"),
         _ => {
             Box::pin(handle_worker_jobs_job_payload(
                 state,
@@ -426,7 +544,12 @@ async fn record_solver_worker_job_failure(
         lca_job_id = %lca_job_id,
         "solver worker_jobs execution failed"
     );
-    if let JobPayload::LciaResultPackageBuild { build_id, .. } = payload {
+    if let JobPayload::LciaResultPackageBuild {
+        build_id,
+        closure_check_id,
+        ..
+    } = payload
+    {
         let diagnostics = json!({
             "error": err_message,
             "buildId": build_id,
@@ -447,7 +570,10 @@ async fn record_solver_worker_job_failure(
             })),
         );
         result.result_ref = Some(lcia_result_package_worker_result_ref(
-            job.id, *build_id, None,
+            job.id,
+            *build_id,
+            None,
+            *closure_check_id,
         ));
         if let Err(record_err) =
             record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
@@ -512,7 +638,12 @@ async fn record_solver_worker_job_success(
                 lca_job_id = %lca_job_id,
                 "solver worker_jobs execution completed but result projection failed"
             );
-            if let JobPayload::LciaResultPackageBuild { build_id, .. } = payload {
+            if let JobPayload::LciaResultPackageBuild {
+                build_id,
+                closure_check_id,
+                ..
+            } = payload
+            {
                 let mut result = WorkerJobResult::failed(
                     "lcia_result_package_projection_failed",
                     err_message.clone(),
@@ -529,7 +660,10 @@ async fn record_solver_worker_job_success(
                     })),
                 );
                 result.result_ref = Some(lcia_result_package_worker_result_ref(
-                    job.id, *build_id, None,
+                    job.id,
+                    *build_id,
+                    None,
+                    *closure_check_id,
                 ));
                 if let Err(record_err) =
                     record_worker_job_result(&state.pool, job.id, job.lease_token, result).await
@@ -566,7 +700,12 @@ async fn build_solver_worker_job_result(
     worker_job_id: Uuid,
     payload: &JobPayload,
 ) -> anyhow::Result<WorkerJobResult> {
-    if let JobPayload::LciaResultPackageBuild { build_id, .. } = payload {
+    if let JobPayload::LciaResultPackageBuild {
+        build_id,
+        closure_check_id,
+        ..
+    } = payload
+    {
         let package_projection =
             fetch_lcia_result_package_projection(&state.pool, worker_job_id).await?;
         let package_id = package_projection
@@ -578,6 +717,7 @@ async fn build_solver_worker_job_result(
             result_json: Some(json!({
                 "workerJobId": worker_job_id,
                 "buildId": build_id,
+                "closureCheckId": closure_check_id,
                 "payloadType": payload_type_name(payload),
                 "package": package_projection,
             })),
@@ -586,9 +726,11 @@ async fn build_solver_worker_job_result(
                 worker_job_id,
                 *build_id,
                 package_id,
+                *closure_check_id,
             )),
             diagnostics: Some(json!({
                 "lciaResultPackage": package_projection,
+                "closureCheckId": closure_check_id,
             })),
             error_code: None,
             error_message: None,
@@ -772,11 +914,13 @@ fn lcia_result_package_worker_result_ref(
     worker_job_id: Uuid,
     build_id: Uuid,
     package_id: Option<Uuid>,
+    closure_check_id: Option<Uuid>,
 ) -> Value {
     json!({
         "domainSource": "worker_jobs",
         "workerJobId": worker_job_id,
         "buildId": build_id,
+        "closureCheckId": closure_check_id,
         "package": package_id.map(|id| json!({
             "table": "lcia_result_packages",
             "id": id,
@@ -972,6 +1116,7 @@ fn solver_worker_job_payload(job: &WorkerJob) -> anyhow::Result<JobPayload> {
     Ok(parsed)
 }
 
+#[allow(clippy::too_many_lines)]
 fn normalize_worker_payload_object(value: Value) -> anyhow::Result<Map<String, Value>> {
     let Value::Object(mut payload) = value else {
         return Err(anyhow::anyhow!(
@@ -1064,6 +1209,31 @@ fn normalize_worker_payload_object(value: Value) -> anyhow::Result<Map<String, V
         "default_impact_category",
     );
     copy_alias(&mut payload, "postprocessManifest", "postprocess_manifest");
+    copy_alias(&mut payload, "closureCheckId", "closure_check_id");
+    copy_alias(&mut payload, "scanExecutionId", "scan_execution_id");
+    copy_alias(
+        &mut payload,
+        "closureCertificateHash",
+        "closure_certificate_hash",
+    );
+    copy_alias(&mut payload, "effectiveScopeHash", "effective_scope_hash");
+    copy_alias(&mut payload, "dataSnapshotToken", "data_snapshot_token");
+    copy_alias(&mut payload, "snapshotHash", "snapshot_hash");
+    copy_alias(&mut payload, "closureBundleHash", "closure_bundle_hash");
+    copy_alias(
+        &mut payload,
+        "reportArtifactManifestHash",
+        "report_artifact_manifest_hash",
+    );
+    copy_alias(&mut payload, "requestedScopeHash", "requested_scope_hash");
+    copy_alias(&mut payload, "policyFingerprint", "policy_fingerprint");
+    copy_alias(
+        &mut payload,
+        "expectedValidatorScannerFingerprint",
+        "expected_validator_scanner_fingerprint",
+    );
+    copy_alias(&mut payload, "requestFingerprint", "request_fingerprint");
+    copy_alias(&mut payload, "requestKey", "request_key");
     normalize_request_roots(&mut payload);
 
     Ok(payload)
@@ -1118,6 +1288,7 @@ fn payload_schema_supported_for_job_kind(job_kind: &str, schema: &str) -> bool {
                 "lcia_result.package_build",
                 "lcia_result.package_build.request.v1"
             )
+            | (SCOPE_CLOSURE_JOB_KIND, SCOPE_CLOSURE_REQUEST_SCHEMA_VERSION)
     )
 }
 
@@ -1241,6 +1412,63 @@ fn validate_versioned_payload_contract(
                 "calculation_evidence_binding cannot be carried by a v1 solve payload"
             ));
         }
+        (
+            "lcia_result.package_build.request.v1",
+            JobPayload::LciaResultPackageBuild {
+                closure_check_id,
+                closure_certificate_hash,
+                effective_scope_hash,
+                data_snapshot_token,
+                snapshot_id,
+                snapshot_hash,
+                closure_bundle_hash,
+                report_artifact_manifest_hash,
+                ..
+            },
+        ) => {
+            let binding_count = [
+                closure_check_id.is_some(),
+                closure_certificate_hash.is_some(),
+                effective_scope_hash.is_some(),
+                data_snapshot_token.is_some(),
+                snapshot_id.is_some(),
+                snapshot_hash.is_some(),
+                closure_bundle_hash.is_some(),
+                report_artifact_manifest_hash.is_some(),
+            ]
+            .into_iter()
+            .filter(|present| *present)
+            .count();
+            if binding_count != 0 && binding_count != 8 {
+                return Err(anyhow::anyhow!(
+                    "lcia result package closure evidence binding must be all-or-none"
+                ));
+            }
+        }
+        (
+            SCOPE_CLOSURE_REQUEST_SCHEMA_VERSION,
+            JobPayload::ScopeClosureCheck {
+                request_fingerprint,
+                data_snapshot_token,
+                ..
+            },
+        ) => {
+            if requested_by.is_none() {
+                return Err(anyhow::anyhow!(
+                    "scope closure requires authenticated requested_by"
+                ));
+            }
+            if request_fingerprint.trim().is_empty() {
+                return Err(anyhow::anyhow!(
+                    "scope closure payload requires request_fingerprint"
+                ));
+            }
+            if data_snapshot_token.trim().is_empty() {
+                return Err(anyhow::anyhow!(
+                    "scope closure payload requires data_snapshot_token"
+                ));
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -1255,6 +1483,7 @@ fn payload_type_for_job_kind(job_kind: &str) -> Option<&'static str> {
         "lca.contribution_path" => Some("analyze_contribution_path"),
         "lca.factorization_prepare" => Some("prepare_factorization"),
         "lcia_result.package_build" => Some("lcia_result_package_build"),
+        SCOPE_CLOSURE_JOB_KIND => Some("scope_closure_check"),
         _ => None,
     }
 }
@@ -1265,6 +1494,7 @@ fn result_schema_version_for_payload(payload: &JobPayload) -> &'static str {
         JobPayload::AnalyzeContributionPath { .. } => "lca.contribution_path.result.v1",
         JobPayload::PrepareFactorization { .. } => "lca.factorization_prepare.result.v1",
         JobPayload::LciaResultPackageBuild { .. } => "lcia_result.package_build.result.v1",
+        JobPayload::ScopeClosureCheck { .. } => "lcia.scope_closure_check.result.v1",
         _ => "lca.solve.result.v1",
     }
 }
@@ -1280,6 +1510,7 @@ fn payload_type_name(payload: &JobPayload) -> &'static str {
         JobPayload::RebuildFactorization { .. } => "rebuild_factorization",
         JobPayload::BuildSnapshot { .. } => "build_snapshot",
         JobPayload::LciaResultPackageBuild { .. } => "lcia_result_package_build",
+        JobPayload::ScopeClosureCheck { .. } => "scope_closure_check",
     }
 }
 
@@ -1287,6 +1518,7 @@ fn solver_worker_phase(payload: &JobPayload) -> &'static str {
     match payload {
         JobPayload::BuildSnapshot { .. } => "build_snapshot",
         JobPayload::LciaResultPackageBuild { .. } => "lcia_result_package_build",
+        JobPayload::ScopeClosureCheck { .. } => "load_scope",
         JobPayload::AnalyzeContributionPath { .. } => "analyze_contribution_path",
         JobPayload::PrepareFactorization { .. } | JobPayload::RebuildFactorization { .. } => {
             "prepare_factorization"
@@ -1383,6 +1615,9 @@ fn extract_job_id(payload: &JobPayload) -> uuid::Uuid {
         | JobPayload::RebuildFactorization { job_id, .. }
         | JobPayload::BuildSnapshot { job_id, .. } => *job_id,
         JobPayload::LciaResultPackageBuild { build_id, .. } => *build_id,
+        JobPayload::ScopeClosureCheck {
+            closure_check_id, ..
+        } => *closure_check_id,
     }
 }
 
@@ -1413,8 +1648,8 @@ mod tests {
             method_factor_source_contract_fixture,
         },
         queue::{
-            parse_build_snapshot_worker_projection, payload_type_name,
-            result_schema_version_for_payload, snapshot_diagnostic_scope_pairs,
+            lcia_result_package_worker_result_ref, parse_build_snapshot_worker_projection,
+            payload_type_name, result_schema_version_for_payload, snapshot_diagnostic_scope_pairs,
             solver_worker_job_payload, solver_worker_result_ref,
         },
         types::JobPayload,
@@ -1920,6 +2155,87 @@ mod tests {
             }
             other => panic!("unexpected payload: {other:?}"),
         }
+    }
+
+    #[test]
+    fn maps_scope_closure_payload_from_database_envelope() {
+        let closure_check_id = Uuid::new_v4();
+        let scan_execution_id = Uuid::new_v4();
+        let job = worker_job(
+            "lcia.scope_closure_check",
+            "lcia.scope_closure_check.request.v1",
+            json!({
+                "closure_check_id": closure_check_id,
+                "scan_execution_id": scan_execution_id,
+                "data_snapshot_token": "snapshot-token",
+                "request_fingerprint": "request-fingerprint",
+            }),
+        );
+
+        let payload = solver_worker_job_payload(&job).expect("scope closure payload");
+        assert!(matches!(
+            payload,
+            JobPayload::ScopeClosureCheck {
+                closure_check_id: parsed_check,
+                scan_execution_id: parsed_execution,
+                ref data_snapshot_token,
+                ref request_fingerprint,
+            } if parsed_check == closure_check_id
+                && parsed_execution == scan_execution_id
+                && data_snapshot_token == "snapshot-token"
+                && request_fingerprint == "request-fingerprint"
+        ));
+    }
+
+    #[test]
+    fn package_closure_binding_is_all_or_none_and_result_ref_preserves_check_id() {
+        let closure_check_id = Uuid::new_v4();
+        let snapshot_id = Uuid::new_v4();
+        let requested_by = Uuid::new_v4();
+        let full = worker_job(
+            "lcia_result.package_build",
+            "lcia_result.package_build.request.v1",
+            json!({
+                "build_id": Uuid::new_v4(),
+                "requested_by": requested_by,
+                "coverage_mode": "subset",
+                "eligible_input_count": 1,
+                "included_input_count": 1,
+                "input_manifest_hash": "input-hash",
+                "input_manifest": {"processes": []},
+                "lcia_method_set": [],
+                "closure_check_id": closure_check_id,
+                "closure_certificate_hash": "certificate-hash",
+                "effective_scope_hash": "scope-hash",
+                "data_snapshot_token": "snapshot-token",
+                "snapshot_id": snapshot_id,
+                "snapshot_hash": "snapshot-hash",
+                "closure_bundle_hash": "bundle-hash",
+                "report_artifact_manifest_hash": "report-hash",
+            }),
+        );
+        assert!(solver_worker_job_payload(&full).is_ok());
+
+        let mut partial = full;
+        partial
+            .payload
+            .as_object_mut()
+            .unwrap()
+            .remove("snapshot_hash");
+        assert!(
+            solver_worker_job_payload(&partial)
+                .unwrap_err()
+                .to_string()
+                .contains("all-or-none")
+        );
+
+        let result_ref = lcia_result_package_worker_result_ref(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            None,
+            Some(closure_check_id),
+        );
+        assert_eq!(result_ref["closureCheckId"], json!(closure_check_id));
     }
 
     #[test]

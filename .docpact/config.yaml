@@ -1,6 +1,6 @@
 version: 1
 layout: repo
-lastReviewedAt: "2026-07-21"
+lastReviewedAt: "2026-07-22"
 lastReviewedCommit: "bc40e015e60effd62fd159f1a61cb99b09a5556b"
 
 # Keep deterministic governance facts here.
@@ -28,6 +28,7 @@ ownership:
           - .docpact/**
           - docs/agents/**
           - docs/lca-api-contract.md
+          - docs/scope-closure-contract.md
           - docs/matrix-readiness-report-contract.md
           - docs/review-submit-fast-gate-contract.md
           - docs/edge-function-integration.md
@@ -80,6 +81,7 @@ coverage:
     - docs/agents/repo-validation.md
     - docs/agents/repo-architecture.md
     - docs/lca-api-contract.md
+    - docs/scope-closure-contract.md
     - docs/matrix-readiness-report-contract.md
     - docs/review-submit-fast-gate-contract.md
     - docs/edge-function-integration.md
@@ -125,6 +127,17 @@ routing:
         - crates/solver-worker/src/**
         - docs/lca-api-contract.md
         - docs/matrix-readiness-report-contract.md
+    scope-closure:
+      paths:
+        - crates/solver-worker/src/scope_closure.rs
+        - crates/solver-worker/src/queue.rs
+        - crates/solver-worker/src/types.rs
+        - crates/solver-worker/src/db.rs
+        - crates/solver-worker/tests/fixtures/reference_extraction_v1/**
+        - docs/scope-closure-contract.md
+        - docs/lca-api-contract.md
+        - docs/tidas-package-contract.md
+        - docs/agents/repo-validation.md
     matrix-readiness:
       paths:
         - crates/solver-worker/src/readiness.rs
@@ -194,6 +207,7 @@ routing:
         - .docpact/**
         - docs/agents/**
         - docs/lca-api-contract.md
+        - docs/scope-closure-contract.md
         - docs/matrix-readiness-report-contract.md
         - docs/review-submit-fast-gate-contract.md
         - docs/edge-function-integration.md
@@ -214,6 +228,7 @@ docInventory:
     - docs/agents/repo-validation.md
     - docs/agents/repo-architecture.md
     - docs/lca-api-contract.md
+    - docs/scope-closure-contract.md
     - docs/matrix-readiness-report-contract.md
     - docs/review-submit-fast-gate-contract.md
     - docs/edge-function-integration.md
@@ -290,6 +305,38 @@ rules:
       - path: docs/lca-api-contract.md
         mode: review_or_update
     reason: Solver runtime, worker behavior, and CI gates shape ownership, proof, and the shared runtime contract together.
+  - id: worker-scope-closure-contract
+    scope: repo
+    repo: worker
+    triggers:
+      - path: crates/solver-worker/src/scope_closure.rs
+        kind: runtime-code
+      - path: crates/solver-worker/src/queue.rs
+        kind: runtime-code
+      - path: crates/solver-worker/src/types.rs
+        kind: runtime-code
+      - path: crates/solver-worker/src/db.rs
+        kind: runtime-code
+      - path: crates/solver-worker/tests/fixtures/reference_extraction_v1/**
+        kind: fixture
+      - path: docs/scope-closure-contract.md
+        kind: runtime-contract
+    requiredDocs:
+      - path: AGENTS.md
+        mode: review_or_update
+      - path: .docpact/config.yaml
+        mode: review_or_update
+      - path: docs/agents/repo-validation.md
+        mode: review_or_update
+      - path: docs/agents/repo-architecture.md
+        mode: review_or_update
+      - path: docs/lca-api-contract.md
+        mode: review_or_update
+      - path: docs/scope-closure-contract.md
+        mode: review_or_update
+      - path: docs/tidas-package-contract.md
+        mode: review_or_update
+    reason: Closure execution, immutable release evidence, TIDAS parity, reuse, and package certificate binding must remain one reviewed contract surface.
   - id: worker-provider-allocation-theory-contract
     scope: repo
     repo: worker

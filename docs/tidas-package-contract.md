@@ -17,13 +17,16 @@ checkPaths:
   - .docpact/config.yaml
   - crates/solver-worker/**
   - docs/agents/repo-validation.md
-lastReviewedAt: 2026-06-10
-lastReviewedCommit: 4546fb8fff034c84cd1b699cb049345b70eabe16
+  - docs/scope-closure-contract.md
+lastReviewedAt: 2026-07-22
+lastReviewedCommit: bc40e015e60effd62fd159f1a61cb99b09a5556b
+lastReviewedNote: "Clarified that Issue #139 certificate-bound LCIA result builds consume closure evidence without changing import/export package-worker semantics."
 related:
   - AGENTS.md
   - .docpact/config.yaml
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
+  - docs/scope-closure-contract.md
 ---
 
 # TIDAS Package Async Contract
@@ -230,6 +233,12 @@ cargo run -p solver-worker --bin package_gc -- --execute
 - `context`
 
 无论最终结果是 `IMPORTED` / `USER_DATA_CONFLICT` / `VALIDATION_FAILED`，report 都会携带校验统计；当 `VALIDATION_FAILED` 时，还会包含导致阻断导入的校验问题详情。
+
+### 7.3 与 certificate-bound LCIA result package 的边界
+
+`lcia_result.package_build` 属于 solver queue 的 data-product 构建，不是本文件定义的 `tidas.export_package` / `tidas.import_package` package-worker 任务。Build V2 必须携带完整 scope-closure certificate/snapshot/bundle/report binding；solver worker 在构建前 fail-closed 校验该 binding，然后复用既有数值 snapshot、all-unit solve 和 artifact 路径，不重新运行 administrative closure。
+
+这项绑定不会改变 TIDAS import/export ZIP、report、retention 或 `worker_queue=package` 状态机。完整契约见 `docs/scope-closure-contract.md` 与 `docs/lca-api-contract.md`。
 
 ## 8. 状态机
 

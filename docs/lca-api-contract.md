@@ -13,6 +13,7 @@ whenToUpdate:
   - 当 job payload、状态机、结果 artifact、幂等规则或服务端权限边界变化时
 checkPaths:
   - docs/lca-api-contract.md
+  - docs/scope-closure-contract.md
   - docs/provider-linking.md
   - AGENTS.md
   - .docpact/config.yaml
@@ -22,13 +23,14 @@ checkPaths:
   - docs/review-submit-fast-gate-contract.md
   - docs/edge-function-integration.md
   - docs/frontend-integration.md
-lastReviewedAt: 2026-07-21
+lastReviewedAt: 2026-07-22
 lastReviewedCommit: bc40e015e60effd62fd159f1a61cb99b09a5556b
-lastReviewedNote: "Documented database-backed LCIA canonical method identity and artifact locator normalization for Issue #137."
+lastReviewedNote: "Added Issue #139 scope-closure job/result semantics and certificate-bound package Build V2 consumption."
 related:
   - AGENTS.md
   - .docpact/config.yaml
   - docs/provider-linking.md
+  - docs/scope-closure-contract.md
   - docs/matrix-readiness-report-contract.md
   - docs/review-submit-fast-gate-contract.md
   - docs/edge-function-integration.md
@@ -162,6 +164,7 @@ solver worker 默认使用 `SOLVER_QUEUE_BACKEND=worker-jobs` / `--queue-backend
 | `lca.contribution_path` | `lca.contribution_path.request.v1` / `lca.contribution_path.request.v2` | `analyze_contribution_path` | `lca.contribution_path.result.v1` |
 | `lca.factorization_prepare` | `lca.factorization_prepare.request.v1` | `prepare_factorization` | `lca.factorization_prepare.result.v1` |
 | `lcia_result.package_build` | `lcia_result.package_build.request.v1` | `lcia_result_package_build` | `lcia_result.package_build.result.v1` |
+| `lcia.scope_closure_check` | `lcia.scope_closure_check.request.v1` | `scope_closure_check` | `lcia.scope_closure_check.result.v1` |
 
 `worker_jobs.payload_json` may use the legacy snake_case fields above, or Edge-friendly camelCase aliases such as `lcaJobId`, `snapshotId`, `rhsBatch`, `unitBatchSize`, `processId`, `impactId`, `requestRoots`, `noLcia`, `buildId`, `requestedBy`, `inputManifest`, `inputManifestHash`, `lciaMethodSet`, and `defaultImpactCategory`. Payloads must still carry a valid `lcaJobId` / `job_id` compatibility UUID when the task writes `lca_results`、`lca_result_cache`、`lca_latest_all_unit_results` 或 `lca_factorization_registry` rows keyed by historical `job_id` columns. 这些 columns 不再要求 `public.lca_jobs` FK 或 parent row。
 
@@ -188,6 +191,16 @@ Factor coverage is counted for every selected method/exchange pair. Counts are `
 For this scope, `lca.solve_one.request.v2`, `lca.solve_all_unit.request.v2`, and `lca.contribution_path.request.v2` must carry `calculation_evidence_binding` equal to the snapshot-index evidence. The worker rejects missing, malformed, or drifted bindings before factorization/solve. A v1 solve against a bound snapshot is rejected, so the contract cannot silently downgrade. Successful scoped results repeat `calculation_evidence` in `lca_results.diagnostics` and job diagnostics; numeric trial results with gaps remain explicitly marked `incomplete_coverage`.
 
 `lcia_result.package_build` 不是普通求解 API 的用户请求类型，而是 data product manager command 创建的后台构建任务。payload 必须来自数据库/Edge 的 service-role command 边界，包含 `buildId`、`requestedBy`、published-only `inputManifest`、`inputManifestHash`、`coverageMode`、`eligibleInputCount`、`includedInputCount`、`lciaMethodSet` 和可选 `defaultImpactCategory`。worker 只接受 `inputManifest.processes` 中 `stateCode/state_code` 为 `100..199` 的已发布过程；不会纳入 draft data。
+
+### 3.8 `lcia.scope_closure_check` 与 Build V2 证书绑定
+
+`lcia.scope_closure_check` 只能由数据库命令边界创建。其 claim payload 是最小 envelope：`closure_check_id`、`scan_execution_id`、`data_snapshot_token`、`request_fingerprint`；完整 scope 和 `lcia.scope-closure-data-snapshot.v2` 必须通过 service-role worker-input RPC 读取。Worker 按当前 public release 的完整 exact dataset/hash allowlist 执行 union closure，不从 live state code 推断可用 universe。live-only identity、同 identity 内容漂移或 allowlisted row 不可读都会使 `scanCompleteness=incomplete`，且不能得到有效证书。
+
+terminal result 使用 `lcia.scope_closure_check.result.v1`，并保留 `closureCheckId`、`status`、`scanCompleteness`、`certificateStatus/certificateHash`、report artifact reference 和 blocker codes。完整 issues、occurrences、affected roots、bundle/snapshot/JSONL/XLSX evidence 由 closure domain RPC 原子落库；queue 层不得随后重复调用普通 `worker_record_job_result`。共享 scan reuse 只复用 immutable evidence，并为当前 closure check 新建 summary、XLSX、report manifest binding 和 certificate。
+
+数据库 Build V2 command 原子创建 `lcia_result.package_build` job，并写入完整 closure binding：`closure_check_id`、`closure_certificate_hash`、`effective_scope_hash`、`data_snapshot_token`、`snapshot_id`、`snapshot_hash`、`closure_bundle_hash`、`report_artifact_manifest_hash`。Worker 对这些字段执行 all-or-none 校验，并在运行数值构建前逐项核对当前 passed/complete/valid certificate。它直接消费已签名 snapshot/evidence，不重复运行 administrative closure。数值 snapshot/all-unit solve/artifact 路径保持原样；result JSON、result_ref、package metadata 与 audit 保留 `closureCheckId`。
+
+完整 traversal、artifact、reuse 和 failure 契约见 `docs/scope-closure-contract.md`。
 
 该 package build 的 legacy database-backed LCIA 路径在读取 factors 前必须把每个方法归一化为 `(canonical method UUID, exact version, artifact locator UUID)`：文档内 `common:UUID` 是 matrix axis、calculation evidence、result key 和 source-closure identity，`public.lciamethods.id` 只作为精确读取该文档的 artifact locator。Locator 与文档 UUID 相同时可直接使用；不相同时必须与 reviewed `RELEASE_METHOD_IDENTITIES` 中的完整三元组精确匹配，否则在矩阵构建前 fail closed。单方法选择若使用 canonical UUID，worker 可通过同一 reviewed mapping 定位 locator，但写入 snapshot/result 的仍是 canonical UUID。
 

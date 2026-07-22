@@ -21,6 +21,7 @@ checkPaths:
   - .docpact/**/*.yaml
   - docs/agents/**
   - docs/lca-api-contract.md
+  - docs/scope-closure-contract.md
   - docs/matrix-readiness-report-contract.md
   - docs/review-submit-fast-gate-contract.md
   - docs/edge-function-integration.md
@@ -40,14 +41,15 @@ checkPaths:
   - scripts/docpact
   - scripts/docpact-gate.sh
   - scripts/install-git-hooks.sh
-lastReviewedAt: 2026-07-21
+lastReviewedAt: 2026-07-22
 lastReviewedCommit: bc40e015e60effd62fd159f1a61cb99b09a5556b
-lastReviewedNote: "Reviewed worker ownership, validation, and governance boundaries for exact Flow revision binding and closure pruning in Issue #135; repo boundaries are unchanged."
+lastReviewedNote: "Added the Issue #139 certificate-grade scope-closure execution, immutable public-release boundary, and package-build evidence-binding contract."
 related:
   - .docpact/config.yaml
   - docs/agents/repo-validation.md
   - docs/agents/repo-architecture.md
   - docs/lca-api-contract.md
+  - docs/scope-closure-contract.md
   - docs/matrix-readiness-report-contract.md
   - docs/review-submit-fast-gate-contract.md
   - docs/edge-function-integration.md
@@ -71,6 +73,7 @@ Start here when the task may change what the compute stack does.
 | `docs/agents/repo-architecture.md` | compact repo mental model, stable path map, hotspot families, and common misreads | checklist-style proof guidance or current work queue |
 | `README.md` | repo landing context, operator setup, and runtime overview | machine-readable routing or lint semantics |
 | `docs/lca-api-contract.md` | shared jobs/results/payload/status contract for consumers | branch policy, proof matrix, or edge/frontend implementation details |
+| `docs/scope-closure-contract.md` | certificate-grade closure traversal, frozen-release validation, artifacts, scan reuse, and build evidence binding | durable database schema or Edge/Next presentation behavior |
 | `docs/matrix-readiness-report-contract.md` | worker-owned matrix-readiness CLI and report artifact schema, blocker/finding codes, next_action semantics, and policy surface | HTTP endpoint contract or edge request/auth behavior |
 | `docs/review-submit-fast-gate-contract.md` | worker-owned review-submit fast gate schema, passed/blocked semantics, blocker codes, policy defaults, targeted probe contract, and DB runner result-recorder behavior | Edge HTTP API, persistence schema, or Next submit-review UX |
 | `docs/edge-function-integration.md` | edge-facing enqueue, polling, and service-role integration contract | solver internals or frontend UX rules |
@@ -88,6 +91,7 @@ Read in this order:
 3. `docs/agents/repo-validation.md` or `docs/agents/repo-architecture.md`
 4. load only the narrow contract doc that matches the task:
    - `docs/lca-api-contract.md`
+   - `docs/scope-closure-contract.md`
    - `docs/matrix-readiness-report-contract.md`
    - `docs/review-submit-fast-gate-contract.md`
    - `docs/edge-function-integration.md`
@@ -107,7 +111,7 @@ Do not start from the root workspace or the edge repo if the change is really ab
 - stable path groups and hotspot families live in `docs/agents/repo-architecture.md`
 - runtime-facing consumer contracts and report artifact contracts live in the narrow docs under `docs/*.md`
 - repo-local documentation maintenance is enforced locally by the pre-push docpact gate; `.github/workflows/ai-doc-lint.yml` is manual-dispatch fallback
-- the main routing intents are `solver-runtime`, `matrix-readiness`, `snapshot-and-provider`, `review-submit-gate`, `package-worker`, `runtime-sql-boundary`, `debug-and-parity`, `edge-api-boundary`, `frontend-integration`, `proof`, `repo-docs`, and `root-integration`
+- the main routing intents are `solver-runtime`, `scope-closure`, `matrix-readiness`, `snapshot-and-provider`, `review-submit-gate`, `package-worker`, `runtime-sql-boundary`, `debug-and-parity`, `edge-api-boundary`, `frontend-integration`, `proof`, `repo-docs`, and `root-integration`
 
 ## Minimal Execution Facts
 
@@ -135,7 +139,7 @@ At a human-readable level, this repo owns:
 - `Cargo.toml`, `Makefile`, and `crates/**` for solver topology, sparse-runtime behavior, queue workers, snapshot builder flows, and package workers
 - `scripts/**` and `tools/bw25-validator/**` for manual validation, parity, debug, snapshot, and diagnostics helpers
 - `supabase/migrations/**` for runtime SQL expectations still referenced by the worker runtime
-- `README.md`, `docs/agents/**`, `docs/lca-api-contract.md`, `docs/matrix-readiness-report-contract.md`, `docs/review-submit-fast-gate-contract.md`, `docs/edge-function-integration.md`, `docs/frontend-integration.md`, `docs/provider-linking.md`, `docs/implicit-regional-supply-mix-modeling.md`, `docs/implicit-regional-supply-mix-modeling.en.md`, `docs/tidas-package-contract.md`, and repo-local governed docs
+- `README.md`, `docs/agents/**`, `docs/lca-api-contract.md`, `docs/scope-closure-contract.md`, `docs/matrix-readiness-report-contract.md`, `docs/review-submit-fast-gate-contract.md`, `docs/edge-function-integration.md`, `docs/frontend-integration.md`, `docs/provider-linking.md`, `docs/implicit-regional-supply-mix-modeling.md`, `docs/implicit-regional-supply-mix-modeling.en.md`, `docs/tidas-package-contract.md`, and repo-local governed docs
 
 This repo does not own:
 
@@ -165,6 +169,8 @@ Route those tasks to:
 - queue enqueue and protected writes must stay on service-side paths; do not move them to frontend clients or authenticated direct table writes
 - runtime write paths assume `service_role` ownership boundaries and existing RLS restrictions on `lca_*` tables
 - worker and snapshot flows expect DB connectivity plus the required S3 env set before runtime validation is meaningful
+- certificate-grade closure reads only the immutable current-public-release dataset manifest, fails incomplete on live/source drift, and never substitutes a live-only or different-version dataset
+- package builds carrying closure evidence require the complete certificate/snapshot/bundle/report binding; the numerical build path consumes that binding without rerunning administrative closure
 
 ## Documentation Update Rules
 
@@ -173,6 +179,7 @@ Route those tasks to:
 - if proof expectations or manual validation helper guidance change, update `docs/agents/repo-validation.md`
 - if repo shape, hotspot families, or path ownership explanation changes, update `docs/agents/repo-architecture.md`
 - if shared jobs/results/payload/status semantics change, update `docs/lca-api-contract.md`
+- if closure traversal, immutable release evidence, artifacts, reuse, or build-certificate binding changes, update `docs/scope-closure-contract.md`
 - if matrix-readiness report schema, blocker/finding codes, policy defaults, or next_action semantics change, update `docs/matrix-readiness-report-contract.md`
 - if review-submit fast gate schema, blocker codes, policy defaults, targeted probe semantics, or DB runner result-recorder behavior changes, update `docs/review-submit-fast-gate-contract.md`
 - if edge-facing enqueue, polling, or service-role integration guidance changes, update `docs/edge-function-integration.md`
