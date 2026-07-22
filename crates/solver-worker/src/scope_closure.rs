@@ -1509,12 +1509,6 @@ async fn fetch_exact_documents(
     }
     let mut documents = Vec::new();
     for (category, group) in grouped {
-        let table = category.table_name();
-        let document_expression = if category == DatasetCategory::Lciamethods {
-            "COALESCE(json, json_ordered::jsonb)"
-        } else {
-            "json_ordered::jsonb"
-        };
         let read_keys = group
             .iter()
             .map(|identity| {
@@ -1523,22 +1517,10 @@ async fn fetch_exact_documents(
                 } else {
                     identity.id
                 };
-                (identity, locator_id)
+                ((*identity).clone(), locator_id)
             })
             .collect::<Vec<_>>();
-        let mut builder = QueryBuilder::<Postgres>::new(format!(
-            "SELECT id, btrim(version::text) AS version, {document_expression} AS document FROM public.{table} WHERE (id, btrim(version::text)) IN ("
-        ));
-        let mut separated = builder.separated(", ");
-        for (identity, locator_id) in &read_keys {
-            separated
-                .push("(")
-                .push_bind(*locator_id)
-                .push(", ")
-                .push_bind(identity.version.clone())
-                .push(")");
-        }
-        separated.push_unseparated(") ORDER BY id, btrim(version::text)");
+        let mut builder = exact_documents_query_builder(category, &read_keys);
         let rows = builder.build().fetch_all(pool).await?;
         for row in rows {
             let locator_id = row.try_get::<Uuid, _>("id")?;
@@ -1548,7 +1530,7 @@ async fn fetch_exact_documents(
                 .find(|(identity, expected_locator)| {
                     *expected_locator == locator_id && identity.version == version
                 })
-                .map(|(identity, _)| (**identity).clone())
+                .map(|(identity, _)| identity.clone())
                 .ok_or_else(|| anyhow::anyhow!("LCIA/source fetch returned an unexpected row"))?;
             documents.push(ClosureDocument {
                 identity: requested,
@@ -1558,6 +1540,34 @@ async fn fetch_exact_documents(
     }
     documents.sort_by(|left, right| left.identity.cmp(&right.identity));
     Ok(documents)
+}
+
+fn exact_documents_query_builder(
+    category: DatasetCategory,
+    read_keys: &[(ExactDatasetIdentity, Uuid)],
+) -> QueryBuilder<'static, Postgres> {
+    let table = category.table_name();
+    let document_expression = if category == DatasetCategory::Lciamethods {
+        "COALESCE(json, json_ordered::jsonb)"
+    } else {
+        "json_ordered::jsonb"
+    };
+    let mut builder = QueryBuilder::<Postgres>::new(format!(
+        "SELECT id, btrim(version::text) AS version, {document_expression} AS document FROM public.{table} WHERE (id, btrim(version::text)) IN ("
+    ));
+    for (index, (identity, locator_id)) in read_keys.iter().enumerate() {
+        if index > 0 {
+            builder.push(", ");
+        }
+        builder
+            .push("(")
+            .push_bind(*locator_id)
+            .push(", ")
+            .push_bind(identity.version.clone())
+            .push(")");
+    }
+    builder.push(") ORDER BY id, btrim(version::text)");
+    builder
 }
 
 fn lcia_method_artifact_locator_id(identity: &ExactDatasetIdentity) -> Uuid {
@@ -4057,6 +4067,8 @@ mod tests {
     use serde_json::json;
     use zip::ZipArchive;
 
+    use crate::pgbouncer_sqlx::Execute;
+
     use super::*;
 
     #[derive(Clone, Default)]
@@ -4807,5 +4819,35 @@ mod tests {
         assert_eq!(frozen.processes.len(), 2);
         assert!(frozen.process_manifest_hash.is_some());
         assert_eq!(scope_process_axis(&frozen).len(), 2);
+    }
+
+    #[test]
+    fn exact_document_query_uses_valid_parameterized_tuple_syntax() {
+        let first = identity(
+            DatasetCategory::Lciamethods,
+            "96969696-9696-9696-9696-969696969696",
+        );
+        let second = identity(
+            DatasetCategory::Lciamethods,
+            "97979797-9797-9797-9797-979797979797",
+        );
+
+        let mut single = exact_documents_query_builder(
+            DatasetCategory::Lciamethods,
+            &[(first.clone(), first.id)],
+        );
+        assert_eq!(
+            single.build().sql(),
+            "SELECT id, btrim(version::text) AS version, COALESCE(json, json_ordered::jsonb) AS document FROM public.lciamethods WHERE (id, btrim(version::text)) IN (($1, $2)) ORDER BY id, btrim(version::text)"
+        );
+
+        let mut multiple = exact_documents_query_builder(
+            DatasetCategory::Lciamethods,
+            &[(first.clone(), first.id), (second.clone(), second.id)],
+        );
+        assert_eq!(
+            multiple.build().sql(),
+            "SELECT id, btrim(version::text) AS version, COALESCE(json, json_ordered::jsonb) AS document FROM public.lciamethods WHERE (id, btrim(version::text)) IN (($1, $2), ($3, $4)) ORDER BY id, btrim(version::text)"
+        );
     }
 }
