@@ -242,9 +242,18 @@ pub enum JobPayload {
         /// Certificate hash calculated and stored by the database completion RPC.
         #[serde(default)]
         closure_certificate_hash: Option<String>,
+        /// Hash of the original requested scope bound into the certificate.
+        #[serde(default)]
+        requested_scope_hash: Option<String>,
+        /// Fingerprint of the policy used to evaluate scope closure.
+        #[serde(default)]
+        policy_fingerprint: Option<String>,
         /// Hash of the effective exact-version manifest certified by the preflight.
         #[serde(default)]
         effective_scope_hash: Option<String>,
+        /// Complete effective exact-version manifest certified by the preflight.
+        #[serde(default)]
+        effective_scope: Option<Value>,
         /// Frozen membership token bound into closure evidence.
         #[serde(default)]
         data_snapshot_token: Option<String>,

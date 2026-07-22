@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::pgbouncer_sqlx::{self as sqlx, Row};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::time::sleep;
 use tracing::{error, info, instrument, warn};
@@ -30,11 +30,13 @@ const SOLVER_WORKER_QUEUE: &str = "solver";
 
 const LCIA_RESULT_PACKAGE_BUILD_V2: &str = "lcia_result.package_build.request.v2";
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AuthoritativePackageClosureBinding {
     closure_check_id: Uuid,
     certificate_hash: String,
+    requested_scope_hash: String,
+    policy_fingerprint: String,
     effective_scope_hash: String,
     data_snapshot_token: String,
     snapshot_id: Uuid,
@@ -526,7 +528,10 @@ fn validate_authoritative_package_closure_binding(
     let JobPayload::LciaResultPackageBuild {
         closure_check_id,
         closure_certificate_hash,
+        requested_scope_hash,
+        policy_fingerprint,
         effective_scope_hash,
+        effective_scope,
         data_snapshot_token,
         snapshot_id,
         snapshot_hash,
@@ -549,7 +554,10 @@ fn validate_authoritative_package_closure_binding(
 
     let matches_binding = closure_check_id == &Some(binding.closure_check_id)
         && closure_certificate_hash.as_deref() == Some(binding.certificate_hash.as_str())
+        && requested_scope_hash.as_deref() == Some(binding.requested_scope_hash.as_str())
+        && policy_fingerprint.as_deref() == Some(binding.policy_fingerprint.as_str())
         && effective_scope_hash.as_deref() == Some(binding.effective_scope_hash.as_str())
+        && effective_scope.as_ref() == Some(&binding.effective_scope)
         && data_snapshot_token.as_deref() == Some(binding.data_snapshot_token.as_str())
         && snapshot_id == &Some(binding.snapshot_id)
         && snapshot_hash.as_deref() == Some(binding.snapshot_hash.as_str())
@@ -566,6 +574,29 @@ fn validate_authoritative_package_closure_binding(
     if !matches_binding {
         return Err(anyhow::anyhow!(
             "package-build payload differs from authoritative scope-closure binding"
+        ));
+    }
+
+    if canonical_json_sha256(&binding.effective_scope)? != binding.effective_scope_hash {
+        return Err(anyhow::anyhow!(
+            "authoritative effective scope does not match its canonical hash"
+        ));
+    }
+    if canonical_json_sha256(&binding.input_manifest)? != binding.input_manifest_hash {
+        return Err(anyhow::anyhow!(
+            "authoritative input manifest does not match its canonical hash"
+        ));
+    }
+    if binding.effective_scope.get("coverageMode")
+        != Some(&Value::String(binding.coverage_mode.clone()))
+    {
+        return Err(anyhow::anyhow!(
+            "authoritative coverage mode differs from effective scope"
+        ));
+    }
+    if binding.effective_scope.get("lciaMethods") != Some(&binding.lcia_method_set) {
+        return Err(anyhow::anyhow!(
+            "authoritative LCIA method axis differs from effective scope"
         ));
     }
 
@@ -1511,7 +1542,10 @@ fn validate_versioned_payload_contract(
             JobPayload::LciaResultPackageBuild {
                 closure_check_id,
                 closure_certificate_hash,
+                requested_scope_hash,
+                policy_fingerprint,
                 effective_scope_hash,
+                effective_scope,
                 data_snapshot_token,
                 snapshot_id,
                 snapshot_hash,
@@ -1527,7 +1561,10 @@ fn validate_versioned_payload_contract(
             let binding_count = [
                 closure_check_id.is_some(),
                 closure_certificate_hash.is_some(),
+                requested_scope_hash.is_some(),
+                policy_fingerprint.is_some(),
                 effective_scope_hash.is_some(),
+                effective_scope.is_some(),
                 data_snapshot_token.is_some(),
                 snapshot_id.is_some(),
                 snapshot_hash.is_some(),
@@ -1552,7 +1589,10 @@ fn validate_versioned_payload_contract(
             JobPayload::LciaResultPackageBuild {
                 closure_check_id,
                 closure_certificate_hash,
+                requested_scope_hash,
+                policy_fingerprint,
                 effective_scope_hash,
+                effective_scope,
                 data_snapshot_token,
                 snapshot_id,
                 snapshot_hash,
@@ -1568,7 +1608,10 @@ fn validate_versioned_payload_contract(
             let binding_count = [
                 closure_check_id.is_some(),
                 closure_certificate_hash.is_some(),
+                requested_scope_hash.is_some(),
+                policy_fingerprint.is_some(),
                 effective_scope_hash.is_some(),
+                effective_scope.is_some(),
                 data_snapshot_token.is_some(),
                 snapshot_id.is_some(),
                 snapshot_hash.is_some(),
@@ -1582,7 +1625,7 @@ fn validate_versioned_payload_contract(
             .into_iter()
             .filter(|present| *present)
             .count();
-            if binding_count != 12 {
+            if binding_count != 15 {
                 return Err(anyhow::anyhow!(
                     "lcia result package v2 requires the complete closure evidence binding"
                 ));
@@ -2352,7 +2395,10 @@ mod tests {
                 "lcia_method_set": [],
                 "closure_check_id": closure_check_id,
                 "closure_certificate_hash": "certificate-hash",
+                "requested_scope_hash": "requested-scope-hash",
+                "policy_fingerprint": "policy-fingerprint",
                 "effective_scope_hash": "scope-hash",
+                "effective_scope": {"processes": []},
                 "data_snapshot_token": "snapshot-token",
                 "snapshot_id": snapshot_id,
                 "snapshot_hash": "snapshot-hash",
@@ -2400,6 +2446,16 @@ mod tests {
             "version": "01.00.000",
             "stateCode": 100,
         }]);
+        let effective_scope = json!({
+            "coverageMode": "subset",
+            "lciaMethods": [],
+            "processes": process_axis.clone(),
+        });
+        let input_manifest = json!({"processes": process_axis.clone()});
+        let effective_scope_hash =
+            canonical_json_sha256(&effective_scope).expect("effective scope hash");
+        let input_manifest_hash =
+            canonical_json_sha256(&input_manifest).expect("input manifest hash");
         let job = worker_job(
             "lcia_result.package_build",
             "lcia_result.package_build.request.v2",
@@ -2409,12 +2465,15 @@ mod tests {
                 "coverage_mode": "subset",
                 "eligible_input_count": 1,
                 "included_input_count": 1,
-                "input_manifest_hash": "input-hash",
-                "input_manifest": {"processes": process_axis.clone()},
+                "input_manifest_hash": input_manifest_hash,
+                "input_manifest": input_manifest.clone(),
                 "lcia_method_set": [],
                 "closure_check_id": closure_check_id,
                 "closure_certificate_hash": "certificate-hash",
-                "effective_scope_hash": "scope-hash",
+                "requested_scope_hash": "requested-scope-hash",
+                "policy_fingerprint": "policy-fingerprint",
+                "effective_scope_hash": effective_scope_hash,
+                "effective_scope": effective_scope.clone(),
                 "data_snapshot_token": "snapshot-token",
                 "snapshot_id": snapshot_id,
                 "snapshot_hash": "snapshot-hash",
@@ -2430,7 +2489,9 @@ mod tests {
         let mut binding = AuthoritativePackageClosureBinding {
             closure_check_id,
             certificate_hash: "certificate-hash".to_owned(),
-            effective_scope_hash: "scope-hash".to_owned(),
+            requested_scope_hash: "requested-scope-hash".to_owned(),
+            policy_fingerprint: "policy-fingerprint".to_owned(),
+            effective_scope_hash: effective_scope_hash.clone(),
             data_snapshot_token: "snapshot-token".to_owned(),
             snapshot_id,
             snapshot_hash: "snapshot-hash".to_owned(),
@@ -2441,9 +2502,9 @@ mod tests {
             closure_bundle_hash: "bundle-hash".to_owned(),
             coverage_mode: "subset".to_owned(),
             lcia_method_set: json!([]),
-            input_manifest: json!({"processes": process_axis.clone()}),
-            input_manifest_hash: "input-hash".to_owned(),
-            effective_scope: json!({"processes": process_axis}),
+            input_manifest: input_manifest.clone(),
+            input_manifest_hash: input_manifest_hash.clone(),
+            effective_scope: effective_scope.clone(),
         };
 
         validate_authoritative_package_closure_binding(&payload, &binding)
@@ -2472,13 +2533,41 @@ mod tests {
                 .to_string()
                 .contains("differs from authoritative")
         );
-        binding.input_manifest_hash = "input-hash".to_owned();
-        binding.effective_scope = json!({"processes": []});
+        binding.input_manifest_hash = input_manifest_hash;
+        binding.requested_scope_hash = "tampered-requested".to_owned();
         assert!(
             validate_authoritative_package_closure_binding(&payload, &binding)
                 .unwrap_err()
                 .to_string()
-                .contains("process axis differs")
+                .contains("differs from authoritative")
+        );
+        binding.requested_scope_hash = "requested-scope-hash".to_owned();
+        binding.policy_fingerprint = "tampered-policy".to_owned();
+        assert!(
+            validate_authoritative_package_closure_binding(&payload, &binding)
+                .unwrap_err()
+                .to_string()
+                .contains("differs from authoritative")
+        );
+        binding.policy_fingerprint = "policy-fingerprint".to_owned();
+        binding.effective_scope = json!({
+            "coverageMode": "subset",
+            "lciaMethods": [],
+            "processes": [],
+        });
+        binding.effective_scope_hash =
+            canonical_json_sha256(&binding.effective_scope).expect("tampered scope hash");
+        assert!(
+            validate_authoritative_package_closure_binding(&payload, &binding)
+                .unwrap_err()
+                .to_string()
+                .contains("differs from authoritative")
+        );
+
+        let mut authoritative = serde_json::to_value(&binding).unwrap_or_default();
+        authoritative["unexpectedField"] = json!(true);
+        assert!(
+            serde_json::from_value::<AuthoritativePackageClosureBinding>(authoritative).is_err()
         );
     }
 
