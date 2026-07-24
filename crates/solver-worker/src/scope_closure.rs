@@ -3612,6 +3612,7 @@ fn run_tidas_batch_validation(
 
     let input_dir_arg = input_dir.to_string_lossy().into_owned();
     let manifest_arg = manifest_path.to_string_lossy().into_owned();
+    let jobs = std::env::var("TIDAS_VALIDATION_JOBS").unwrap_or_else(|_| "0".to_owned());
     let events = run_tidas_batch_events(&[
         "--protocol",
         TIDAS_BATCH_PROTOCOL,
@@ -3621,6 +3622,8 @@ fn run_tidas_batch_validation(
         input_dir_arg.as_str(),
         "--input-manifest",
         manifest_arg.as_str(),
+        "--jobs",
+        jobs.as_str(),
     ])?;
     let final_positions = events
         .iter()
