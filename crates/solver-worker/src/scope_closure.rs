@@ -1844,8 +1844,24 @@ async fn scan_and_validate_scope<P: ScopeClosureProvider>(
     pool: &PgPool,
     worker_job_id: Uuid,
     requested_scope: &RequestedScopeManifest,
+    progress: &WorkerJobProgress<'_>,
+    closure_check_id: Uuid,
 ) -> anyhow::Result<(ScopeClosureScan, TidasBatchValidation)> {
     let mut scan = collect_scope_closure(provider, requested_scope).await?;
+    progress
+        .heartbeat(
+            "validate_documents",
+            0.42,
+            Some(json!({
+                "closureCheckId": closure_check_id,
+                "progressCounters": {
+                    "scanned": scan.documents.len(),
+                    "total": scan.provider_universe.len(),
+                    "unit": "documents"
+                },
+            })),
+        )
+        .await?;
     let validation =
         run_tidas_batch_validation_cached(pool, worker_job_id, &scan.documents).await?;
     let issue_events = validation.issue_events.clone();
@@ -2281,6 +2297,8 @@ pub async fn execute_scope_closure_job(
         &state.pool,
         worker_job_id,
         &input.requested_scope,
+        &progress,
+        closure_check_id,
     )
     .await?;
 
@@ -2379,6 +2397,8 @@ pub async fn execute_scope_closure_job(
             &state.pool,
             worker_job_id,
             &final_requested_scope,
+            &progress,
+            closure_check_id,
         )
         .await?;
         effective_scope = build_effective_scope_manifest(&final_requested_scope, &scan.documents);
