@@ -219,6 +219,61 @@ impl<'a> WorkerJobProgress<'a> {
         )
         .await
     }
+
+    /// Spawn a background heartbeat guard that re-sends the last known
+    /// phase/progress/diagnostics every `interval` seconds until the
+    /// returned guard is dropped.  This keeps the job lease alive during
+    /// long synchronous computations that would otherwise starve the
+    /// tokio runtime.
+    #[must_use]
+    pub fn spawn_heartbeat_guard(
+        &self,
+        phase: String,
+        progress: f64,
+        diagnostics: Option<Value>,
+        interval: std::time::Duration,
+    ) -> WorkerJobHeartbeatGuard {
+        let pool = self.pool.clone();
+        let job_id = self.job_id;
+        let lease_token = self.lease_token;
+        let lease_seconds = self.lease_seconds;
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_clone = cancel.clone();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                if cancel_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let _ = heartbeat_worker_job(
+                    &pool,
+                    job_id,
+                    lease_token,
+                    &phase,
+                    progress,
+                    diagnostics.clone(),
+                    lease_seconds,
+                )
+                .await;
+            }
+        });
+        WorkerJobHeartbeatGuard { cancel, handle }
+    }
+}
+
+pub struct WorkerJobHeartbeatGuard {
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl WorkerJobHeartbeatGuard {
+    pub async fn stop(self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.handle.await;
+    }
 }
 
 pub async fn claim_worker_jobs(

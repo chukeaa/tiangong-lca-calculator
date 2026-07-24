@@ -1862,36 +1862,8 @@ async fn scan_and_validate_scope<P: ScopeClosureProvider>(
             })),
         )
         .await?;
-    let doc_count = scan.documents.len();
-    let total_count = scan.provider_universe.len();
-    let validation = {
-        let docs = scan.documents.clone();
-        let validation_fut = run_tidas_batch_validation_cached(pool, worker_job_id, &docs);
-        tokio::pin!(validation_fut);
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                result = &mut validation_fut => break result?,
-                _ = ticker.tick() => {
-                    progress
-                        .heartbeat(
-                            "validate_documents",
-                            0.42,
-                            Some(json!({
-                                "closureCheckId": closure_check_id,
-                                "progressCounters": {
-                                    "scanned": doc_count,
-                                    "total": total_count,
-                                    "unit": "documents"
-                                },
-                            })),
-                        )
-                        .await?;
-                }
-            }
-        }
-    };
+    let validation =
+        run_tidas_batch_validation_cached(pool, worker_job_id, &scan.documents).await?;
     let issue_events = validation.issue_events.clone();
     let scan = tokio::task::spawn_blocking(move || {
         merge_tidas_validation_issues(&mut scan, &issue_events);
@@ -2320,6 +2292,15 @@ pub async fn execute_scope_closure_job(
         lease_token,
         lease_seconds,
     );
+    let guard = progress.spawn_heartbeat_guard(
+        "validate_documents".to_owned(),
+        0.42,
+        Some(json!({
+            "closureCheckId": closure_check_id,
+            "progressCounters": {"scanned": 0, "total": 0, "unit": "documents"},
+        })),
+        std::time::Duration::from_secs(30),
+    );
     let (mut scan, mut validation) = scan_and_validate_scope(
         &provider,
         &state.pool,
@@ -2329,6 +2310,7 @@ pub async fn execute_scope_closure_job(
         closure_check_id,
     )
     .await?;
+    guard.stop().await;
 
     progress
         .heartbeat(
