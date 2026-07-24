@@ -3440,10 +3440,15 @@ async fn run_tidas_batch_validation_cached(
             "installed tidas-tools does not support {TIDAS_BATCH_PROTOCOL}"
         ));
     }
-    let cache_keys = documents
-        .iter()
-        .map(|document| document_validation_cache_key(document, &describe))
-        .collect::<anyhow::Result<Vec<_>>>()?;
+    let describe_for_keys = describe.clone();
+    let documents_for_keys = documents.to_vec();
+    let cache_keys = tokio::task::spawn_blocking(move || {
+        documents_for_keys
+            .iter()
+            .map(|document| document_validation_cache_key(document, &describe_for_keys))
+            .collect::<anyhow::Result<Vec<_>>>()
+    })
+    .await??;
     let cached = lookup_document_validation_evidence(pool, &cache_keys).await?;
     let cached_by_key = cached
         .into_iter()
