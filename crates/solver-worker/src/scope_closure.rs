@@ -3450,92 +3450,106 @@ async fn run_tidas_batch_validation_cached(
     })
     .await??;
     let cached = lookup_document_validation_evidence(pool, &cache_keys).await?;
-    let cached_by_key = cached
-        .into_iter()
-        .map(|item| (document_evidence_key(&item), item))
-        .collect::<BTreeMap<_, _>>();
-    let mut issue_events = Vec::new();
-    let mut missing = Vec::new();
-    for (document, key) in documents.iter().zip(&cache_keys) {
-        if let Some(hit) = cached_by_key.get(&document_evidence_key(key)) {
-            let issue_artifact_ref = hit
-                .get("issueArtifactRef")
-                .ok_or_else(|| anyhow::anyhow!("cached TIDAS evidence omitted issueArtifactRef"))?;
-            let expected_artifact_hash = hit
-                .get("issueArtifactHash")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
+    let documents_owned = documents.to_vec();
+    let describe_for_records = describe.clone();
+    let describe_for_validation = describe.clone();
+    let uncached = tokio::task::spawn_blocking(move || {
+        let documents = &documents_owned;
+        let cached_by_key = cached
+            .into_iter()
+            .map(|item| (document_evidence_key(&item), item))
+            .collect::<BTreeMap<_, _>>();
+        let mut issue_events = Vec::new();
+        let mut missing = Vec::new();
+        for (document, key) in documents.iter().zip(&cache_keys) {
+            if let Some(hit) = cached_by_key.get(&document_evidence_key(key)) {
+                let issue_artifact_ref = hit.get("issueArtifactRef").ok_or_else(|| {
+                    anyhow::anyhow!("cached TIDAS evidence omitted issueArtifactRef")
+                })?;
+                let expected_artifact_hash = hit
+                    .get("issueArtifactHash")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
                     anyhow::anyhow!("cached TIDAS evidence omitted issueArtifactHash")
                 })?;
-            if canonical_json_sha256(issue_artifact_ref)? != expected_artifact_hash {
-                return Err(anyhow::anyhow!(
-                    "cached TIDAS evidence issue artifact hash mismatch"
-                ));
+                if canonical_json_sha256(issue_artifact_ref)? != expected_artifact_hash {
+                    return Err(anyhow::anyhow!(
+                        "cached TIDAS evidence issue artifact hash mismatch"
+                    ));
+                }
+                issue_events.extend(
+                    issue_artifact_ref
+                        .get("issues")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+            } else {
+                missing.push(document.clone());
             }
-            issue_events.extend(
-                issue_artifact_ref
-                    .get("issues")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default(),
-            );
-        } else {
-            missing.push(document.clone());
         }
-    }
 
-    let describe_for_validation = describe.clone();
-    let missing_for_records = missing.clone();
-    let uncached = tokio::task::spawn_blocking(move || {
-        run_tidas_batch_validation(&missing, describe_for_validation)
+        let missing_for_records = missing.clone();
+        let uncached = run_tidas_batch_validation(&missing, describe_for_validation)?;
+        issue_events.extend(uncached.issue_events.clone());
+
+        let records = if missing_for_records.is_empty() {
+            Vec::new()
+        } else {
+            missing_for_records
+                .iter()
+                .map(|document| {
+                    let issues = uncached
+                        .issue_events
+                        .iter()
+                        .filter(|event| {
+                            event.get("document_key").and_then(Value::as_str)
+                                == Some(document.identity.document_key().as_str())
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let mut record =
+                        document_validation_cache_key(document, &describe_for_records)?;
+                    let Value::Object(record) = &mut record else {
+                        unreachable!("cache key is an object")
+                    };
+                    record.insert(
+                        "status".to_owned(),
+                        Value::String(
+                            if issues.is_empty() {
+                                "passed"
+                            } else {
+                                "failed"
+                            }
+                            .to_owned(),
+                        ),
+                    );
+                    record.insert(
+                        "summary".to_owned(),
+                        json!({"issueCount": issues.len(), "completed": true}),
+                    );
+                    record.insert("issueArtifactRef".to_owned(), json!({"issues": issues}));
+                    record.insert(
+                        "issueArtifactHash".to_owned(),
+                        Value::String(canonical_json_sha256(
+                            record.get("issueArtifactRef").unwrap(),
+                        )?),
+                    );
+                    Ok(Value::Object(record.clone()))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?
+        };
+
+        sort_by_canonical_value(&mut issue_events);
+        Ok::<_, anyhow::Error>((uncached, issue_events, missing_for_records, records))
     })
     .await??;
-    issue_events.extend(uncached.issue_events.clone());
-    if !missing_for_records.is_empty() {
-        let records = missing_for_records
-            .iter()
-            .map(|document| {
-                let issues = uncached
-                    .issue_events
-                    .iter()
-                    .filter(|event| {
-                        event.get("document_key").and_then(Value::as_str)
-                            == Some(document.identity.document_key().as_str())
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let mut record = document_validation_cache_key(document, &describe)?;
-                let Value::Object(record) = &mut record else {
-                    unreachable!("cache key is an object")
-                };
-                record.insert(
-                    "status".to_owned(),
-                    Value::String(
-                        if issues.is_empty() {
-                            "passed"
-                        } else {
-                            "failed"
-                        }
-                        .to_owned(),
-                    ),
-                );
-                record.insert(
-                    "summary".to_owned(),
-                    json!({"issueCount": issues.len(), "completed": true}),
-                );
-                record.insert("issueArtifactRef".to_owned(), json!({"issues": issues}));
-                record.insert(
-                    "issueArtifactHash".to_owned(),
-                    Value::String(canonical_json_sha256(
-                        record.get("issueArtifactRef").unwrap(),
-                    )?),
-                );
-                Ok(Value::Object(record.clone()))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let (uncached_val, issue_events, missing_for_records, records) = uncached;
+    let _ = uncached_val;
+    if !records.is_empty() {
         record_document_validation_evidence(pool, worker_job_id, &records).await?;
     }
-    sort_by_canonical_value(&mut issue_events);
     let final_event = json!({
         "type": "final",
         "schema_version": "tidas.validation-final-event.v1",
