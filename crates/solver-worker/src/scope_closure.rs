@@ -3397,7 +3397,9 @@ async fn run_tidas_batch_validation_cached(
     worker_job_id: Uuid,
     documents: &[ClosureDocument],
 ) -> anyhow::Result<TidasBatchValidation> {
-    let describe_output = run_tidas_command(&["--describe", "--format", "json"])?;
+    let describe_output =
+        tokio::task::spawn_blocking(|| run_tidas_command(&["--describe", "--format", "json"]))
+            .await??;
     let describe: Value = serde_json::from_str(describe_output.trim())?;
     if !describe
         .get("protocols")
@@ -3447,10 +3449,15 @@ async fn run_tidas_batch_validation_cached(
         }
     }
 
-    let uncached = run_tidas_batch_validation(&missing, describe.clone())?;
+    let describe_for_validation = describe.clone();
+    let missing_for_records = missing.clone();
+    let uncached = tokio::task::spawn_blocking(move || {
+        run_tidas_batch_validation(&missing, describe_for_validation)
+    })
+    .await??;
     issue_events.extend(uncached.issue_events.clone());
-    if !missing.is_empty() {
-        let records = missing
+    if !missing_for_records.is_empty() {
+        let records = missing_for_records
             .iter()
             .map(|document| {
                 let issues = uncached
@@ -3503,8 +3510,8 @@ async fn run_tidas_batch_validation_cached(
         "summary": {
             "document_count": documents.len(),
             "issue_count": issue_events.len(),
-            "cache_hit_count": documents.len() - missing.len(),
-            "validated_count": missing.len(),
+            "cache_hit_count": documents.len() - missing_for_records.len(),
+            "validated_count": missing_for_records.len(),
         },
         "fingerprints": describe,
     });
