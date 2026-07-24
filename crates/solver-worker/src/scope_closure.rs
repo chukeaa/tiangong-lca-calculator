@@ -898,18 +898,22 @@ async fn collect_scope_closure<P: ScopeClosureProvider>(
         }
     }
 
-    tokio::task::yield_now().await;
-    let scan = finalize_scope_closure_scan(
-        edges,
-        resolved_references,
-        omitted_version_resolutions,
-        raw_issues,
-        &roots,
-        &graph,
-        complete,
-        documents,
-        scheduled,
-    );
+    let roots_clone = roots.clone();
+    let graph_clone = graph.clone();
+    let scan = tokio::task::spawn_blocking(move || {
+        finalize_scope_closure_scan(
+            edges,
+            resolved_references,
+            omitted_version_resolutions,
+            raw_issues,
+            &roots_clone,
+            &graph_clone,
+            complete,
+            documents,
+            scheduled,
+        )
+    })
+    .await?;
     Ok(scan)
 }
 
@@ -925,14 +929,14 @@ fn finalize_scope_closure_scan(
     documents: BTreeMap<ExactDatasetIdentity, ClosureDocument>,
     scheduled: BTreeSet<ExactDatasetIdentity>,
 ) -> ScopeClosureScan {
-    edges.sort_by_key(canonical_value);
+    sort_by_canonical_value(&mut edges);
     resolved_references.sort();
-    omitted_version_resolutions.sort_by_key(canonical_value);
+    sort_by_canonical_value(&mut omitted_version_resolutions);
     let mut raw_issues = raw_issues;
     attach_reference_occurrences(&mut raw_issues, &resolved_references);
     let mut issues = coalesce_issues(raw_issues);
     compute_affected_roots_batch(&mut issues, roots, graph);
-    issues.sort_by_key(canonical_value);
+    issues.sort_by(|a, b| a.issue_key.cmp(&b.issue_key));
 
     ScopeClosureScan {
         schema_version: "lcia.scope-closure-scan.v1".to_owned(),
@@ -1087,7 +1091,7 @@ fn populate_affected_roots(scan: &mut ScopeClosureScan) {
             .insert(reference.target.clone());
     }
     compute_affected_roots_batch(&mut scan.issues, &scan.roots, &graph);
-    scan.issues.sort_by_key(canonical_value);
+    scan.issues.sort_by(|a, b| a.issue_key.cmp(&b.issue_key));
 }
 
 #[must_use]
@@ -1693,6 +1697,18 @@ fn canonical_value<T: Serialize>(value: &T) -> String {
         .unwrap_or_default()
 }
 
+fn sort_by_canonical_value<T: Serialize>(items: &mut Vec<T>) {
+    let mut keyed: Vec<(String, T)> = items
+        .drain(..)
+        .map(|item| {
+            let key = canonical_value(&item);
+            (key, item)
+        })
+        .collect();
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    items.extend(keyed.into_iter().map(|(_, item)| item));
+}
+
 fn canonical_json_bytes<T: Serialize>(value: &T) -> anyhow::Result<Vec<u8>> {
     let value = serde_json::to_value(value)?;
     let mut output = Vec::new();
@@ -1835,7 +1851,7 @@ async fn scan_and_validate_scope<P: ScopeClosureProvider>(
     let issue_events = validation.issue_events.clone();
     let scan = tokio::task::spawn_blocking(move || {
         merge_tidas_validation_issues(&mut scan, &issue_events);
-        scan.issues.sort_by_key(canonical_value);
+        scan.issues.sort_by(|a, b| a.issue_key.cmp(&b.issue_key));
         scan
     })
     .await?;
@@ -2297,7 +2313,7 @@ pub async fn execute_scope_closure_job(
             })),
         )
         .await?;
-    scan.issues.sort_by_key(canonical_value);
+    scan.issues.sort_by(|a, b| a.issue_key.cmp(&b.issue_key));
 
     let mut effective_scope =
         build_effective_scope_manifest(&input.requested_scope, &scan.documents);
@@ -2368,11 +2384,11 @@ pub async fn execute_scope_closure_job(
         effective_scope = build_effective_scope_manifest(&final_requested_scope, &scan.documents);
         add_process_axis_drift_issue(&mut scan, frozen_process_axis.as_slice(), &effective_scope)?;
         merge_matrix_readiness_blockers(&mut scan, &discovery.readiness)?;
-        scan.issues.sort_by_key(canonical_value);
+        scan.issues.sort_by(|a, b| a.issue_key.cmp(&b.issue_key));
     }
 
     normalize_database_issue_severities(&mut scan.issues)?;
-    scan.issues.sort_by_key(canonical_value);
+    scan.issues.sort_by(|a, b| a.issue_key.cmp(&b.issue_key));
     let (closure_bundle_bytes, closure_bundle_hash) =
         build_closure_bundle(&input, &validation, &scan)?;
     let source_fingerprint = source_fingerprint(&scan.documents)?;
@@ -3192,7 +3208,7 @@ fn build_resolution_map(edges: &[ReferenceEdge], omitted_resolutions: &[Value]) 
             "provenance": resolution,
         })
     }));
-    resolutions.sort_by_key(canonical_value);
+    sort_by_canonical_value(&mut resolutions);
     resolutions
 }
 
@@ -3477,7 +3493,7 @@ async fn run_tidas_batch_validation_cached(
             .collect::<anyhow::Result<Vec<_>>>()?;
         record_document_validation_evidence(pool, worker_job_id, &records).await?;
     }
-    issue_events.sort_by_key(canonical_value);
+    sort_by_canonical_value(&mut issue_events);
     let final_event = json!({
         "type": "final",
         "schema_version": "tidas.validation-final-event.v1",
